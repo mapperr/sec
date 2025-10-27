@@ -1,14 +1,21 @@
 #!/bin/sh
 
+# inspiration taken from:
+# https://github.com/slok/agebox
+# https://github.com/biox/pa
+
+sec_tracking_filename=.sec
+
 usage() {
     s="$(basename $0)"
     printf %s "\
 $s
-    a handler for age-based secrets, in git
+    a rough handler for age-based secrets stored in git
 
 commands:
-    t|track <path>  - track a file or a directory
-    u|untrack <path>  - untrack a file or a directory
+    t|track <path>  - track a file
+    u|untrack <path>  - untrack a file
+    l|list  - list tracked files
 
     e|encrypt  - encrypt all tracked files
     d|decrypt  - decrypt all tracked files
@@ -17,12 +24,94 @@ commands:
     r|rm <public_key>  - remove a recipient
 
 env vars:
-    SEC_IDENTITY_FILE  - identity file to use for decryption
-        by default a bunch of locations are scanned
-        and eventually found keys are tried.
-        locations are: ~/.ssh/ , ~/.age/ .
+    SEC_IDENTITY_FILE  - age/ssh identity file to use for decryption
 
 notes:
     sec keeps a file named '.sec' in the repo root
 "
+exit 0
 }
+
+_die() {
+    printf "%s: %s\n" "$(basename $0)" "$@"
+    exit 1
+}
+
+_warn() {
+    printf "%s: warn: %s\n" "$(basename $0)" "$@"
+}
+
+_rand_chars() {
+    # Generate random characters by reading '/dev/urandom' with the
+    # 'tr' command to translate the random bytes into a
+    # configurable character set.
+    #
+    # The 'dd' command is then used to read only the desired length.
+    #
+    # Regarding usage of '/dev/urandom' instead of '/dev/random'.
+    # See: https://www.2uo.de/myths-about-urandom
+    #
+    # $1 = number of chars to receive
+    # $2 = filter for the chars
+    LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null
+}
+_mktemp() {
+    tmpdir=/dev/shm
+    # Fall back to $TMPDIR or /tmp - /dev/shm is Linux-only
+    # and shared memory space on other operating systems
+    # have non-standard methods of setup/access.
+    [ -w /dev/shm ] || tmpdir=${TMPDIR:-/tmp}
+    tmpfile=$tmpdir/sec.$(rand_chars 16 'A-Za-z0-9') ||
+        _die "couldn't generate random characters"
+    trap 'rm -f "$tmpfile"' EXIT
+    printf "%s" "$tmpfile"
+}
+
+_is_cwd_a_git_repo() {
+    git rev-parse --show-toplevel >/dev/null 2>&1
+    return $?
+}
+
+_get_git_top_directory() {
+    git rev-parse --show-toplevel
+}
+
+sec_track_file() {
+    [ -f "$sec_tracking_file_path" ] || touch "$sec_tracking_file_path"
+    for f in "$@"; do
+        if [ ! -f "$f" ]; then _warn "file [$f] does not exists, not tracked"; continue; fi
+        grep "^$f\$" "$sec_tracking_file_path" >/dev/null && continue
+        echo "$f" >>"$sec_tracking_file_path"
+        echo "tracked [$f]"
+    done
+}
+
+main() {
+    : ${SEC_IDENTITY_FILE:?$(_die "setup the SEC_IDENTITY_FILE env var")}
+
+    age=$(command -v age || command -v rage) ||
+        _die "age not found, install per https://age-encryption.org"
+    age_keygen=$(command -v age-keygen || command -v rage-keygen) ||
+        _die "age-keygen not found, install per https://age-encryption.org"
+
+    _is_cwd_a_git_repo ||
+        _die "current directory is not a git repository"
+
+    git_top_dir=$(_get_git_top_directory)
+    sec_tracking_file_path="$git_top_dir/$sec_tracking_filename"
+
+    cmd="$1"
+    shift
+    case $cmd in
+        t*) sec_track_file "$@";;
+        u*) sec_untrack_file "$@";;
+        l*) sec_list_tracked_files;;
+        e*) sec_encrypt;;
+        d*) sec_decrypt;;
+        a*) sec_add_recipient "$@";;
+        r*) sec_remove_recipient "$@";;
+        *) usage;;
+    esac
+}
+
+[ "$1" ] || usage && main "$@"
