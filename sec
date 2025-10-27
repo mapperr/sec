@@ -1,0 +1,28 @@
+#!/bin/sh
+
+usage() {
+    s="$(basename $0)"
+    printf %s "\
+$s
+    a handler for age-based secrets, in git
+
+commands:
+    t|track <path>  - track a file or a directory
+    u|untrack <path>  - untrack a file or a directory
+
+    e|encrypt  - encrypt all tracked files
+    d|decrypt  - decrypt all tracked files
+
+    a|add <public_key>  - add a recipient
+    r|rm <public_key>  - remove a recipient
+
+env vars:
+    SEC_IDENTITY_FILE  - identity file to use for decryption
+        by default a bunch of locations are scanned
+        and eventually found keys are tried.
+        locations are: ~/.ssh/ , ~/.age/ .
+
+notes:
+    sec keeps a file named '.sec' in the repo root
+"
+}
