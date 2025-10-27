@@ -27,7 +27,7 @@ env vars:
     SEC_IDENTITY_FILE  - age/ssh identity file to use for decryption
 
 notes:
-    sec keeps a file named '.sec' in the repo root
+    sec keeps a file named '$sec_tracking_filename' in the repo root
 "
 exit 0
 }
@@ -61,9 +61,12 @@ _mktemp() {
     # and shared memory space on other operating systems
     # have non-standard methods of setup/access.
     [ -w /dev/shm ] || tmpdir=${TMPDIR:-/tmp}
-    tmpfile=$tmpdir/sec.$(rand_chars 16 'A-Za-z0-9') ||
+    tmpfile=$tmpdir/sec.$(_rand_chars 16 'A-Za-z0-9') ||
         _die "couldn't generate random characters"
-    trap 'rm -f "$tmpfile"' EXIT
+    mkdir -p "$(dirname "$tmpfile")" ||
+        _die "couldn't create temp dir"
+    touch "$tmpfile" ||
+        _die "couldn't create temp file"
     printf "%s" "$tmpfile"
 }
 
@@ -86,6 +89,34 @@ sec_track_file() {
     done
 }
 
+
+sec_untrack_file() {
+    [ -f "$sec_tracking_file_path" ] ||
+        ( _warn "no file tracked yet" &&
+        return 0 )
+    tmpfile=$(_mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+    while IFS= read f; do
+        echo "read from tracking file: $f"
+        match=false
+        for u in "$@"; do
+            [ "$f" = "$u" ] && match=true
+        done
+        [ "$match" = "true" ] &&
+            sec_decrypt_file "$f"
+        [ "$match" = "false" ] &&
+            echo "$f" >> "$tmpfile"
+    done < "$sec_tracking_file_path"
+    mv "$tmpfile" "$sec_tracking_file_path"
+}
+
+sec_list_tracking() {
+    [ -f "$sec_tracking_file_path" ] ||
+        ( _warn "no file/recipient tracked yet" &&
+        return 0 )
+    cat "$sec_tracking_file_path"
+}
+
 main() {
     : ${SEC_IDENTITY_FILE:?$(_die "setup the SEC_IDENTITY_FILE env var")}
 
@@ -105,7 +136,7 @@ main() {
     case $cmd in
         t*) sec_track_file "$@";;
         u*) sec_untrack_file "$@";;
-        l*) sec_list_tracked_files;;
+        l*) sec_list_tracking;;
         e*) sec_encrypt;;
         d*) sec_decrypt;;
         a*) sec_add_recipient "$@";;
@@ -115,3 +146,5 @@ main() {
 }
 
 [ "$1" ] || usage && main "$@"
+
+# vim: set expandtab tabstop=4 shiftwidth=4:
