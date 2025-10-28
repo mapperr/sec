@@ -62,6 +62,9 @@ _dbg() {
     [ "$SEC_DEBUG" ] &&
         printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2
 }
+_info() {
+    printf "%s: %s\n" "$(basename "$0")" "$1" >&2
+}
 
 _rand_chars() {
     # Generate random characters by reading '/dev/urandom' with the
@@ -106,7 +109,7 @@ _get_root_dir() {
 _get_recipient_file() {
     # TODO
     # decrypt tracking file
-    _is_file_encrypted "$sec_tracking_file_path"
+    _is_file_encrypted "$sec_tracking_file_abspath"
     # extract and create a recipient file with mktemp
     # if not present, add $SEC_RECIPIENT to it
     # and print the recipient file absolute path
@@ -128,11 +131,12 @@ sec_encrypt_file() {
 
 sec_decrypt_file() {
     file_to_decrypt="$1"
-    [ -f "$file_to_decrypt" ] ||
-        ( _warn "file [$file_to_decrypt] does not exists" &&
-        return 0 )
-    _is_file_encrypted "$file_to_decrypt" ||
-        return 0
+    if ! [ -f "$file_to_decrypt" ]; then
+        _warn "file [$file_to_decrypt] does not exists"
+        return 0; fi
+    if ! _is_file_encrypted "$file_to_decrypt"; then
+        _dbg "file [$file_to_decrypt] is not encrypted"
+        return 0; fi
     tmpfile=$(_mktemp)
     trap 'rm -f "$tmpfile"' EXIT
     $age -d -i "$SEC_IDENTITY_FILE" -o "$tmpfile" "$file_to_decrypt" ||
@@ -142,10 +146,10 @@ sec_decrypt_file() {
 }
 
 _ensure_tracking_file_exists_and_is_decrypted() {
-    [ -f "$sec_tracking_file_path" ] ||
-        touch "$sec_tracking_file_path"
-    sec_decrypt_file "$sec_tracking_file_path"
-    _dbg "tracking file decrypted"
+    [ -f "$sec_tracking_file_abspath" ] ||
+        touch "$sec_tracking_file_abspath"
+    sec_decrypt_file "$sec_tracking_file_abspath"
+    _dbg "tracking file is decrypted"
 }
 
 sec_encrypt() {
@@ -160,69 +164,84 @@ sec_decrypt() {
         printf "%s" "$f" | grep '^_recipient: ' >/dev/null &&
             continue
         _dbg "read from tracking file: $f"
-        sec_decrypt_file "$f"
-    done < "$sec_tracking_file_path"
-    _dbg "decrypted all tracked files"
+        sec_decrypt_file "$sec_root_dir/$f"
+    done < "$sec_tracking_file_abspath"
+    _info "decrypted all tracked files"
+}
+
+_get_relative_path() {
+    filepath="$1"
+    _dbg "building relative path of [$filepath]"
+    absolute_filepath=$(readlink -f "$filepath")
+    _dbg "absolute path of [$filepath] is [$absolute_filepath]"
+    printf "%s" "$absolute_filepath" | sed "s#^$sec_root_dir/##"
 }
 
 sec_track_file() {
-    for f in "$@"; do
-        if [ ! -f "$f" ]; then
-            _warn "file [$f] does not exists, not tracked"
+    for ft in "$@"; do
+        if [ ! -f "$ft" ]; then
+            _warn "file [$ft] does not exists, not tracked"
             continue
         fi
-        if grep "^$f\$" "$sec_tracking_file_path" >/dev/null; then
+        f=$(_get_relative_path "$ft")
+        if grep "^$f\$" "$sec_tracking_file_abspath" >/dev/null; then
             _warn "file [$f] already tracked"
             continue
         fi
-        echo "$f" >>"$sec_tracking_file_path"
-        echo "tracked [$f]"
+        echo "$f" >>"$sec_tracking_file_abspath"
+        _info "tracked [$f]"
     done
 }
 
 sec_untrack_file() {
-    if [ ! -f "$sec_tracking_file_path" ]; then
-        _warn "no file tracked yet"
-        return 0
-    fi
     tmpfile=$(_mktemp)
     trap 'rm -f "$tmpfile"' EXIT
     any_match="false"
+    untracked_files=""
     while IFS= read -r f; do
         if printf "%s" "$f" | grep '^#' >/dev/null; then
             echo "$f" >> "$tmpfile"
             continue
         fi
-        _dbg "read from tracking file: $f"
+        if printf "%s" "$f" | grep '^_recipient: ' >/dev/null; then
+            echo "$f" >> "$tmpfile"
+            continue
+        fi
+        _dbg "check if [$f] matches files to untrack"
         match=false
-        for u in "$@"; do
+        for fu in "$@"; do
+            u=$(_get_relative_path "$fu")
+            _dbg "try to match [$u]"
             [ "$f" = "$u" ] && match=true
         done
         if [ "$match" = "true" ]; then
             any_match="true"
-            sec_decrypt_file "$f"
+            _dbg "matched [$u]"
+            sec_decrypt_file "$sec_root_dir/$f"
+            untracked_files="$untracked_files $f"
         else
             echo "$f" >> "$tmpfile"
         fi
-    done < "$sec_tracking_file_path"
+    done < "$sec_tracking_file_abspath"
     if [ "$any_match" = "true" ]; then
-        mv "$tmpfile" "$sec_tracking_file_path"
+        mv "$tmpfile" "$sec_tracking_file_abspath"
+        _info "untracked files: [$untracked_files]"
     else
-        _warn "files are not tracked, nothing to untrack"
+        _warn "files passed in input are not tracked, nothing to untrack"
     fi
 }
 
 sec_list_tracking() {
-    if [ ! -f "$sec_tracking_file_path" ]; then
+    if [ ! -f "$sec_tracking_file_abspath" ]; then
         _warn "no file/recipient tracked yet"
         return 0
     fi
-    cat "$sec_tracking_file_path" |
+    cat "$sec_tracking_file_abspath" |
         grep -v '^#' | sort
 }
 
 sec_edit_tracking() {
-    ${EDITOR:-vi} "$sec_tracking_file_path"
+    ${EDITOR:-vi} "$sec_tracking_file_abspath"
 }
 
 main() {
@@ -236,9 +255,10 @@ main() {
     sec_root_dir=$(_get_root_dir)
     [ -z "$sec_root_dir" ] && exit 1
     _dbg "sec_root_dir: $sec_root_dir"
-    sec_tracking_file_path="$sec_root_dir/$sec_tracking_filename"
+    sec_tracking_file_abspath="$sec_root_dir/$sec_tracking_filename"
 
-    cd "$sec_root_dir" || _die "cannot cd in root dir [$sec_root_dir]"
+    # cd "$sec_root_dir" || _die "cannot cd in root dir [$sec_root_dir]"
+    [ -d "$sec_root_dir" ] || _die "root dir [$sec_root_dir] is not a directory"
 
     cmd="$1"
     shift
