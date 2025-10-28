@@ -22,8 +22,8 @@ commands:
     e|encrypt  - encrypt all tracked files
     d|decrypt  - decrypt all tracked files
 
-    a|add <public_key>  - add a recipient
-    r|rm <public_key>  - remove a recipient
+    a|add <public_key> [<public_key>] ...  - add recipients
+    r|rm <public_key> [<public_key>] ...  - remove recipients
 
     m|modify  - edit tracking file directly with ${EDITOR:-vi}, use caution!
 
@@ -34,14 +34,14 @@ env vars:
         Set this to always ensure that your pubkey is present in the recipients,
         to avoid an epic lock-out : )
 
-    SEC_ROOT_DIR  - [optional] set the root dir forbicly, to address a bunch of use cases,
+    SEC_ROOT_DIR  - [optional] set the root dir forcibly, to address a bunch of use cases,
         like working with a normal directory that is not a git repo.
         If this var is unset and CWD is in a git repo, then the git repo root is used.
 
 notes:
     sec keeps a tracking file named '$sec_tracking_filename' in the root dir .
         The file contains paths of files tracked, relative to the root dir, one per line
-        and one line per recipient, starting with '_recipient: ' .
+        and one line per recipient, starting with 'recipient: ' .
         Lines starting with '#' are considered comments and ignored .
 
     git dir and work tree: to work with a git dir that is, i.e. a bare repo used for dotfiles,
@@ -106,14 +106,21 @@ _get_root_dir() {
     printf "%s" "${SEC_ROOT_DIR}"
 }
 
-_get_recipient_file() {
-    # TODO
-    # decrypt tracking file
-    _is_file_encrypted "$sec_tracking_file_abspath"
-    # extract and create a recipient file with mktemp
+_populate_recipient_file() {
+    recipient_file="$1"
+    # extract and populate a recipient file passed
     # if not present, add $SEC_RECIPIENT to it
-    # and print the recipient file absolute path
-    echo "/tmp/recipients"
+    printf "" > "$recipient_file"
+    cat "$sec_tracking_file_abspath" |
+        grep '^recipient: ' |
+        sed 's/^recipient: //' > "$recipient_file"
+    [ -z "$SEC_RECIPIENT" ] && [ -z "$(cat "$recipient_file")" ] &&
+        _die "no recipients added yet, check usage to add at least one"
+    [ -z "$SEC_RECIPIENT" ] && return 0
+    grep "^$SEC_RECIPIENT\$" "$recipient_file" >/dev/null ||
+        printf "%s" "$SEC_RECIPIENT" >> "$recipient_file"
+    _dbg "recipient file: $recipient_file"
+    _dbg "recipient file contents: $(cat "$recipient_file")"
 }
 
 _is_file_encrypted() {
@@ -123,10 +130,20 @@ _is_file_encrypted() {
 }
 
 sec_encrypt_file() {
-    # TODO
     file_to_encrypt="$1"
-    recipient_file=$(_get_recipient_file)
-    _dbg "encrypt $file_to_encrypt for recipients: $(cat $recipient_file)"
+    recipient_file="$2"
+    if ! [ -f "$file_to_encrypt" ]; then
+        _warn "file [$file_to_encrypt] does not exists"
+        return 0; fi
+    if _is_file_encrypted "$file_to_encrypt"; then
+        _warn "file [$file_to_encrypt] is already encrypted"
+        return 0; fi
+    tmpfile=$(_mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+    $age -a -R "$recipient_file" -o "$tmpfile" "$file_to_encrypt" ||
+        _die "cannot encrypt file [$file_to_encrypt]"
+    mv -f "$tmpfile" "$file_to_encrypt"
+    _dbg "encrypted file [$file_to_encrypt]"
 }
 
 sec_decrypt_file() {
@@ -153,15 +170,26 @@ _ensure_tracking_file_exists_and_is_decrypted() {
 }
 
 sec_encrypt() {
-    # TODO
-    _dbg "encrypt"
+    recipient_file=$(_mktemp)
+    trap 'rm -f "$recipient_file"' EXIT
+    _populate_recipient_file "$recipient_file"
+    while IFS= read -r f; do
+        printf "%s" "$f" | grep '^#' >/dev/null &&
+            continue
+        printf "%s" "$f" | grep '^recipient: ' >/dev/null &&
+            continue
+        _dbg "read from tracking file: $f"
+        sec_encrypt_file "$sec_root_dir/$f" "$recipient_file"
+    done < "$sec_tracking_file_abspath"
+    sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
+    _info "encrypted all tracked files"
 }
 
 sec_decrypt() {
     while IFS= read -r f; do
         printf "%s" "$f" | grep '^#' >/dev/null &&
             continue
-        printf "%s" "$f" | grep '^_recipient: ' >/dev/null &&
+        printf "%s" "$f" | grep '^recipient: ' >/dev/null &&
             continue
         _dbg "read from tracking file: $f"
         sec_decrypt_file "$sec_root_dir/$f"
@@ -203,7 +231,7 @@ sec_untrack_file() {
             echo "$f" >> "$tmpfile"
             continue
         fi
-        if printf "%s" "$f" | grep '^_recipient: ' >/dev/null; then
+        if printf "%s" "$f" | grep '^recipient: ' >/dev/null; then
             echo "$f" >> "$tmpfile"
             continue
         fi
@@ -231,13 +259,61 @@ sec_untrack_file() {
     fi
 }
 
+sec_add_recipients() {
+    for r in "$@"; do
+        if grep "recipient: $r" "$sec_tracking_file_abspath" >/dev/null; then
+            _warn "recipient already present [$r]"
+        else
+            printf "recipient: %s" "$r" >> "$sec_tracking_file_abspath"
+            _info "added recipient [$r]"
+        fi
+    done
+    recipient_file=$(_mktemp)
+    trap 'rm -f "$recipient_file"' EXIT
+    _populate_recipient_file "$recipient_file"
+    while IFS= read -r f; do
+        if printf "%s" "$f" | grep '^#' >/dev/null; then
+            continue
+        fi
+        if printf "%s" "$f" | grep '^recipient: ' >/dev/null; then
+            continue
+        fi
+        if _is_file_encrypted "$sec_root_dir/$f"; then
+            sec_decrypt_file "$sec_root_dir/$f"
+            sec_encrypt_file "$sec_root_dir/$f" "$recipient_file"
+        fi
+    done < "$sec_tracking_file_abspath"
+}
+
+sec_remove_recipients() {
+    # TODO
+    tmpfile=$(_mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+    for r in "$@"; do
+        if ! grep "^recipient: $r" "$sec_tracking_file_abspath" >/dev/null; then
+            _warn "recipient not present [$r]"
+        else
+            _info "removed recipient [$r]"
+        fi
+    done
+}
+
 sec_list_tracking() {
     if [ ! -f "$sec_tracking_file_abspath" ]; then
         _warn "no file/recipient tracked yet"
         return 0
     fi
+    echo "# recipients:"
+    {
+        [ -z "$SEC_RECIPIENT" ] ||
+        printf "%s (SEC_RECIPIENT env var)\n" "$SEC_RECIPIENT"
     cat "$sec_tracking_file_abspath" |
-        grep -v '^#' | sort
+        grep -v '^#' | grep '^recipient: ' |
+        sed 's/^recipient: //'
+    } | sort
+    echo; echo "# tracked files:"
+    cat "$sec_tracking_file_abspath" |
+        grep -v '^#' | grep -v '^recipient: ' | sort
 }
 
 sec_edit_tracking() {
@@ -257,7 +333,6 @@ main() {
     _dbg "sec_root_dir: $sec_root_dir"
     sec_tracking_file_abspath="$sec_root_dir/$sec_tracking_filename"
 
-    # cd "$sec_root_dir" || _die "cannot cd in root dir [$sec_root_dir]"
     [ -d "$sec_root_dir" ] || _die "root dir [$sec_root_dir] is not a directory"
 
     cmd="$1"
@@ -275,8 +350,8 @@ main() {
         u*) sec_untrack_file "$@";;
         e*) sec_encrypt;;
         d*) sec_decrypt;;
-        a*) sec_add_recipient "$@";;
-        r*) sec_remove_recipient "$@";;
+        a*) sec_add_recipients "$@";;
+        r*) sec_remove_recipients "$@";;
         *) usage;;
     esac
 }
