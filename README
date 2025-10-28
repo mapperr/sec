@@ -27,7 +27,7 @@ env vars:
         If this var is unset and CWD is in a git repo, then the git repo root is used.
 
 notes:
-    sec keeps a tracking file named '$sec_tracking_filename' in the SEC_ROOT_DIR .
+    sec keeps a tracking file named '.sec' in the SEC_ROOT_DIR .
         The file contains paths of files tracked, relative to the root dir, one per line
         and one line per recipient, starting with 'recipient: ' .
         Empty lines and lines starting with '#' are ignored .
