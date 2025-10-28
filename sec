@@ -10,12 +10,13 @@ usage() {
     s="$(basename $0)"
     printf %s "\
 $s
-    a rough handler for age-based secrets stored in git
+    a rough handler for age-based secrets eventually stored in git
 
 commands:
-    t|track <path>  - track a file
-    u|untrack <path>  - untrack a file
-    l|list  - list tracked files
+    l|list  - list tracked files and recipients
+
+    t|track <path> [<path>] ...  - track files
+    u|untrack <path> [<path>] ...  - untrack files
 
     e|encrypt  - encrypt all tracked files
     d|decrypt  - decrypt all tracked files
@@ -23,26 +24,42 @@ commands:
     a|add <public_key>  - add a recipient
     r|rm <public_key>  - remove a recipient
 
+    m|modify  - edit tracking file directly with ${EDITOR:-vi}, use caution!
+
 env vars:
-    SEC_IDENTITY_FILE  - age/ssh identity file to use for decryption
+    SEC_IDENTITY_FILE  - [mandatory] age/ssh identity file to use for decryption
+
+    SEC_RECIPIENT  - [optional] your age/ssh publickey to use for enryption .
+        Set this to always ensure that your pubkey is present in the recipients,
+        to avoid an epic lock-out : )
+
+    SEC_ROOT_DIR  - [optional] set the root dir forbicly, to address a bunch of use cases,
+        like working with a normal directory that is not a git repo.
+        If this var is unset and CWD is in a git repo, then the git repo root is used.
 
 notes:
-    sec keeps a file named '$sec_tracking_filename' in the repo root
+    sec keeps a tracking file named '$sec_tracking_filename' in the root dir .
+        The file contains paths of files tracked, relative to the root dir, one per line
+        and one line per recipient, starting with '_ ' .
+        Lines starting with '#' are considered comments and ignored .
+
+    git dir and work tree: to work with a git dir that is, i.e. a bare repo used for dotfiles,
+        just set GIT_DIR and GIT_WORK_TREE env variables
 "
 exit 0
 }
 
 _die() {
-    printf "%s: %s\n" "$(basename $0)" "$@"
+    printf "%s: error: %s\n" "$(basename $0)" "$@" >&2
     exit 1
 }
 
 _warn() {
-    printf "%s: warn: %s\n" "$(basename $0)" "$@"
+    printf "%s: warn: %s\n" "$(basename $0)" "$@" >&2
 }
 _dbg() {
     [ "$SEC_DEBUG" ] &&
-        printf "%s: debug: %s\n" "$(basename $0)" "$@"
+        printf "%s: debug: %s\n" "$(basename $0)" "$@" >&2
 }
 
 _rand_chars() {
@@ -74,17 +91,50 @@ _mktemp() {
     printf "%s" "$tmpfile"
 }
 
-_is_cwd_a_git_repo() {
+_is_cwd_in_a_git_repo() {
     git rev-parse --show-toplevel >/dev/null 2>&1
     return $?
 }
 
-_get_git_top_dir() {
-    git rev-parse --show-toplevel
+_get_root_dir() {
+    [ -z "${SEC_ROOT_DIR:=$(git rev-parse --show-toplevel 2>/dev/null)}" ] &&
+        _die "CWD is not a git repo, set SEC_ROOT_DIR explicitly or check usage"
+    printf "%s" "${SEC_ROOT_DIR}"
+}
+
+_get_recipient_file() {
+    # TODO
+    # decrypt tracking file
+    # extract and create a recipient file with mktemp
+    # if not present, add $SEC_RECIPIENT to it
+    # and print the recipient file absolute path
+    echo "/tmp/recipients"
+}
+
+_ensure_tracking_file_is_decrypted() {
+    # TODO
+    # decrypt tracking file
+    _dbg "tracking file decrypted"
+}
+
+sec_encrypt_file() {
+    recipient_file=$(_get_recipient_file)
+    _dbg "encrypt $file_to_encrypt for recipients: $(cat $recipient_file)"
 }
 
 sec_decrypt_file() {
-    echo decrypt
+    # TODO
+    _dbg "decrypt $file_to_decrypt"
+}
+
+sec_encrypt() {
+    # TODO
+    _dbg "encrypt"
+}
+
+sec_decrypt() {
+    # TODO
+    _dbg "decrypt"
 }
 
 sec_track_file() {
@@ -95,34 +145,47 @@ sec_track_file() {
             _warn "file [$f] does not exists, not tracked"
             continue
         fi
-        grep "^$f\$" "$sec_tracking_file_path" >/dev/null &&
+        if grep "^$f\$" "$sec_tracking_file_path" >/dev/null; then
+            _warn "file [$f] already tracked"
             continue
+        fi
         echo "$f" >>"$sec_tracking_file_path"
         echo "tracked [$f]"
     done
 }
 
-
 sec_untrack_file() {
-    if [ -f "$sec_tracking_file_path" ]; then
+    if [ ! -f "$sec_tracking_file_path" ]; then
         _warn "no file tracked yet"
         return 0
     fi
     tmpfile=$(_mktemp)
     trap 'rm -f "$tmpfile"' EXIT
+    any_match="false"
     while IFS= read -r f; do
+        if printf "%s" "$f" | grep '^#' >/dev/null; then
+            echo "$f" >> "$tmpfile"
+            continue
+        fi
         _dbg "read from tracking file: $f"
         match=false
         for u in "$@"; do
             [ "$f" = "$u" ] && match=true
         done
         if [ "$match" = "true" ]; then
-            sec_decrypt_file "$f"
-        fi
-        [ "$match" = "false" ] &&
+            any_match="true"
+            file_to_decrypt="$f"
+            sec_decrypt_file "$file_to_decrypt"
+            unset file_to_decrypt
+        else
             echo "$f" >> "$tmpfile"
+        fi
     done < "$sec_tracking_file_path"
-    mv "$tmpfile" "$sec_tracking_file_path"
+    if [ "$any_match" = "true" ]; then
+        mv "$tmpfile" "$sec_tracking_file_path"
+    else
+        _warn "files are not tracked, nothing to untrack"
+    fi
 }
 
 sec_list_tracking() {
@@ -130,29 +193,34 @@ sec_list_tracking() {
         _warn "no file/recipient tracked yet"
         return 0
     fi
-    cat "$sec_tracking_file_path"
+    cat "$sec_tracking_file_path" |
+        grep -v '^#' | sort
+}
+
+sec_edit_tracking() {
+    ${EDITOR:-vi} "$sec_tracking_file_path"
 }
 
 main() {
-    : ${SEC_IDENTITY_FILE:?$(_die "setup the SEC_IDENTITY_FILE env var")}
+    : "${SEC_IDENTITY_FILE:?$(_die "setup the SEC_IDENTITY_FILE env var")}"
 
     age=$(command -v age || command -v rage) ||
         _die "age not found, install per https://age-encryption.org"
     age_keygen=$(command -v age-keygen || command -v rage-keygen) ||
         _die "age-keygen not found, install per https://age-encryption.org"
 
-    _is_cwd_a_git_repo ||
-        _die "current directory is not a git repository"
-
-    git_top_dir=$(_get_git_top_dir)
-    sec_tracking_file_path="$git_top_dir/$sec_tracking_filename"
+    sec_root_dir=$(_get_root_dir)
+    _dbg "sec_root_dir: $sec_root_dir"
+    [ -z "$sec_root_dir" ] && exit 1
+    sec_tracking_file_path="$sec_root_dir/$sec_tracking_filename"
 
     cmd="$1"
     shift
     case $cmd in
+        l*) sec_list_tracking;;
+        m*) sec_edit_tracking;;
         t*) sec_track_file "$@";;
         u*) sec_untrack_file "$@";;
-        l*) sec_list_tracking;;
         e*) sec_encrypt;;
         d*) sec_decrypt;;
         a*) sec_add_recipient "$@";;
