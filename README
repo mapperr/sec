@@ -13,7 +13,7 @@ commands:
     a|add <public_key> [<public_key>] ...  - add recipients
     r|rm <public_key> [<public_key>] ...  - remove recipients
 
-    m|modify  - edit tracking file directly with \$EDITOR, use caution!
+    m|modify  - edit tracking file directly with $EDITOR, use caution!
 
 env vars:
     SEC_IDENTITY_FILE  - [mandatory] age identity file to use for decryption
