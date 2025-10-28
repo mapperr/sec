@@ -173,7 +173,11 @@ sec_encrypt() {
     recipient_file=$(_mktemp)
     trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
-    while IFS= read -r f; do
+    while read -r f || [ -n "$f" ]; do
+        if [ -z "$f" ]; then
+            _dbg "[$f] is an empty line, ignoring"
+            continue
+        fi
         printf "%s" "$f" | grep '^#' >/dev/null &&
             continue
         printf "%s" "$f" | grep '^recipient: ' >/dev/null &&
@@ -186,7 +190,11 @@ sec_encrypt() {
 }
 
 sec_decrypt() {
-    while IFS= read -r f; do
+    while read -r f || [ -n "$f" ]; do
+        if [ -z "$f" ]; then
+            _dbg "[$f] is an empty line, ignoring"
+            continue
+        fi
         printf "%s" "$f" | grep '^#' >/dev/null &&
             continue
         printf "%s" "$f" | grep '^recipient: ' >/dev/null &&
@@ -226,7 +234,11 @@ sec_untrack_file() {
     trap 'rm -f "$tmpfile"' EXIT
     any_match="false"
     untracked_files=""
-    while IFS= read -r f; do
+    while read -r f || [ -n "$f" ]; do
+        if [ -z "$f" ]; then
+            _dbg "[$f] is an empty line, ignoring"
+            continue
+        fi
         if printf "%s" "$f" | grep '^#' >/dev/null; then
             echo "$f" >> "$tmpfile"
             continue
@@ -259,19 +271,15 @@ sec_untrack_file() {
     fi
 }
 
-sec_add_recipients() {
-    for r in "$@"; do
-        if grep "recipient: $r" "$sec_tracking_file_abspath" >/dev/null; then
-            _warn "recipient already present [$r]"
-        else
-            printf "recipient: %s" "$r" >> "$sec_tracking_file_abspath"
-            _info "added recipient [$r]"
-        fi
-    done
+_reencrypt_encrypted_files() {
     recipient_file=$(_mktemp)
     trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
-    while IFS= read -r f; do
+    while read -r f || [ -n "$f" ]; do
+        if [ -z "$f" ]; then
+            _dbg "[$f] is an empty line, ignoring"
+            continue
+        fi
         if printf "%s" "$f" | grep '^#' >/dev/null; then
             continue
         fi
@@ -285,17 +293,63 @@ sec_add_recipients() {
     done < "$sec_tracking_file_abspath"
 }
 
-sec_remove_recipients() {
-    # TODO
-    tmpfile=$(_mktemp)
-    trap 'rm -f "$tmpfile"' EXIT
+sec_add_recipients() {
+    any_added="false"
     for r in "$@"; do
-        if ! grep "^recipient: $r" "$sec_tracking_file_abspath" >/dev/null; then
-            _warn "recipient not present [$r]"
+        if grep "recipient: $r" "$sec_tracking_file_abspath" >/dev/null; then
+            _warn "recipient already present [$r]"
         else
-            _info "removed recipient [$r]"
+            printf "recipient: %s" "$r" >> "$sec_tracking_file_abspath"
+            any_added="true"
+            _info "added recipient [$r]"
         fi
     done
+    [ "$any_added" = "true" ] && _reencrypt_encrypted_files
+}
+
+sec_remove_recipients() {
+    tmpfile=$(_mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+
+    removed_recipients=""
+    while read -r f || [ -n "$f" ]; do
+        _dbg "scanning [$f] for a recipient to remove"
+        if [ -z "$f" ]; then
+            _dbg "[$f] is an empty line, ignoring"
+            continue
+        fi
+        if printf "%s" "$f" | grep '^#' >/dev/null; then
+            _dbg "[$f] is a comment, ignoring"
+            echo "$f" >> "$tmpfile"
+            continue
+        fi
+        if ! printf "%s" "$f" | grep '^recipient: ' >/dev/null; then
+            _dbg "[$f] is not a recipient, ignoring"
+            echo "$f" >> "$tmpfile"
+            continue
+        fi
+        _dbg "check if [$f] matches a recipient to remove"
+        match="false"
+        f_cleaned="$(printf "%s" "$f" | sed 's/^recipient: //')"
+        for r in "$@"; do
+            _dbg "try to match [$r]"
+            [ "$f_cleaned" = "$r" ] &&
+                match="true"
+        done
+        if [ "$match" = "true" ]; then
+            _dbg "matched [$f]"
+            removed_recipients="$removed_recipients $f_cleaned"
+        else
+            echo "$f" >> "$tmpfile"
+        fi
+    done < "$sec_tracking_file_abspath"
+    if [ ! -z "$removed_recipients" ]; then
+        mv -f "$tmpfile" "$sec_tracking_file_abspath"
+        _info "removed recipients: [$removed_recipients ]"
+        _reencrypt_encrypted_files
+    else
+        _warn "recipients passed in input are not present, nothing to remove"
+    fi
 }
 
 sec_list_tracking() {
