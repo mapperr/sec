@@ -75,15 +75,20 @@ _is_cwd_a_git_repo() {
     return $?
 }
 
-_get_git_top_directory() {
+_get_git_top_dir() {
     git rev-parse --show-toplevel
 }
 
 sec_track_file() {
-    [ -f "$sec_tracking_file_path" ] || touch "$sec_tracking_file_path"
+    [ -f "$sec_tracking_file_path" ] ||
+        touch "$sec_tracking_file_path"
     for f in "$@"; do
-        if [ ! -f "$f" ]; then _warn "file [$f] does not exists, not tracked"; continue; fi
-        grep "^$f\$" "$sec_tracking_file_path" >/dev/null && continue
+        if [ ! -f "$f" ]; then
+            _warn "file [$f] does not exists, not tracked"
+            continue
+        fi
+        grep "^$f\$" "$sec_tracking_file_path" >/dev/null &&
+            continue
         echo "$f" >>"$sec_tracking_file_path"
         echo "tracked [$f]"
     done
@@ -128,7 +133,7 @@ main() {
     _is_cwd_a_git_repo ||
         _die "current directory is not a git repository"
 
-    git_top_dir=$(_get_git_top_directory)
+    git_top_dir=$(_get_git_top_dir)
     sec_tracking_file_path="$git_top_dir/$sec_tracking_filename"
 
     cmd="$1"
