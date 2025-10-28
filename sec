@@ -26,12 +26,12 @@ commands:
     a|add <public_key> [<public_key>] ...  - add recipients
     r|rm <public_key> [<public_key>] ...  - remove recipients
 
-    m|modify  - edit tracking file directly with ${EDITOR:-vi}, use caution!
+    m|modify  - edit tracking file directly with \$EDITOR, use caution!
 
 env vars:
-    SEC_IDENTITY_FILE  - [mandatory] age/ssh identity file to use for decryption
+    SEC_IDENTITY_FILE  - [mandatory] age identity file to use for decryption
 
-    SEC_RECIPIENT  - [optional] your age/ssh publickey to use for enryption .
+    SEC_RECIPIENT  - [optional] your age publickey to use for enryption .
         Set this to always ensure that your pubkey is present in the recipients,
         to avoid an epic lock-out : )
 
@@ -151,13 +151,6 @@ sec_decrypt_file() {
         _die "cannot decrypt file [$file_to_decrypt]"
     mv -f "$tmpfile" "$file_to_decrypt"
     _dbg "decrypted $file_to_decrypt"
-}
-
-_ensure_tracking_file_exists_and_is_decrypted() {
-    [ -f "$sec_tracking_file_abspath" ] ||
-        touch "$sec_tracking_file_abspath"
-    sec_decrypt_file "$sec_tracking_file_abspath"
-    _dbg "tracking file is decrypted"
 }
 
 sec_encrypt() {
@@ -363,6 +356,13 @@ sec_list_tracking() {
 
 sec_edit_tracking() {
     ${EDITOR:-vi} "$sec_tracking_file_abspath"
+}
+
+_ensure_tracking_file_exists_and_is_decrypted() {
+    [ -f "$sec_tracking_file_abspath" ] ||
+        touch "$sec_tracking_file_abspath"
+    sec_decrypt_file "$sec_tracking_file_abspath"
+    _dbg "tracking file is decrypted"
 }
 
 main() {
