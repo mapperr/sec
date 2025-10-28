@@ -40,6 +40,10 @@ _die() {
 _warn() {
     printf "%s: warn: %s\n" "$(basename $0)" "$@"
 }
+_dbg() {
+    [ "$SEC_DEBUG" ] &&
+        printf "%s: debug: %s\n" "$(basename $0)" "$@"
+}
 
 _rand_chars() {
     # Generate random characters by reading '/dev/urandom' with the
@@ -79,6 +83,10 @@ _get_git_top_dir() {
     git rev-parse --show-toplevel
 }
 
+sec_decrypt_file() {
+    echo decrypt
+}
+
 sec_track_file() {
     [ -f "$sec_tracking_file_path" ] ||
         touch "$sec_tracking_file_path"
@@ -96,19 +104,21 @@ sec_track_file() {
 
 
 sec_untrack_file() {
-    [ -f "$sec_tracking_file_path" ] ||
-        ( _warn "no file tracked yet" &&
-        return 0 )
+    if [ -f "$sec_tracking_file_path" ]; then
+        _warn "no file tracked yet"
+        return 0
+    fi
     tmpfile=$(_mktemp)
     trap 'rm -f "$tmpfile"' EXIT
-    while IFS= read f; do
-        echo "read from tracking file: $f"
+    while IFS= read -r f; do
+        _dbg "read from tracking file: $f"
         match=false
         for u in "$@"; do
             [ "$f" = "$u" ] && match=true
         done
-        [ "$match" = "true" ] &&
+        if [ "$match" = "true" ]; then
             sec_decrypt_file "$f"
+        fi
         [ "$match" = "false" ] &&
             echo "$f" >> "$tmpfile"
     done < "$sec_tracking_file_path"
@@ -116,9 +126,10 @@ sec_untrack_file() {
 }
 
 sec_list_tracking() {
-    [ -f "$sec_tracking_file_path" ] ||
-        ( _warn "no file/recipient tracked yet" &&
-        return 0 )
+    if [ ! -f "$sec_tracking_file_path" ]; then
+        _warn "no file/recipient tracked yet"
+        return 0
+    fi
     cat "$sec_tracking_file_path"
 }
 
