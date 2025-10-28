@@ -3,6 +3,7 @@
 # inspiration taken from:
 # https://github.com/slok/agebox
 # https://github.com/biox/pa
+# check them out!
 
 sec_tracking_filename=.sec
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
@@ -39,10 +40,10 @@ env vars:
         If this var is unset and CWD is in a git repo, then the git repo root is used.
 
 notes:
-    sec keeps a tracking file named '$sec_tracking_filename' in the root dir .
+    sec keeps a tracking file named '$sec_tracking_filename' in the SEC_ROOT_DIR .
         The file contains paths of files tracked, relative to the root dir, one per line
         and one line per recipient, starting with 'recipient: ' .
-        Lines starting with '#' are considered comments and ignored .
+        Empty lines and lines starting with '#' are ignored .
 
     git dir and work tree: to work with a git dir that is, i.e. a bare repo used for dotfiles,
         just set GIT_DIR and GIT_WORK_TREE env variables
@@ -54,28 +55,18 @@ _die() {
     printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2
     exit 1
 }
-
 _warn() {
     printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2
+}
+_info() {
+    printf "%s: %s\n" "$(basename "$0")" "$1" >&2
 }
 _dbg() {
     [ "$SEC_DEBUG" ] &&
         printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2
 }
-_info() {
-    printf "%s: %s\n" "$(basename "$0")" "$1" >&2
-}
 
 _rand_chars() {
-    # Generate random characters by reading '/dev/urandom' with the
-    # 'tr' command to translate the random bytes into a
-    # configurable character set.
-    #
-    # The 'dd' command is then used to read only the desired length.
-    #
-    # Regarding usage of '/dev/urandom' instead of '/dev/random'.
-    # See: https://www.2uo.de/myths-about-urandom
-    #
     # $1 = number of chars to receive
     # $2 = filter for the chars
     LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null
