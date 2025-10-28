@@ -5,6 +5,7 @@
 # https://github.com/biox/pa
 
 sec_tracking_filename=.sec
+age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
 
 usage() {
     s="$(basename $0)"
@@ -40,7 +41,7 @@ env vars:
 notes:
     sec keeps a tracking file named '$sec_tracking_filename' in the root dir .
         The file contains paths of files tracked, relative to the root dir, one per line
-        and one line per recipient, starting with '_ ' .
+        and one line per recipient, starting with '_recipient: ' .
         Lines starting with '#' are considered comments and ignored .
 
     git dir and work tree: to work with a git dir that is, i.e. a bare repo used for dotfiles,
@@ -50,16 +51,16 @@ exit 0
 }
 
 _die() {
-    printf "%s: error: %s\n" "$(basename $0)" "$@" >&2
+    printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2
     exit 1
 }
 
 _warn() {
-    printf "%s: warn: %s\n" "$(basename $0)" "$@" >&2
+    printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2
 }
 _dbg() {
     [ "$SEC_DEBUG" ] &&
-        printf "%s: debug: %s\n" "$(basename $0)" "$@" >&2
+        printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2
 }
 
 _rand_chars() {
@@ -105,26 +106,46 @@ _get_root_dir() {
 _get_recipient_file() {
     # TODO
     # decrypt tracking file
+    _is_file_encrypted "$sec_tracking_file_path"
     # extract and create a recipient file with mktemp
     # if not present, add $SEC_RECIPIENT to it
     # and print the recipient file absolute path
     echo "/tmp/recipients"
 }
 
-_ensure_tracking_file_is_decrypted() {
-    # TODO
-    # decrypt tracking file
-    _dbg "tracking file decrypted"
+_is_file_encrypted() {
+    file_to_check="$1"
+    head -n1 "$file_to_check" |
+        grep "^$age_armored_header\$" >/dev/null
 }
 
 sec_encrypt_file() {
+    # TODO
+    file_to_encrypt="$1"
     recipient_file=$(_get_recipient_file)
     _dbg "encrypt $file_to_encrypt for recipients: $(cat $recipient_file)"
 }
 
 sec_decrypt_file() {
-    # TODO
-    _dbg "decrypt $file_to_decrypt"
+    file_to_decrypt="$1"
+    [ -f "$file_to_decrypt" ] ||
+        ( _warn "file [$file_to_decrypt] does not exists" &&
+        return 0 )
+    _is_file_encrypted "$file_to_decrypt" ||
+        return 0
+    tmpfile=$(_mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+    $age -d -i "$SEC_IDENTITY_FILE" -o "$tmpfile" "$file_to_decrypt" ||
+        _die "cannot decrypt file [$file_to_decrypt]"
+    mv -f "$tmpfile" "$file_to_decrypt"
+    _dbg "decrypted $file_to_decrypt"
+}
+
+_ensure_tracking_file_exists_and_is_decrypted() {
+    [ -f "$sec_tracking_file_path" ] ||
+        touch "$sec_tracking_file_path"
+    sec_decrypt_file "$sec_tracking_file_path"
+    _dbg "tracking file decrypted"
 }
 
 sec_encrypt() {
@@ -133,13 +154,18 @@ sec_encrypt() {
 }
 
 sec_decrypt() {
-    # TODO
-    _dbg "decrypt"
+    while IFS= read -r f; do
+        printf "%s" "$f" | grep '^#' >/dev/null &&
+            continue
+        printf "%s" "$f" | grep '^_recipient: ' >/dev/null &&
+            continue
+        _dbg "read from tracking file: $f"
+        sec_decrypt_file "$f"
+    done < "$sec_tracking_file_path"
+    _dbg "decrypted all tracked files"
 }
 
 sec_track_file() {
-    [ -f "$sec_tracking_file_path" ] ||
-        touch "$sec_tracking_file_path"
     for f in "$@"; do
         if [ ! -f "$f" ]; then
             _warn "file [$f] does not exists, not tracked"
@@ -174,9 +200,7 @@ sec_untrack_file() {
         done
         if [ "$match" = "true" ]; then
             any_match="true"
-            file_to_decrypt="$f"
-            sec_decrypt_file "$file_to_decrypt"
-            unset file_to_decrypt
+            sec_decrypt_file "$f"
         else
             echo "$f" >> "$tmpfile"
         fi
@@ -206,16 +230,24 @@ main() {
 
     age=$(command -v age || command -v rage) ||
         _die "age not found, install per https://age-encryption.org"
-    age_keygen=$(command -v age-keygen || command -v rage-keygen) ||
-        _die "age-keygen not found, install per https://age-encryption.org"
+    # age_keygen=$(command -v age-keygen || command -v rage-keygen) ||
+    #     _die "age-keygen not found, install per https://age-encryption.org"
 
     sec_root_dir=$(_get_root_dir)
-    _dbg "sec_root_dir: $sec_root_dir"
     [ -z "$sec_root_dir" ] && exit 1
+    _dbg "sec_root_dir: $sec_root_dir"
     sec_tracking_file_path="$sec_root_dir/$sec_tracking_filename"
+
+    cd "$sec_root_dir" || _die "cannot cd in root dir [$sec_root_dir]"
 
     cmd="$1"
     shift
+
+    case $cmd in
+        m*) sec_edit_tracking; return 0;;
+    esac
+
+    _ensure_tracking_file_exists_and_is_decrypted
     case $cmd in
         l*) sec_list_tracking;;
         m*) sec_edit_tracking;;
