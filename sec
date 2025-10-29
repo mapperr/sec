@@ -14,6 +14,9 @@ commands:
 
     l|list  - list tracked files and recipients
 
+    a|add <public_key> [<public_key>] ...  - add recipients
+    r|rm <public_key> [<public_key>] ...  - remove recipients
+
     t|track <path> [<path>] ...  - track files
     u|untrack <path> [<path>] ...  - untrack files
 
@@ -25,10 +28,13 @@ commands:
     se|sencrypt  - encrypt content from stdin and prints to stdout
     sd|sdecrypt  - decrypt content from stdin and prints to stdout
 
-    a|add <public_key> [<public_key>] ...  - add recipients
-    r|rm <public_key> [<public_key>] ...  - remove recipients
-
+    # debug/utility commands
     m|modify  - edit tracking file directly with \$EDITOR, use caution!
+
+    # NOT IMPLEMETED: IN EVALUATION
+    # git-related commands: thery only works in a git repo
+    git-mode on|off  - (un)installs git configs (filters, etc.) in local repo
+    git-encrypt <path>  - encryption to use in git clean filter
 "
 }
 
@@ -133,7 +139,7 @@ sec_encrypt_stream() {
     trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
 
-    content_to_encrypt="$(cat)"
+    content_to_encrypt="$(cat | tr -d '\0')"
     tmpfile=$(_mktemp)
     trap 'rm -f "$tmpfile"' EXIT
     printf "%s" "$content_to_encrypt" > "$tmpfile"
@@ -147,12 +153,14 @@ sec_encrypt_stream() {
 }
 
 sec_decrypt_stream() {
-    content_to_decrypt="$(cat)"
+    content_to_decrypt="$(cat | tr -d '\0')"
+    [ -z "$content_to_decrypt" ] && return 0
     tmpfile=$(_mktemp)
     trap 'rm -f "$tmpfile"' EXIT
     printf "%s" "$content_to_decrypt" > "$tmpfile"
     if ! _is_file_encrypted "$tmpfile"; then
         _dbg "stream is not encrypted"
+        printf "%s" "$content_to_decrypt"
         return 0; fi
     $age -d -i "$SEC_IDENTITY_FILE" "$tmpfile" ||
         _die "cannot decrypt input stream"

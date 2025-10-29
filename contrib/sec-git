@@ -1,3 +1,88 @@
 #!/bin/sh
-
 # setup/remove git filter and diff text converter
+
+usage() {
+    s="$(basename "$0")"
+    printf "%s" "\
+$s
+    handles git configs to transparently use sec in your repo
+
+    on  - install sec in your git repo
+    off  - removes sec from your git repo
+"
+}
+
+cmd="$1"
+[ -z "$cmd" ] || shift
+
+is_git_mode_on() {
+    git config --local filter.sec.clean
+}
+turn_git_mode_off() {
+    git config --local --unset-all filter.sec.clean
+    git config --local --unset-all filter.sec.smudge
+    git config --local --unset-all filter.sec.required
+    git config --local --unset-all diff.sec.textconv
+}
+turn_git_mode_on() {
+    git config --local filter.sec.clean "sec-git encrypt %f"
+    git config --local filter.sec.smudge "sec-git decrypt %f"
+    git config --local filter.sec.required true
+    git config --local diff.sec.textconv "sec-git decrypt"
+}
+
+sec_git_encrypt() {
+    content=$(cat)
+    file="$1"
+    encrypted_git_file_content=$(git show HEAD:"$file" 2>/dev/null || echo "")
+    if [ -n "$encrypted_git_file_content" ]; then
+        decrypted_git_file_content="$(printf "%s" "$encrypted_git_file_content" | sec sd)"
+        [ "$content" = "$decrypted_git_file_content" ] &&
+           printf "%s" "$encrypted_git_file_content"  &&
+           exit 0
+    fi
+    printf "%s" "$content" | sec se
+}
+sec_git_decrypt () {
+    file="$1"
+    if [ -z "$file" ] || [ ! -r "$file" ]; then printf ""; fi
+    content="$(cat "$file" || printf "")"
+    if [ -z "$content" ]; then printf ""; fi
+    decrypted_content="$(printf "%s" "$content" | sec sd)"
+    printf "\n\nfile [$file], content [$content], decrypted_content [$decrypted_content]" >/tmp/sec.log
+    printf "%s" "$decrypted_content"
+}
+
+if [ "$cmd" = "on" ]; then
+    turn_git_mode_off
+    turn_git_mode_on
+
+elif [ "$cmd" = "off" ]; then
+    turn_git_mode_off
+
+elif [ "$cmd" = "encrypt" ]; then
+    sec_git_encrypt "$1"
+
+elif [ "$cmd" = "decrypt" ]; then
+    sec_git_decrypt "$1"
+
+elif [ "$cmd" = "l" ] || [ "$cmd" = "ls" ] || [ "$cmd" = "list" ]; then
+    if is_git_mode_on; then
+        printf "git mode is ON\n\n"
+    fi
+    sec l
+
+elif [ -z "$cmd" ]; then
+    usage
+    echo
+    sec help
+else
+    sec "$cmd" "$@"
+fi
+
+
+# checking git-filtered files examples
+# $ git check-attr filter -- /path/to/file
+# /path/to/file: filter: sec
+# $ git check-attr filter -- /path/to/nonfiltered/file
+# /path/to/nonfiltered/file: filter: unspecified
