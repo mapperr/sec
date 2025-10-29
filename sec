@@ -1,10 +1,5 @@
 #!/bin/sh
 
-# inspiration taken from:
-# https://github.com/slok/agebox
-# https://github.com/biox/pa
-# check them out!
-
 sec_tracking_filename=.sec
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
 
