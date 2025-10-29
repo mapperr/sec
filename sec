@@ -389,11 +389,10 @@ sec_list_tracking() {
     fi
     echo "# recipients:"
     {
-        [ -z "$SEC_RECIPIENT" ] ||
-        printf "%s (SEC_RECIPIENT env var)\n" "$SEC_RECIPIENT"
     cat "$sec_tracking_file_abspath" |
         grep -v '^#' | grep '^recipient: ' |
-        sed 's/^recipient: //'
+        sed 's/^recipient: //' |
+        sed "s/^\(${SEC_RECIPIENT:-_}\)/\1 <- SEC_RECIPIENT/"
     } | sort
     echo; echo "# tracked files:"
     cat "$sec_tracking_file_abspath" |
@@ -409,6 +408,11 @@ _ensure_tracking_file_exists_and_is_decrypted() {
         touch "$sec_tracking_file_abspath"
     sec_decrypt_file "$sec_tracking_file_abspath"
     _dbg "tracking file is decrypted"
+}
+_ensure_recipient_from_env_is_in_tracking_file() {
+    [ -z "$SEC_RECIPIENT" ] && return 0
+    grep "^recipient: $SEC_RECIPIENT\$" "$sec_tracking_file_abspath" >/dev/null ||
+    sec_add_recipients "$SEC_RECIPIENT"
 }
 
 main() {
@@ -434,6 +438,7 @@ main() {
     esac
 
     _ensure_tracking_file_exists_and_is_decrypted
+    _ensure_recipient_from_env_is_in_tracking_file
     case $cmd in
         l*) sec_list_tracking;;
         m*) sec_edit_tracking;;
