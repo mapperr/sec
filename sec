@@ -120,6 +120,35 @@ _is_file_encrypted() {
         grep "^$age_armored_header\$" >/dev/null
 }
 
+sec_encrypt_stream() {
+    recipient_file=$(_mktemp)
+    trap 'rm -f "$recipient_file"' EXIT
+    _populate_recipient_file "$recipient_file"
+
+    content_to_encrypt="$(cat)"
+    tmpfile=$(_mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+    printf "%s" "$content_to_encrypt" > "$tmpfile"
+
+    if _is_file_encrypted "$tmpfile"; then
+        _warn "file [$tmpfile] is already encrypted"
+        return 0; fi
+    $age -a -R "$recipient_file" "$tmpfile" ||
+        _die "cannot encrypt input stream"
+}
+
+sec_decrypt_stream() {
+    content_to_decrypt="$(cat)"
+    tmpfile=$(_mktemp)
+    trap 'rm -f "$tmpfile"' EXIT
+    printf "%s" "$content_to_decrypt" > "$tmpfile"
+    if ! _is_file_encrypted "$tmpfile"; then
+        _dbg "file [$tmpfile] is not encrypted"
+        return 0; fi
+    $age -d -i "$SEC_IDENTITY_FILE" "$tmpfile" ||
+        _die "cannot decrypt input stream"
+}
+
 sec_encrypt_file() {
     file_to_encrypt="$1"
     recipient_file="$2"
@@ -395,6 +424,10 @@ main() {
         u*) sec_untrack_file "$@";;
         e*) sec_encrypt;;
         d*) sec_decrypt;;
+        fe*) sec_encrypt_file "$@";;
+        fd*) sec_decrypt_file "$@";;
+        se*) sec_encrypt_stream;;
+        sd*) sec_decrypt_stream;;
         a*) sec_add_recipients "$@";;
         r*) sec_remove_recipients "$@";;
         *) usage;;
