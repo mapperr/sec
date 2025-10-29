@@ -13,24 +13,29 @@ commands:
     e|encrypt  - encrypt all tracked files
     d|decrypt  - decrypt all tracked files
 
+    fe|fencrypt <path>  - encrypt a single file
+    fd|fdecrypt <path>  - decrypt a single file
+    se|sencrypt  - encrypt content from stdin and prints to stdout
+    sd|sdecrypt  - decrypt content from stdin and prints to stdout
+
     a|add <public_key> [<public_key>] ...  - add recipients
     r|rm <public_key> [<public_key>] ...  - remove recipients
 
-    m|modify  - edit tracking file directly with $EDITOR, use caution!
+    m|modify  - edit tracking file directly with \$EDITOR, use caution!
 
 env vars:
     SEC_IDENTITY_FILE  - [mandatory] age identity file to use for decryption
 
-    SEC_RECIPIENT  - [optional] your age publickey to use for enryption .
+    SEC_RECIPIENT  - [optional] your age publickey to use for encryption .
         Set this to always ensure that your pubkey is present in the recipients,
         to avoid an epic lock-out : )
 
-    SEC_ROOT_DIR  - [optional] set the root dir forcibly, to address a bunch of use cases,
-        like working with a normal directory that is not a git repo.
+    SEC_ROOT_DIR  - [optional if PWD is in a git repo] set the root dir forcibly,
+        to address a bunch of use cases, like working with a normal directory that is not a git repo.
         If this var is unset and CWD is in a git repo, then the git repo root is used.
 
 notes:
-    sec keeps a tracking file named '.sec' in the SEC_ROOT_DIR .
+    sec keeps a tracking file named '$sec_tracking_filename' in the SEC_ROOT_DIR .
         The file contains paths of files tracked, relative to the root dir, one per line
         and one line per recipient, starting with 'recipient: ' .
         Empty lines and lines starting with '#' are ignored .

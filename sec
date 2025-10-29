@@ -10,6 +10,8 @@ $s
     a rough handler for age-based secrets eventually stored in git
 
 commands:
+    h|help  - show extended help
+
     l|list  - list tracked files and recipients
 
     t|track <path> [<path>] ...  - track files
@@ -27,16 +29,23 @@ commands:
     r|rm <public_key> [<public_key>] ...  - remove recipients
 
     m|modify  - edit tracking file directly with \$EDITOR, use caution!
+"
+}
+
+usage_extended() {
+    s="$(basename $0)"
+    usage
+    printf %s "\
 
 env vars:
     SEC_IDENTITY_FILE  - [mandatory] age identity file to use for decryption
 
-    SEC_RECIPIENT  - [optional] your age publickey to use for enryption .
+    SEC_RECIPIENT  - [optional] your age publickey to use for encryption .
         Set this to always ensure that your pubkey is present in the recipients,
         to avoid an epic lock-out : )
 
-    SEC_ROOT_DIR  - [optional] set the root dir forcibly, to address a bunch of use cases,
-        like working with a normal directory that is not a git repo.
+    SEC_ROOT_DIR  - [optional if PWD is in a git repo] set the root dir forcibly,
+        to address a bunch of use cases, like working with a normal directory that is not a git repo.
         If this var is unset and CWD is in a git repo, then the git repo root is used.
 
 notes:
@@ -48,7 +57,6 @@ notes:
     git dir and work tree: to work with a git dir that is, i.e. a bare repo used for dotfiles,
         just set GIT_DIR and GIT_WORK_TREE env variables
 "
-exit 0
 }
 
 _die() {
@@ -431,10 +439,11 @@ main() {
         sd*) sec_decrypt_stream;;
         a*) sec_add_recipients "$@";;
         r*) sec_remove_recipients "$@";;
-        *) usage;;
+        h*) usage_extended; exit 0;;
+        *) usage; exit 0;;
     esac
 }
 
-[ "$1" ] || usage && main "$@"
+[ "$1" ] || { usage; exit 0; } && main "$@"
 
 # vim: set expandtab tabstop=4 shiftwidth=4:
