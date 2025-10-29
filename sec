@@ -131,7 +131,8 @@ sec_encrypt_stream() {
     printf "%s" "$content_to_encrypt" > "$tmpfile"
 
     if _is_file_encrypted "$tmpfile"; then
-        _warn "file [$tmpfile] is already encrypted"
+        _warn "stream is already encrypted, printing as-is:"
+        cat "$tmpfile"
         return 0; fi
     $age -a -R "$recipient_file" "$tmpfile" ||
         _die "cannot encrypt input stream"
@@ -143,7 +144,7 @@ sec_decrypt_stream() {
     trap 'rm -f "$tmpfile"' EXIT
     printf "%s" "$content_to_decrypt" > "$tmpfile"
     if ! _is_file_encrypted "$tmpfile"; then
-        _dbg "file [$tmpfile] is not encrypted"
+        _dbg "stream is not encrypted"
         return 0; fi
     $age -d -i "$SEC_IDENTITY_FILE" "$tmpfile" ||
         _die "cannot decrypt input stream"
