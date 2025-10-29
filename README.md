@@ -1,4 +1,7 @@
 # sec
+
+```
+sec
     a rough handler for age-based secrets eventually stored in git
 
 commands:
@@ -35,6 +38,7 @@ notes:
     git dir and work tree: to work with a git dir that is, i.e. a bare repo used for dotfiles,
         just set GIT_DIR and GIT_WORK_TREE env variables
 
+```
 
 ## Inspirations
 
@@ -42,5 +46,6 @@ notes:
 - https://github.com/slok/agebox
 - https://github.com/vlaci/git-agecrypt
 - https://github.com/nxsy/shroudage
+- https://techgeneral.org/introducing-shroudage/
 - https://tech.j4m3s.eu/posts/git-filter-scripts/
 - https://blog.9wd.eu/posts/git-encryption-age/

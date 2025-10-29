@@ -1,6 +1,6 @@
 #!/bin/sh
 
-sec_tracking_filename=.sec
+sec_tracking_filename=.sec-tracking
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
 
 usage() {
@@ -17,6 +17,11 @@ commands:
 
     e|encrypt  - encrypt all tracked files
     d|decrypt  - decrypt all tracked files
+
+    fe|fencrypt <path>  - encrypt a single file
+    fd|fdecrypt <path>  - decrypt a single file
+    se|sencrypt  - encrypt content from stdin and prints to stdout
+    sd|sdecrypt  - decrypt content from stdin and prints to stdout
 
     a|add <public_key> [<public_key>] ...  - add recipients
     r|rm <public_key> [<public_key>] ...  - remove recipients
@@ -278,7 +283,7 @@ sec_add_recipients() {
         if grep "recipient: $r" "$sec_tracking_file_abspath" >/dev/null; then
             _warn "recipient already present [$r]"
         else
-            printf "recipient: %s" "$r" >> "$sec_tracking_file_abspath"
+            printf "recipient: %s\n" "$r" >> "$sec_tracking_file_abspath"
             any_added="true"
             _info "added recipient [$r]"
         fi
