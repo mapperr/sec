@@ -166,10 +166,10 @@ _sec_encrypt_paths_list() {
         ff_rel="$(_get_relative_path "$ff")"
         if _is_file_encrypted "$ff"; then
             [ "$filter" = "unencrypted" ] && _info "[$ff_rel] already encrypted" && continue
-            _sec_decrypt_file "$ff"; _sec_encrypt_file "$ff" "$recipient_file" || continue
+            _sec_decrypt_file "$ff"; _sec_encrypt_file "$ff" "$recipient_file"
             _info "[$ff_rel] re-encrypted"
         else [ "$filter" = "encrypted" ] && continue
-            _sec_encrypt_file "$ff" "$recipient_file" || continue
+            _sec_encrypt_file "$ff" "$recipient_file"
             _info "[$ff_rel] encrypted"
         fi
     done
