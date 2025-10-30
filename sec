@@ -105,15 +105,14 @@ _populate_recipient_file() {
 }
 _get_relative_path() {
     filepath="$1"
-    _dbg "building relative path of [$filepath]"
     absolute_filepath=$(readlink -f "$filepath")
     _dbg "absolute path of [$filepath] is [$absolute_filepath]"
-    printf "%s" "$absolute_filepath" | sed "s#^$sec_root_dir/##"
+    printf "%s" "${absolute_filepath}" | sed "s#^$sec_root_dir/##"
 }
 _is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_header\$" >/dev/null; }
 _is_file_encrypted() { _is_content_encrypted "$(cat "$1")"; }
-_ensure_tracking_file_exists_and_is_decrypted() {
-    [ -f "$sec_tracking_file_abspath" ] || touch "$sec_tracking_file_abspath"
+_ensure_tracking_file_is_decrypted() {
+    [ -f "$sec_tracking_file_abspath" ] || return 0
     _is_file_encrypted "$sec_tracking_file_abspath" &&
         _sec_decrypt_file "$sec_tracking_file_abspath"
     _dbg "tracking file is decrypted"
@@ -295,7 +294,7 @@ sec_remove_recipients() {
 sec_edit_tracking() { ${EDITOR:-vi} "$sec_tracking_file_abspath"; }
 sec_list_recipients_and_trackings() {
     if [ ! -f "$sec_tracking_file_abspath" ]; then
-        _warn "no file/recipient tracked yet"; return 0; fi
+        _warn "nothing tracked yet"; return 0; fi
     echo "# recipients:"
     { cat "$sec_tracking_file_abspath" |
         grep -v '^#' | grep '^recipient: ' |
@@ -303,7 +302,7 @@ sec_list_recipients_and_trackings() {
         sed "s/^\(${SEC_RECIPIENT:-_}\)/\1 <- SEC_RECIPIENT/"; } | sort
     echo; echo "# tracked paths:"
     cat "$sec_tracking_file_abspath" | grep -v '^#' | grep -v '^recipient: ' | sort
-    ! _is_recipient_from_env_tracked && echo &&
+    [ -n "$SEC_RECIPIENT" ] && ! _is_recipient_from_env_tracked && echo &&
         _warn "add your SEC_RECIPIENT recipient with: '$(basename "$0") add \$SEC_RECIPIENT' !"
 }
 sec_list_all() {
@@ -315,6 +314,7 @@ sec_list_all() {
         printf "%s" "$f" | grep '^recipient: ' >/dev/null && continue
         for ff in "$sec_root_dir/"$f; do
             ff_rel="$(_get_relative_path "$ff")"
+            [ ! -f "$ff" ] && _warn "file [${ff_rel:-$ff}] does not exists" && continue
             if _is_file_encrypted "$ff"; then echo "encrypted: $ff_rel"
             else echo "unencrypted: $ff_rel"; fi
         done & wait
@@ -336,18 +336,21 @@ main() {
 
     cmd="$1"; shift
     [ "$cmd" = "m" ] && { sec_edit_tracking; return 0; }
-    _ensure_tracking_file_exists_and_is_decrypted
+    _ensure_tracking_file_is_decrypted
     case $cmd in
-        l) sec_list_recipients_and_trackings;;
-        ls) sec_list_all;;
-        m) sec_edit_tracking;;
+        l) sec_list_recipients_and_trackings; exit 0;;
+        ls) sec_list_all; exit 0;;
+        m) sec_edit_tracking; exit 0;;
+        h) usage_extended; exit 0;;
+    esac
+    [ -f "$sec_tracking_file_abspath" ] || touch "$sec_tracking_file_abspath"
+    case $cmd in
         t) sec_track_paths "$@";;
         u) sec_untrack_paths "$@";;
         e) sec_encrypt "$@";;
         d) sec_decrypt "$@";;
         a) sec_add_recipients "$@";;
         r) sec_remove_recipients "$@";;
-        h) usage_extended; exit 0;;
         git) sec-"$cmd" "$@" ;;
         *) usage; exit 0;;
     esac
