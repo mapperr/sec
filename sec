@@ -113,16 +113,16 @@ _get_root_dir() {
 
 _populate_recipient_file() {
     recipient_file="$1"
-    # extract and populate a recipient file passed
+    # populate a file passed in input with recipients
     # if not present, add $SEC_RECIPIENT to it
     printf "" > "$recipient_file"
     cat "$sec_tracking_file_abspath" |
         grep '^recipient: ' |
-        sed 's/^recipient: //' > "$recipient_file"
+        sed 's/^recipient: //' | sort > "$recipient_file"
     [ -z "$SEC_RECIPIENT" ] && [ -z "$(cat "$recipient_file")" ] &&
         _die "no recipients added yet, check usage to add at least one"
     [ -z "$SEC_RECIPIENT" ] && return 0
-    grep "^$SEC_RECIPIENT\$" "$recipient_file" >/dev/null ||
+    _is_recipient_from_env_tracked ||
         printf "%s" "$SEC_RECIPIENT" >> "$recipient_file"
     _dbg "recipient file: $recipient_file"
     _dbg "recipient file contents: $(cat "$recipient_file")"
@@ -145,7 +145,7 @@ sec_encrypt_stream() {
     printf "%s" "$content_to_encrypt" > "$tmpfile"
 
     if _is_file_encrypted "$tmpfile"; then
-        _warn "stream is already encrypted, printing as-is:"
+        _warn "stream is already encrypted, printing as-is"
         cat "$tmpfile"
         return 0; fi
     $age -a -R "$recipient_file" "$tmpfile" ||
@@ -196,7 +196,7 @@ sec_decrypt_file() {
     $age -d -i "$SEC_IDENTITY_FILE" -o "$tmpfile" "$file_to_decrypt" ||
         _die "cannot decrypt file [$file_to_decrypt]"
     mv -f "$tmpfile" "$file_to_decrypt"
-    _dbg "decrypted $file_to_decrypt"
+    _dbg "decrypted file [$file_to_decrypt]"
 }
 
 sec_encrypt() {
@@ -214,6 +214,7 @@ sec_encrypt() {
             continue
         _dbg "read from tracking file: $f"
         sec_encrypt_file "$sec_root_dir/$f" "$recipient_file"
+        _info "[$f] encrypted"
     done < "$sec_tracking_file_abspath"
     sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
     _info "encrypted all tracked files"
@@ -231,6 +232,7 @@ sec_decrypt() {
             continue
         _dbg "read from tracking file: $f"
         sec_decrypt_file "$sec_root_dir/$f"
+        _info "[$f] decrypted"
     done < "$sec_tracking_file_abspath"
     _info "decrypted all tracked files"
 }
@@ -301,7 +303,7 @@ sec_untrack_file() {
     fi
 }
 
-_reencrypt_encrypted_files() {
+_reencrypt_encrypted_tracked_files() {
     recipient_file=$(_mktemp)
     trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
@@ -334,7 +336,7 @@ sec_add_recipients() {
             _info "added recipient [$r]"
         fi
     done
-    [ "$any_added" = "true" ] && _reencrypt_encrypted_files
+    [ "$any_added" = "true" ] && _reencrypt_encrypted_tracked_files
 }
 
 sec_remove_recipients() {
@@ -376,7 +378,7 @@ sec_remove_recipients() {
     if [ ! -z "$removed_recipients" ]; then
         mv -f "$tmpfile" "$sec_tracking_file_abspath"
         _info "removed recipients: [$removed_recipients ]"
-        _reencrypt_encrypted_files
+        _reencrypt_encrypted_tracked_files
     else
         _warn "recipients passed in input are not present, nothing to remove"
     fi
@@ -397,6 +399,10 @@ sec_list_tracking() {
     echo; echo "# tracked files:"
     cat "$sec_tracking_file_abspath" |
         grep -v '^#' | grep -v '^recipient: ' | sort
+    if ! _is_recipient_from_env_tracked; then
+        echo
+        _warn "add your SEC_RECIPIENT recipient with: '$(basename "$0") add \$SEC_RECIPIENT' !"
+    fi
 }
 
 sec_edit_tracking() {
@@ -409,10 +415,10 @@ _ensure_tracking_file_exists_and_is_decrypted() {
     sec_decrypt_file "$sec_tracking_file_abspath"
     _dbg "tracking file is decrypted"
 }
-_ensure_recipient_from_env_is_in_tracking_file() {
+_is_recipient_from_env_tracked() {
     [ -z "$SEC_RECIPIENT" ] && return 0
-    grep "^recipient: $SEC_RECIPIENT\$" "$sec_tracking_file_abspath" >/dev/null ||
-    sec_add_recipients "$SEC_RECIPIENT"
+    grep "^recipient: $SEC_RECIPIENT\$" \
+        "$sec_tracking_file_abspath" >/dev/null
 }
 
 main() {
@@ -438,7 +444,6 @@ main() {
     esac
 
     _ensure_tracking_file_exists_and_is_decrypted
-    _ensure_recipient_from_env_is_in_tracking_file
     case $cmd in
         l*) sec_list_tracking;;
         m*) sec_edit_tracking;;
@@ -453,6 +458,7 @@ main() {
         a*) sec_add_recipients "$@";;
         r*) sec_remove_recipients "$@";;
         h*) usage_extended; exit 0;;
+        git) sec-"$cmd" "$@" ;;
         *) usage; exit 0;;
     esac
 }

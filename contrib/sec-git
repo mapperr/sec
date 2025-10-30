@@ -49,7 +49,6 @@ sec_git_decrypt () {
     content="$(cat "$file" || printf "")"
     if [ -z "$content" ]; then printf ""; fi
     decrypted_content="$(printf "%s" "$content" | sec sd)"
-    printf "\n\nfile [$file], content [$content], decrypted_content [$decrypted_content]" >/tmp/sec.log
     printf "%s" "$decrypted_content"
 }
 
