@@ -10,7 +10,8 @@ $s
     a rough handler for age-based secrets eventually stored in git
 
 commands:
-    l|list  - lists tracked paths and recipients
+    l  - lists recipients and tracked paths
+    ls  - lists recipients, tracked paths and every files encryption status
 
     a|add <public_key> [<public_key>] ...  - adds recipients
     r|rm <public_key> [<public_key>] ...  - removes recipients
@@ -18,8 +19,8 @@ commands:
     t|track <path> [<path>] ...  - tracks paths, <path> can be a glob
     u|untrack <path> [<path>] ...  - untracks paths
 
-    e|encrypt  - ensures all tracked paths are encrypted
-    d|decrypt  - decrypts all encrypted tracked paths
+    e|encrypt [<path> [<path>..]] - ensures all tracked paths are encrypted or encrypts paths
+    d|decrypt [<path> [<path>..]] - decrypts all encrypted tracked paths or decrypts paths
 
     h|help  - shows extended help
 "
@@ -120,30 +121,23 @@ _is_recipient_from_env_tracked() {
     grep "^recipient: $SEC_RECIPIENT\$" "$sec_tracking_file_abspath" >/dev/null
 }
 sec_encrypt_stream() {
-    recipient_file=$(_mktemp)
-    trap 'rm -f "$recipient_file"' EXIT
+    recipient_file=$(_mktemp); trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
-
     content_to_encrypt="$(cat | tr -d '\0')"
-    tmpfile=$(_mktemp)
-    trap 'rm -f "$tmpfile"' EXIT
+    tmpfile=$(_mktemp); trap 'rm -f "$tmpfile"' EXIT
     printf "%s" "$content_to_encrypt" > "$tmpfile"
-
     if _is_file_encrypted "$tmpfile"; then
         _warn "stream is already encrypted, printing as-is"
-        cat "$tmpfile"
-        return 0; fi
-    $age -a -R "$recipient_file" "$tmpfile" ||
-        _die "cannot encrypt input stream"
+        cat "$tmpfile"; return 0; fi
+    $age -a -R "$recipient_file" "$tmpfile" || _die "cannot encrypt input stream"
 }
 sec_decrypt_stream() {
     content_to_decrypt="$(cat | tr -d '\0')"
     [ -z "$content_to_decrypt" ] && return 0
-    tmpfile=$(_mktemp)
-    trap 'rm -f "$tmpfile"' EXIT
+    tmpfile=$(_mktemp); trap 'rm -f "$tmpfile"' EXIT
     printf "%s" "$content_to_decrypt" > "$tmpfile"
     if ! _is_file_encrypted "$tmpfile"; then
-        _dbg "stream is not encrypted"
+        _dbg "stream is unencrypted"
         printf "%s" "$content_to_decrypt"
         return 0; fi
     $age -d -i "$SEC_IDENTITY_FILE" "$tmpfile" ||
@@ -153,13 +147,10 @@ sec_encrypt_file() {
     file_to_encrypt="$1"
     recipient_file="$2"
     if ! [ -f "$file_to_encrypt" ]; then
-        _warn "file [$file_to_encrypt] does not exists"
-        return 0; fi
+        _warn "file [$file_to_encrypt] does not exists"; return 0; fi
     if _is_file_encrypted "$file_to_encrypt"; then
-        _warn "file [$file_to_encrypt] is already encrypted"
-        return 0; fi
-    tmpfile=$(_mktemp)
-    trap 'rm -f "$tmpfile"' EXIT
+        _warn "file [$file_to_encrypt] is already encrypted"; return 0; fi
+    tmpfile=$(_mktemp); trap 'rm -f "$tmpfile"' EXIT
     $age -a -R "$recipient_file" -o "$tmpfile" "$file_to_encrypt" ||
         _die "cannot encrypt file [$file_to_encrypt]"
     mv -f "$tmpfile" "$file_to_encrypt"
@@ -169,43 +160,33 @@ sec_decrypt_file() {
     file_to_decrypt="$1"
     if ! [ -f "$file_to_decrypt" ]; then
         _warn "file [$file_to_decrypt] does not exists"
-        return 0; fi
+        return 1; fi
     if ! _is_file_encrypted "$file_to_decrypt"; then
-        _warn "file [$file_to_decrypt] is not encrypted"
-        return 0; fi
-    tmpfile=$(_mktemp)
-    trap 'rm -f "$tmpfile"' EXIT
+        _warn "file [$file_to_decrypt] is unencrypted"
+        return 2; fi
+    tmpfile=$(_mktemp); trap 'rm -f "$tmpfile"' EXIT
     $age -d -i "$SEC_IDENTITY_FILE" -o "$tmpfile" "$file_to_decrypt" ||
         _die "cannot decrypt file [$file_to_decrypt]"
     mv -f "$tmpfile" "$file_to_decrypt"
     _dbg "decrypted file [$file_to_decrypt]"
 }
 sec_encrypt_paths() {
-    filter="${1:-unencrypted}"
-    case $filter in
-        unencrypted) ;; encrypted) ;; all);;
-        *) _die "sec_encrypt_paths: valid filter values: unencrypted, encrypted, all";;
-    esac
+    filter_or_path="${1:-unencrypted}"
+    valid_filters="/unencrypted/encrypted/all/"
+    [ -z "${valid_filters##*/"${filter_or_path}"/*}" ] && filter="$filter_or_path"
     recipient_file=$(_mktemp)
     trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
     while read -r f || [ -n "$f" ]; do
-        if [ -z "$f" ]; then
-            _dbg "[$f] is an empty line, ignoring"
-            continue
-        fi
-        printf "%s" "$f" | grep '^#' >/dev/null &&
-            continue
-        printf "%s" "$f" | grep '^recipient: ' >/dev/null &&
-            continue
+        [ -z "$f" ] && _dbg "[$f] is an empty line, ignoring" && continue
+        printf "%s" "$f" | grep '^#' >/dev/null && continue
+        printf "%s" "$f" | grep '^recipient: ' >/dev/null && continue
         _dbg "read from tracking file: $f"
         for ff in "$sec_root_dir/"$f; do
             ff_rel="$(_get_relative_path "$ff")"
             if _is_file_encrypted "$ff"; then
-                [ "$filter" = "unencrypted" ] &&
-                    _info "[$ff_rel] already encrypted" && continue
-                sec_decrypt_file "$ff"
-                sec_encrypt_file "$ff" "$recipient_file"
+                [ "$filter" = "unencrypted" ] && _info "[$ff_rel] already encrypted" && continue
+                sec_decrypt_file "$ff"; sec_encrypt_file "$ff" "$recipient_file"
                 _info "[$ff_rel] re-encrypted"
             else
                 [ "$filter" = "encrypted" ] && continue
@@ -215,8 +196,7 @@ sec_encrypt_paths() {
         done &
     done < "$sec_tracking_file_abspath"
     sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
-    wait
-    _info "encrypted all tracked paths"
+    wait; _info "encrypted all tracked paths"
 }
 sec_decrypt_paths() {
     while read -r f || [ -n "$f" ]; do
@@ -235,7 +215,7 @@ sec_decrypt_paths() {
                 sec_decrypt_file "$ff"
                 _info "[$ff_rel] decrypted"
             else
-                _info "[$ff_rel] already decrypted"
+                _info "[$ff_rel] is unencrypted"
             fi
         done &
     done < "$sec_tracking_file_abspath"
@@ -336,7 +316,8 @@ sec_remove_recipients() {
         sec_encrypt_paths encrypted
     else _warn "recipients passed in input are not present, nothing to remove"; fi
 }
-sec_list_tracking() {
+sec_edit_tracking() { ${EDITOR:-vi} "$sec_tracking_file_abspath"; }
+sec_list_recipients_and_trackings() {
     if [ ! -f "$sec_tracking_file_abspath" ]; then
         _warn "no file/recipient tracked yet"; return 0; fi
     echo "# recipients:"
@@ -344,50 +325,57 @@ sec_list_tracking() {
         grep -v '^#' | grep '^recipient: ' |
         sed 's/^recipient: //' |
         sed "s/^\(${SEC_RECIPIENT:-_}\)/\1 <- SEC_RECIPIENT/"; } | sort
-    echo; echo "# tracked files:"
+    echo; echo "# tracked paths:"
     cat "$sec_tracking_file_abspath" | grep -v '^#' | grep -v '^recipient: ' | sort
     ! _is_recipient_from_env_tracked && echo &&
         _warn "add your SEC_RECIPIENT recipient with: '$(basename "$0") add \$SEC_RECIPIENT' !"
 }
-sec_edit_tracking() { ${EDITOR:-vi} "$sec_tracking_file_abspath"; }
+sec_list_all() {
+    sec_list_recipients_and_trackings
+    echo; echo "# file encryption status:";
+    { while read -r f || [ -n "$f" ]; do
+        [ -z "$f" ] && continue
+        printf "%s" "$f" | grep '^#' >/dev/null && continue
+        printf "%s" "$f" | grep '^recipient: ' >/dev/null && continue
+        for ff in "$sec_root_dir/"$f; do
+            ff_rel="$(_get_relative_path "$ff")"
+            if _is_file_encrypted "$ff"; then echo "encrypted: $ff_rel"
+            else echo "unencrypted: $ff_rel"; fi
+        done & wait
+    done < "$sec_tracking_file_abspath" &
+    wait; } | sort | uniq
+}
 
 main() {
     : "${SEC_IDENTITY_FILE:?$(_die "setup the SEC_IDENTITY_FILE env var")}"
 
     age=$(command -v age || command -v rage) ||
         _die "age not found, install per https://age-encryption.org"
-    # age_keygen=$(command -v age-keygen || command -v rage-keygen) ||
-    #     _die "age-keygen not found, install per https://age-encryption.org"
 
     sec_root_dir=$(_get_root_dir)
     [ -z "$sec_root_dir" ] && exit 1
     _dbg "sec_root_dir: $sec_root_dir"
     sec_tracking_file_abspath="$sec_root_dir/$sec_tracking_filename"
-
     [ -d "$sec_root_dir" ] || _die "root dir [$sec_root_dir] is not a directory"
 
-    cmd="$1"
-    shift
-
-    case $cmd in
-        m*) sec_edit_tracking; return 0;;
-    esac
-
+    cmd="$1"; shift
+    [ "$cmd" = "m" ] && { sec_edit_tracking; return 0; }
     _ensure_tracking_file_exists_and_is_decrypted
     case $cmd in
-        l*) sec_list_tracking;;
-        m*) sec_edit_tracking;;
-        t*) sec_track_paths "$@";;
-        u*) sec_untrack_paths "$@";;
-        e*) sec_encrypt_paths;;
-        d*) sec_decrypt_paths;;
-        fe*) sec_encrypt_file "$@";;
-        fd*) sec_decrypt_file "$@";;
-        se*) sec_encrypt_stream;;
-        sd*) sec_decrypt_stream;;
-        a*) sec_add_recipients "$@";;
-        r*) sec_remove_recipients "$@";;
-        h*) usage_extended; exit 0;;
+        l) sec_list_recipients_and_trackings;;
+        ls) sec_list_all;;
+        m) sec_edit_tracking;;
+        t) sec_track_paths "$@";;
+        u) sec_untrack_paths "$@";;
+        e) sec_encrypt_paths "$@";;
+        d) sec_decrypt_paths "$@";;
+        fe) sec_encrypt_file "$@";;
+        fd) sec_decrypt_file "$@";;
+        se) sec_encrypt_stream;;
+        sd) sec_decrypt_stream;;
+        a) sec_add_recipients "$@";;
+        r) sec_remove_recipients "$@";;
+        h) usage_extended; exit 0;;
         git) sec-"$cmd" "$@" ;;
         *) usage; exit 0;;
     esac
