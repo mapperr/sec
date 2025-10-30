@@ -16,14 +16,14 @@ commands:
     a <public_key> [<public_key>] ...  - adds recipients
     r <public_key> [<public_key>] ...  - removes recipients
 
-    t <path> [<path>] ...  - tracks paths, <path> can be a glob
-    u <path> [<path>] ...  - untracks paths
+    t <path> [<path> ...]  - tracks paths, <path> can be a glob
+    u <path> [<path> ...]  - untracks paths
 
     e  - ensures all tracked paths are encrypted
     e -r  - re-encrypts tracked paths that are already encrypted
     e -a  - (re-)encrypts all tracked paths
-    e [<path> [<path>..]] - (re-)encrypts paths
-    d [<path> [<path>..]] - decrypts all encrypted tracked paths or decrypts paths
+    e <path> [<path> ...] - (re-)encrypts paths
+    d <path> [<path> ...] - decrypts all encrypted tracked paths or decrypts paths
 
     h  - shows extended help
 "
@@ -140,8 +140,7 @@ sec_decrypt_stream() {
         _dbg "stream is unencrypted"
         printf "%s" "$content_to_decrypt"
         return 0; fi
-    $age -d -i "$SEC_IDENTITY_FILE" "$tmpfile_stream_decrypt" ||
-        _die "cannot decrypt input stream"
+    $age -d -i "$SEC_IDENTITY_FILE" "$tmpfile_stream_decrypt" || _die "cannot decrypt input stream"
 }
 sec_encrypt_file() {
     file_to_encrypt="$1"
@@ -191,12 +190,10 @@ _sec_encrypt_paths_list() {
     done
 }
 sec_encrypt_paths() {
-    filter_or_path="${1:--u}"
-    valid_filters="/-u/-r/-a/unencrypted/encrypted/all/"
+    filter_or_path="${1:-unencrypted}"
+    valid_filters="/-r/-a/unencrypted/encrypted/all/"
     [ -z "${valid_filters##*/"${filter_or_path}"/*}" ] && filter="$filter_or_path"
-    [ "$filter" = "-u" ] && filter="unencrypted"
-    [ "$filter" = "-r" ] && filter="encrypted"
-    [ "$filter" = "-a" ] && filter="all"
+    [ "$filter" = "-r" ] && filter="encrypted"; [ "$filter" = "-a" ] && filter="all"
     recipient_file=$(_mktemp); trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
     if [ -z "$filter" ]; then _sec_encrypt_paths_list "$recipient_file" "$@"; return 0; fi
