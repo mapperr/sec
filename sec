@@ -10,8 +10,6 @@ $s
     a rough handler for age-based secrets eventually stored in git
 
 commands:
-    h|help  - show extended help
-
     l|list  - list tracked files and recipients
 
     a|add <public_key> [<public_key>] ...  - add recipients
@@ -22,6 +20,15 @@ commands:
 
     e|encrypt  - encrypt all tracked files
     d|decrypt  - decrypt all tracked files
+
+    h|help  - show extended help
+"
+}
+
+usage_extended() {
+    s="$(basename $0)"
+    usage
+    printf %s "\
 
     fe|fencrypt <path>  - encrypt a single file
     fd|fdecrypt <path>  - decrypt a single file
@@ -34,14 +41,6 @@ commands:
     # NOT IMPLEMETED: IN EVALUATION
     # git-related commands: thery only works in a git repo
     git-mode on|off  - (un)installs git configs (filters, etc.) in local repo
-    git-encrypt <path>  - encryption to use in git clean filter
-"
-}
-
-usage_extended() {
-    s="$(basename $0)"
-    usage
-    printf %s "\
 
 env vars:
     SEC_IDENTITY_FILE  - [mandatory] age identity file to use for decryption
@@ -173,7 +172,7 @@ sec_encrypt_file() {
         _warn "file [$file_to_encrypt] does not exists"
         return 0; fi
     if _is_file_encrypted "$file_to_encrypt"; then
-        _warn "file [$file_to_encrypt] is already encrypted"
+        _dbg "file [$file_to_encrypt] is already encrypted"
         return 0; fi
     tmpfile=$(_mktemp)
     trap 'rm -f "$tmpfile"' EXIT
@@ -213,10 +212,13 @@ sec_encrypt() {
         printf "%s" "$f" | grep '^recipient: ' >/dev/null &&
             continue
         _dbg "read from tracking file: $f"
-        sec_encrypt_file "$sec_root_dir/$f" "$recipient_file"
-        _info "[$f] encrypted"
+        for ff in $f; do
+            sec_encrypt_file "$sec_root_dir/$ff" "$recipient_file"
+            _info "[$ff] encrypted"
+        done &
     done < "$sec_tracking_file_abspath"
     sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
+    wait
     _info "encrypted all tracked files"
 }
 
@@ -231,9 +233,12 @@ sec_decrypt() {
         printf "%s" "$f" | grep '^recipient: ' >/dev/null &&
             continue
         _dbg "read from tracking file: $f"
-        sec_decrypt_file "$sec_root_dir/$f"
-        _info "[$f] decrypted"
+        for ff in $f; do
+            sec_decrypt_file "$sec_root_dir/$ff"
+            _info "[$ff] decrypted"
+        done &
     done < "$sec_tracking_file_abspath"
+    wait
     _info "decrypted all tracked files"
 }
 
@@ -247,10 +252,6 @@ _get_relative_path() {
 
 sec_track_file() {
     for ft in "$@"; do
-        if [ ! -f "$ft" ]; then
-            _warn "file [$ft] does not exists, not tracked"
-            continue
-        fi
         f=$(_get_relative_path "$ft")
         if grep "^$f\$" "$sec_tracking_file_abspath" >/dev/null; then
             _warn "file [$f] already tracked"
@@ -289,8 +290,12 @@ sec_untrack_file() {
         if [ "$match" = "true" ]; then
             any_match="true"
             _dbg "matched [$u]"
-            sec_decrypt_file "$sec_root_dir/$f"
-            untracked_files="$untracked_files $f"
+            for ff in $f; do
+                sec_decrypt_file "$sec_root_dir/$ff"
+                _info "[$ff] decrypted"
+            done &
+            wait
+            untracked_files="$untracked_files${untracked_files:+ }$f"
         else
             echo "$f" >> "$tmpfile"
         fi
@@ -318,11 +323,15 @@ _reencrypt_encrypted_tracked_files() {
         if printf "%s" "$f" | grep '^recipient: ' >/dev/null; then
             continue
         fi
-        if _is_file_encrypted "$sec_root_dir/$f"; then
-            sec_decrypt_file "$sec_root_dir/$f"
-            sec_encrypt_file "$sec_root_dir/$f" "$recipient_file"
-        fi
+        for ff in $f; do
+            if _is_file_encrypted "$sec_root_dir/$ff"; then
+                sec_decrypt_file "$sec_root_dir/$ff"
+                sec_encrypt_file "$sec_root_dir/$ff" "$recipient_file"
+            fi
+        done &
     done < "$sec_tracking_file_abspath"
+    wait
+    _info "re-encrypted already encrypted tracked files"
 }
 
 sec_add_recipients() {
@@ -336,7 +345,8 @@ sec_add_recipients() {
             _info "added recipient [$r]"
         fi
     done
-    [ "$any_added" = "true" ] && _reencrypt_encrypted_tracked_files
+    [ "$any_added" = "true" ] &&
+        _reencrypt_encrypted_tracked_files
 }
 
 sec_remove_recipients() {
