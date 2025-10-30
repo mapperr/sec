@@ -120,7 +120,7 @@ _is_recipient_from_env_tracked() {
     [ -z "$SEC_RECIPIENT" ] && return 0
     grep "^recipient: $SEC_RECIPIENT\$" "$sec_tracking_file_abspath" >/dev/null
 }
-sec_encrypt_stream() {
+_sec_encrypt_stream() {
     recipient_file=$(_mktemp); trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
     content_to_encrypt="$(cat | tr -d '\0')"
@@ -131,7 +131,7 @@ sec_encrypt_stream() {
         cat "$tmpfile_stream_encrypt"; return 0; fi
     $age -a -R "$recipient_file" "$tmpfile_stream_encrypt" || _die "cannot encrypt input stream"
 }
-sec_decrypt_stream() {
+_sec_decrypt_stream() {
     content_to_decrypt="$(cat | tr -d '\0')"
     [ -z "$content_to_decrypt" ] && return 0
     tmpfile_stream_decrypt=$(_mktemp); trap 'rm -f "$tmpfile_stream_decrypt"' EXIT
@@ -142,7 +142,7 @@ sec_decrypt_stream() {
         return 0; fi
     $age -d -i "$SEC_IDENTITY_FILE" "$tmpfile_stream_decrypt" || _die "cannot decrypt input stream"
 }
-sec_encrypt_file() {
+_sec_encrypt_file() {
     file_to_encrypt="$1"
     recipient_file="$2"
     if ! [ -f "$file_to_encrypt" ]; then
@@ -181,10 +181,10 @@ _sec_encrypt_paths_list() {
         ff_rel="$(_get_relative_path "$ff")"
         if _is_file_encrypted "$ff"; then
             [ "$filter" = "unencrypted" ] && _info "[$ff_rel] already encrypted" && continue
-            _sec_decrypt_file "$ff"; sec_encrypt_file "$ff" "$recipient_file"
+            _sec_decrypt_file "$ff"; _sec_encrypt_file "$ff" "$recipient_file"
             _info "[$ff_rel] re-encrypted"
         else [ "$filter" = "encrypted" ] && continue
-            sec_encrypt_file "$ff" "$recipient_file"
+            _sec_encrypt_file "$ff" "$recipient_file"
             _info "[$ff_rel] encrypted"
         fi
     done
@@ -203,7 +203,7 @@ sec_encrypt_paths() {
         _dbg "read from tracking file: $f"
         _sec_encrypt_paths_list "$recipient_file" "$sec_root_dir/"$f &
     done < "$sec_tracking_file_abspath"
-    sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
+    _sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
     wait; _info "encrypted all tracked paths"
 }
 sec_decrypt_paths() {
@@ -352,8 +352,8 @@ main() {
         e) sec_encrypt_paths "$@";;
         d) sec_decrypt_paths "$@";;
         fd) _sec_decrypt_file "$@";;
-        se) sec_encrypt_stream;;
-        sd) sec_decrypt_stream;;
+        se) _sec_encrypt_stream;;
+        sd) _sec_decrypt_stream;;
         a) sec_add_recipients "$@";;
         r) sec_remove_recipients "$@";;
         h) usage_extended; exit 0;;
