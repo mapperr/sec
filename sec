@@ -19,9 +19,12 @@ commands:
     t <path> [<path> ...]  - tracks paths, <path> can be a glob
     u <path> [<path> ...]  - untracks paths
 
+    et  - ensures tracking file stays encrypted
+    dt  - ensures tracking file stays decrypted
+
     e  - ensures all tracked paths are encrypted
-    e -r  - re-encrypts tracked paths that are already encrypted
-    e -a  - (re-)encrypts all tracked paths
+    er  - re-encrypts tracked paths that are already encrypted
+    ea  - (re-)encrypts all tracked paths
     e <path> [<path> ...] - (re-)encrypts paths
     e -  - encrypts from stdin and prints result to stdout
 
@@ -117,6 +120,14 @@ _ensure_tracking_file_is_decrypted() {
         _sec_decrypt_file "$sec_tracking_file_abspath"
     _dbg "tracking file is decrypted"
 }
+_ensure_tracking_file_is_encrypted() {
+    [ -f "$sec_tracking_file_abspath" ] || return 0
+    if ! _is_file_encrypted "$sec_tracking_file_abspath"; then
+        recipient_file=$(_mktemp); trap 'rm -f "$recipient_file"' EXIT
+        _populate_recipient_file "$recipient_file"
+        _sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
+    fi; _dbg "tracking file is encrypted"
+}
 _is_recipient_from_env_tracked() {
     [ -z "$SEC_RECIPIENT" ] && return 0
     grep "^recipient: $SEC_RECIPIENT\$" "$sec_tracking_file_abspath" >/dev/null
@@ -132,12 +143,18 @@ _sec_encrypt_stream() {
     content_to_encrypt="$2"
     [ -z "$content_to_encrypt" ] && return 0
     printf "%s" "$content_to_encrypt" | $age -a -R "$recipient_file" || _die "cannot encrypt input stream"
+    RET=$?
     _is_content_encrypted "$content_to_encrypt" && _warn "input stream was already encrypted"
+    return $RET
 }
 _sec_decrypt_stream() {
     content_to_decrypt="$1"
+    _dbg "stream decrypt: content_to_decrypt $content_to_decrypt"
     [ -z "$content_to_decrypt" ] && return 0
-    ! _is_content_encrypted "$content_to_decrypt" && printf "%s" "$content_to_decrypt" && return 0
+    if ! _is_content_encrypted "$content_to_decrypt"; then
+        _dbg "stream decrypt: content_to_decrypt is not encrypted"
+        printf "%s" "$content_to_decrypt"
+        return 0; fi
     printf "%s" "$content_to_decrypt" | $age -d -i "$SEC_IDENTITY_FILE" || _die "cannot decrypt input stream"
 }
 _sec_encrypt_file() {
@@ -187,7 +204,7 @@ _sec_encrypt_tracked_paths() {
         _dbg "read from tracking file: $f"
         _sec_encrypt_paths_list "$recipient_file" "$sec_root_dir/"$f &
     done < "$sec_tracking_file_abspath"
-    _sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
+    # _sec_encrypt_file "$sec_tracking_file_abspath" "$recipient_file"
     wait
 }
 _sec_decrypt_tracked_paths() {
@@ -200,10 +217,11 @@ _sec_decrypt_tracked_paths() {
     wait
 }
 sec_encrypt() {
+    _dbg "sec encrypt: args: $*"
     filter_or_path="${1:-unencrypted}"
     recipient_file=$(_mktemp); trap 'rm -f "$recipient_file"' EXIT
     _populate_recipient_file "$recipient_file"
-    if [ "$filter_or_path" = "-" ]; then _sec_encrypt_stream "$recipient_file" "$(cat | tr -d '\0')"; return $?; fi
+    if [ "$filter_or_path" = "-" ]; then _sec_encrypt_stream "$recipient_file" "$(cat | tr -d '\0')"; return 0; fi
     valid_filters="/-r/-a/unencrypted/encrypted/all/"
     [ -z "${valid_filters##*/"${filter_or_path}"/*}" ] && filter="$filter_or_path"
     if [ -z "$filter" ]; then _sec_encrypt_paths_list "$recipient_file" "$@"; return $?; fi
@@ -211,7 +229,8 @@ sec_encrypt() {
     _sec_encrypt_tracked_paths
 }
 sec_decrypt() {
-    if [ "$1" = "-" ]; then _sec_decrypt_stream "$(cat | tr -d '\0')"; return $?; fi
+    _dbg "decrypt $1"
+    if [ "$1" = "-" ]; then _sec_decrypt_stream "$(cat | tr -d '\0')"; return; fi
     if [ -n "$1" ]; then _sec_decrypt_paths_list "$@"; return $?; fi
     _sec_decrypt_tracked_paths
 }
@@ -301,8 +320,8 @@ sec_remove_recipients() {
 }
 sec_edit_tracking() { ${EDITOR:-vi} "$sec_tracking_file_abspath"; _sort_tracking_file; }
 sec_list_recipients_and_trackings() {
-    if [ ! -f "$sec_tracking_file_abspath" ]; then
-        _warn "nothing tracked yet"; return 0; fi
+    [ ! -f "$sec_tracking_file_abspath" ] && _warn "nothing tracked yet" && return 0
+    _ensure_tracking_file_is_decrypted
     echo "# recipients:"
     { cat "$sec_tracking_file_abspath" |
         grep -v '^#' | grep '^recipient: ' |
@@ -327,6 +346,9 @@ sec_list_all() {
             else echo "unencrypted: $ff_rel"; fi
         done & wait
     done < "$sec_tracking_file_abspath" &
+    sec_tracking_file_relpath="$(_get_relative_path "$sec_tracking_file_abspath")"
+    if [ $was_tracking_file_encrypted -eq 0 ]; then echo "encrypted: $sec_tracking_file_relpath"
+    else echo "unencrypted: $sec_tracking_file_relpath"; fi
     wait; } | sort | uniq
 }
 
@@ -342,26 +364,31 @@ main() {
     sec_tracking_file_abspath="$sec_root_dir/$sec_tracking_filename"
     [ -d "$sec_root_dir" ] || _die "root dir [$sec_root_dir] is not a directory"
 
+    _is_file_encrypted "$sec_tracking_file_abspath"
+    was_tracking_file_encrypted=$?
+    _ensure_tracking_file_is_decrypted
     cmd="$1"; shift
     [ "$cmd" = "m" ] && { sec_edit_tracking; return 0; }
-    _ensure_tracking_file_is_decrypted
     case $cmd in
-        l) sec_list_recipients_and_trackings; exit 0;;
-        ls) sec_list_all; exit 0;;
-        m) sec_edit_tracking; exit 0;;
-        h) usage_extended; exit 0;;
-    esac
-    [ -f "$sec_tracking_file_abspath" ] || touch "$sec_tracking_file_abspath"
-    case $cmd in
+        l) sec_list_recipients_and_trackings;;
+        ls) sec_list_all;;
+        m) sec_edit_tracking;;
+        h) usage_extended;;
         t) sec_track_paths "$@";;
         u) sec_untrack_paths "$@";;
         e) sec_encrypt "$@";;
+        er) sec_encrypt "encrypted";;
+        ea) sec_encrypt "all";;
+        et) was_tracking_file_encrypted=0; _info "tracking file stays encrypted";;
         d) sec_decrypt "$@";;
+        dt) was_tracking_file_encrypted=1; _info "tracking file stays unencrypted";;
         a) sec_add_recipients "$@";;
         r) sec_remove_recipients "$@";;
-        git) sec-"$cmd" "$@" ;;
-        *) usage; exit 0;;
+        *) if command -v sec-"$cmd">/dev/null;then sec-"$cmd" "$@"; else usage; exit 0; fi;
     esac
+    RET=$?
+    [ $was_tracking_file_encrypted -eq 0 ] && _ensure_tracking_file_is_encrypted
+    return $RET
 }
 
 [ "$1" ] || { usage; exit 0; } && main "$@"
