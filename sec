@@ -110,7 +110,7 @@ _get_relative_path() {
     printf "%s" "${absolute_filepath}" | sed "s#^$sec_root_dir/##"
 }
 _is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_header\$" >/dev/null; }
-_is_file_encrypted() { _is_content_encrypted "$(cat "$1")"; }
+_is_file_encrypted() { _is_content_encrypted "$(cat "$1" | tr -d '\0')"; }
 _ensure_tracking_file_is_decrypted() {
     [ -f "$sec_tracking_file_abspath" ] || return 0
     _is_file_encrypted "$sec_tracking_file_abspath" &&
@@ -120,6 +120,12 @@ _ensure_tracking_file_is_decrypted() {
 _is_recipient_from_env_tracked() {
     [ -z "$SEC_RECIPIENT" ] && return 0
     grep "^recipient: $SEC_RECIPIENT\$" "$sec_tracking_file_abspath" >/dev/null
+}
+_sort_tracking_file() {
+    tmpfile_sort_tracking_file=$(_mktemp); trap 'rm -f "$tmpfile_sort_tracking_file"' EXIT
+    cat "$sec_tracking_file_abspath" | grep '^recipient: ' | sort >> "$tmpfile_sort_tracking_file"
+    cat "$sec_tracking_file_abspath" | grep -v '^recipient: ' | sort >> "$tmpfile_sort_tracking_file"
+    mv -f "$tmpfile_sort_tracking_file" "$sec_tracking_file_abspath"
 }
 _sec_encrypt_stream() {
     recipient_file="$1"
@@ -215,7 +221,7 @@ sec_track_paths() {
         if grep "^$f\$" "$sec_tracking_file_abspath" >/dev/null; then
             _warn "file [$f] already tracked"; continue; fi
         echo "$f" >>"$sec_tracking_file_abspath"; _info "tracked [$f]"
-    done
+    done; _sort_tracking_file
 }
 sec_untrack_paths() {
     tmpfile_untrack_paths=$(_mktemp); trap 'rm -f "$tmpfile_untrack_paths"' EXIT
@@ -242,6 +248,7 @@ sec_untrack_paths() {
         mv -f "$tmpfile_untrack_paths" "$sec_tracking_file_abspath"
         _info "untracked files: [$untracked_files]"
     else _warn "paths are not tracked, nothing to untrack"; fi
+    _sort_tracking_file
 }
 sec_add_recipients() {
     any_added="false"
@@ -253,7 +260,7 @@ sec_add_recipients() {
             any_added="true"
             _info "added recipient [$r]"
         fi
-    done; [ "$any_added" = "true" ] && sec_encrypt encrypted
+    done; [ "$any_added" = "true" ] && _sort_tracking_file && sec_encrypt encrypted
 }
 sec_remove_recipients() {
     tmpfile_rm_recipient=$(_mktemp)
@@ -288,10 +295,11 @@ sec_remove_recipients() {
     if [ ! -z "$removed_recipients" ]; then
         mv -f "$tmpfile_rm_recipient" "$sec_tracking_file_abspath"
         _info "removed recipients: [$removed_recipients ]"
+        _sort_tracking_file
         sec_encrypt encrypted
     else _warn "recipients passed in input are not present, nothing to remove"; fi
 }
-sec_edit_tracking() { ${EDITOR:-vi} "$sec_tracking_file_abspath"; }
+sec_edit_tracking() { ${EDITOR:-vi} "$sec_tracking_file_abspath"; _sort_tracking_file; }
 sec_list_recipients_and_trackings() {
     if [ ! -f "$sec_tracking_file_abspath" ]; then
         _warn "nothing tracked yet"; return 0; fi

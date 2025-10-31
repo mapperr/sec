@@ -45,11 +45,10 @@ sec_git_encrypt() {
 }
 sec_git_decrypt () {
     file="$1"
-    if [ -z "$file" ] || [ ! -r "$file" ]; then printf ""; fi
-    content="$(cat "$file" || printf "")"
-    if [ -z "$content" ]; then printf ""; fi
-    decrypted_content="$(printf "%s" "$content" | sec sd)"
-    printf "%s" "$decrypted_content"
+    [ -z "$file" ] || [ ! -r "$file" ] && return 0
+    content="$(cat "$file")"
+    [ -z "$content" ] && return 0
+    printf "%s" "$content" | sec d -
 }
 
 if [ "$cmd" = "on" ]; then
@@ -59,15 +58,15 @@ if [ "$cmd" = "on" ]; then
 elif [ "$cmd" = "off" ]; then
     turn_git_mode_off
 
-elif [ "$cmd" = "encrypt" ]; then
+elif [ "$cmd" = "e" ]; then
     sec_git_encrypt "$1"
 
-elif [ "$cmd" = "decrypt" ]; then
+elif [ "$cmd" = "d" ]; then
     sec_git_decrypt "$1"
 
 elif [ "$cmd" = "l" ] || [ "$cmd" = "ls" ] || [ "$cmd" = "list" ]; then
     if is_git_mode_on; then
-        printf "git mode is ON\n\n"
+        printf "feature: git\n\n"
     fi
     sec l
 
