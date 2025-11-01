@@ -56,7 +56,7 @@ secgit_on() {
     git config --local filter.sec.clean "$s clean %f"
     git config --local filter.sec.smudge "$s smudge %f"
     git config --local filter.sec.required true
-    git config --local diff.sec.textconv "$s diff"
+    git config --local diff.sec.textconv "$s textconv"
 }
 secgit_clean() {
     content=$(cat | tr -d '\0')
@@ -115,18 +115,21 @@ secgit_untrack() {
         _is_git_mode_on || secgit_on; fi
     _info "paths [$*] untracked"
 }
-! _is_cwd_in_a_git_repo && _die "you are not in a git repo >:|"
-cmd="$1"; [ -n "$cmd" ] && shift
-case $cmd in
-    on) secgit_off; secgit_on && _info "activated \o/";;
-    off) secgit_off && _info "deactivated :(";;
-    l) secgit_list;;
-    a) secgit_add_recipients "$@";;
-    r) secgit_rm_recipients "$@";;
-    t) secgit_track "$@";;
-    u) secgit_untrack "$@";;
-    clean) secgit_clean "$@";;
-    smudge) secgit_smudge;;
-    textconv) secgit_textconv "$@";;
-    *) usage; exit 0;;
-esac
+main() {
+    ! _is_cwd_in_a_git_repo && _die "you are not in a git repo >:|"
+    cmd="$1"; [ -n "$cmd" ] && shift
+    case $cmd in
+        on) secgit_off; secgit_on && _info "activated \o/";;
+        off) secgit_off && _info "deactivated :(";;
+        l) secgit_list;;
+        a) secgit_add_recipients "$@";;
+        r) secgit_rm_recipients "$@";;
+        t) secgit_track "$@";;
+        u) secgit_untrack "$@";;
+        clean) secgit_clean "$@";;
+        smudge) secgit_smudge;;
+        textconv) secgit_textconv "$@";;
+        *) usage; exit 0;;
+    esac
+}
+[ "$1" ] || { usage; exit 0; } && main "$@"
