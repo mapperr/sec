@@ -23,7 +23,7 @@ files:
     <repo-root-dir>/$sec_recipient_filename  - this file will store the recipient list
 "
 }
-seccmd=secage
+seccmd=sec
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
 sec_recipient_filename=".sec-recipients"
 _die() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
