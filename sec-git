@@ -1,6 +1,6 @@
 #!/bin/sh
+s="$(basename "$0")"
 usage() {
-    s="$(basename "$0")"
     printf "%s" "\
 $s
     handles git configs to transparently use sec in your repo
@@ -51,14 +51,12 @@ secgit_off() {
     git config --local --unset-all filter.sec.smudge
     git config --local --unset-all filter.sec.required
     git config --local --unset-all diff.sec.textconv
-    _info "deactivated :("
 }
 secgit_on() {
-    git config --local filter.sec.clean "secgit clean %f"
-    git config --local filter.sec.smudge "secgit smudge %f"
+    git config --local filter.sec.clean "$s clean %f"
+    git config --local filter.sec.smudge "$s smudge %f"
     git config --local filter.sec.required true
-    git config --local diff.sec.textconv "secgit diff"
-    _info "activated \o/"
+    git config --local diff.sec.textconv "$s diff"
 }
 secgit_clean() {
     content=$(cat | tr -d '\0')
@@ -120,8 +118,8 @@ secgit_untrack() {
 ! _is_cwd_in_a_git_repo && _die "you are not in a git repo >:|"
 cmd="$1"; [ -n "$cmd" ] && shift
 case $cmd in
-    on) secgit_off; secgit_on;;
-    off) secgit_off;;
+    on) secgit_off; secgit_on && _info "activated \o/";;
+    off) secgit_off && _info "deactivated :(";;
     l) secgit_list;;
     a) secgit_add_recipients "$@";;
     r) secgit_rm_recipients "$@";;
