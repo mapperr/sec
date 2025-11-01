@@ -16,17 +16,20 @@ $s
     t '<path>' [ '<path>'... ]  - tracks paths to .gitattributes (remember to quote globbings)
     u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
 
+    # utilities:
+    s  - try to force git to encrypt your fresh-tracked file (works only on a clean git status)
+
 env vars:
     SEC_IDENTITY  - path to an age identity file (needed for decrypt)
 
 files:
-    <repo-root-dir>/$sec_recipient_filename  - this file will store the recipient list
+    <repo-root-dir>/$recipients_filename  - this file will store the recipient list
 "
 }
 seccmd=sec
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
-sec_recipient_filename=".sec-recipients"
-_die() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
+recipients_filename=".sec-recipients"
+_err() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
 _warn() { printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2; }
 _info() { printf "%s: %s\n" "$(basename "$0")" "$1" >&2; }
 _dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2; }
@@ -34,17 +37,18 @@ _is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_head
 _is_git_mode_on() { git config --local filter.sec.clean >/dev/null 2>&1; }
 _is_git_status_clean() { [ -z "$(git status --porcelain)" ]; }
 _is_cwd_in_a_git_repo() { git rev-parse --is-inside-work-tree > /dev/null 2>&1; }
-_rand_chars() {
-    # $1 = number of chars to receive, $2 = filter for the chars
-    LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null
-}
+_rand_chars() { LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null; }
 _mktemp() {
     tmpdir=/dev/shm
     [ -w /dev/shm ] || tmpdir=${TMPDIR:-/tmp}
-    tmpfile=$tmpdir/sec.$(_rand_chars 16 'A-Za-z0-9') || _die "couldn't generate random characters"
-    mkdir -p "$(dirname "$tmpfile")" || _die "couldn't create temp dir"
-    touch "$tmpfile" || _die "couldn't create temp file"
+    tmpfile=$tmpdir/sec.$(_rand_chars 16 'A-Za-z0-9') || _err "couldn't generate random characters"
+    mkdir -p "$(dirname "$tmpfile")" || _err "couldn't create temp dir"
+    touch "$tmpfile" || _err "couldn't create temp file"
     printf "%s" "$tmpfile"
+}
+secgit_force_git() {
+    _is_git_status_clean || _err "ensure you have a clean git status to run this command"
+    cd $git_root && git rm --cached -r . && git reset --hard
 }
 secgit_off() {
     git config --local --unset-all filter.sec.clean
@@ -53,6 +57,9 @@ secgit_off() {
     git config --local --unset-all diff.sec.textconv
 }
 secgit_on() {
+    [ -f "$gitattrs_file" ] && grep 'filter=sec' "$gitattrs_file">/dev/null &&
+        ( ! [ -f "$recipients_file" ] || [ -z "$(cat "$recipients_file")" ] ) &&
+        _err "there are existing sec trackings in the .gitattributes file, so add some recipients first!"
     git config --local filter.sec.clean "$s clean %f"
     git config --local filter.sec.smudge "$s smudge %f"
     git config --local filter.sec.required true
@@ -62,6 +69,7 @@ secgit_clean() {
     content=$(cat | tr -d '\0')
     file="$1"
     git_file_content=$(git show HEAD:"$file" 2>/dev/null || echo "")
+    export SEC_RECIPIENTS="$git_root/$recipients_filename"
 
     # if a previous version of the file exists in git
     if [ -n "$git_file_content" ]; then
@@ -91,41 +99,72 @@ secgit_textconv () {
     printf "%s" "$content" | $seccmd d
 }
 secgit_track() {
-    _is_git_mode_on || secgit_on
-    git_root_dir=$(git rev-parse --show-toplevel)
-    gitattr_file="$git_root_dir/.gitattributes"
-    [ -f "$gitattr_file" ] || touch "$gitattr_file"
+    ( ! [ -f "$recipients_file" ] || [ -z "$(cat "$recipients_file")" ] ) &&
+        _err "add some recipients first!"
+    [ -f "$gitattrs_file" ] || touch "$gitattrs_file"
     for c in "$@"; do
         line="$c  filter=sec diff=sec"
-        grep "$line" "$gitattr_file" >/dev/null ||
-            echo "$line" >> "$gitattr_file"
+        grep "$line" "$gitattrs_file" >/dev/null ||
+            echo "$line" >> "$gitattrs_file"
     done; _info "paths [$*] tracked"
 }
 secgit_untrack() {
-    git_root_dir=$(git rev-parse --show-toplevel)
-    gitattr_file="$git_root_dir/.gitattributes"
-    ! [ -f "$gitattr_file" ] && _warn ".gitattribute file does not exists" && return 1
+    ! [ -f "$gitattrs_file" ] && _warn ".gitattribute file does not exists" && return 1
     tmpfile_paths_to_remove="$(_mktemp)"; trap 'rm -f "$tmpfile_paths_to_remove"' EXIT
-    for c in "$@";
-        do line="$c  filter=sec diff=sec"
-        echo "$line" >> "$tmpfile_paths_to_remove"; done
-    new_gitattr_content="$(grep -v -F -f "$tmpfile_paths_to_remove" "$gitattr_file")"
-    if [ -z "$new_gitattr_content" ]; then rm -f "$gitattr_file"
-    else printf "%s" "$new_gitattr_content" > "$gitattr_file"
-        _is_git_mode_on || secgit_on; fi
+    for c in "$@"; do line="$c  filter=sec diff=sec"; echo "$line" >> "$tmpfile_paths_to_remove"; done
+    new_gitattr_content="$(grep -v -F -f "$tmpfile_paths_to_remove" "$gitattrs_file")"
+    if [ -z "$new_gitattr_content" ]; then rm -f "$gitattrs_file"
+    else printf "%s" "$new_gitattr_content" > "$gitattrs_file"; fi
     _info "paths [$*] untracked"
 }
+secgit_add_recipients() {
+    for r in "$@"; do
+        if [ -f "$recipients_file" ] && grep "^$r\$" "$recipients_file" >/dev/null; then
+            _warn "recipient already present [$r]"
+        else
+            printf "%s\n" "$r" >> "$recipients_file"
+            _info "added recipient [$r]"
+        fi
+    done
+}
+secgit_remove_recipients() {
+    ! [ -f "$recipients_file" ] &&
+        _warn "recipient file does not exists, first add some recipients" && return 0
+    tmpfile_rm_recipient=$(_mktemp); trap 'rm -f "$tmpfile_rm_recipient"' EXIT
+    for r in "$@"; do printf "%s\n" "$r" >> "$tmpfile_rm_recipient"; done
+    new_recipient_content="$(grep -v -F -f "$tmpfile_rm_recipient" "$recipients_file")"
+    if [ -z "$new_recipient_content" ]; then rm -f "$recipients_file"
+    else printf "%s" "$new_recipient_content" > "$recipients_file"; fi
+    _info "recipients removed"
+}
+secgit_list() {
+    echo "# recipients:"
+    cat "$recipients_file"
+    echo
+    echo "# trackings:"
+    cat "$gitattrs_file" | sed 's/  filter=sec diff=sec//'
+    echo
+    echo "# tracked files:"
+    cd $git_root && git ls-files |
+        xargs git check-attr filter |
+        grep 'filter: sec' |
+        sed 's/: filter: sec//'
+}
 main() {
-    ! _is_cwd_in_a_git_repo && _die "you are not in a git repo >:|"
+    git_root="$(git rev-parse --show-toplevel 2>/dev/null)"
+    [ -z "$git_root" ] && _err "you are not in a git repo >:|"
+    recipients_file="$git_root/$recipients_filename"
+    gitattrs_file="$git_root/.gitattributes"
     cmd="$1"; [ -n "$cmd" ] && shift
     case $cmd in
         on) secgit_off; secgit_on && _info "activated \o/";;
         off) secgit_off && _info "deactivated :(";;
         l) secgit_list;;
         a) secgit_add_recipients "$@";;
-        r) secgit_rm_recipients "$@";;
+        r) secgit_remove_recipients "$@";;
         t) secgit_track "$@";;
         u) secgit_untrack "$@";;
+        s) secgit_force_git;;
         clean) secgit_clean "$@";;
         smudge) secgit_smudge;;
         textconv) secgit_textconv "$@";;
