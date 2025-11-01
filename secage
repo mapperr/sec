@@ -1,0 +1,116 @@
+#!/bin/sh
+age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
+usage() {
+    s="$(basename "$0")"
+    printf %s "\
+$s
+    a boring wrapper for age
+
+commands:
+    e  - encrypts from stdin and prints result to stdout
+    e <path> [<path> ...] - (re-)encrypts paths
+
+    d  - decrypts from stdin and prints result to stdout
+    d <path> [<path> ...] - decrypts paths
+
+env vars:
+    SEC_IDENTITY  - path to an age identity file (needed to decrypt)
+    SEC_RECIPIENTS  - can be a path to an age recipient file
+        or a comma-separated list of age recipients (needed to encrypt)
+"
+}
+_err() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
+_warn() { printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2; }
+_info() { printf "%s: %s\n" "$(basename "$0")" "$1" >&2; }
+_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2; }
+_rand_chars() {
+    # $1 = number of chars to receive, $2 = filter for the chars
+    LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null
+}
+_mktemp() {
+    tmpdir=/dev/shm
+    [ -w /dev/shm ] || tmpdir=${TMPDIR:-/tmp}
+    tmpfile=$tmpdir/sec.$(_rand_chars 16 'A-Za-z0-9') || _err "couldn't generate random characters"
+    mkdir -p "$(dirname "$tmpfile")" || _err "couldn't create temp dir"
+    touch "$tmpfile" || _err "couldn't create temp file"
+    printf "%s" "$tmpfile"
+}
+_is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_header\$" >/dev/null; }
+_is_file_encrypted() { _is_content_encrypted "$(cat "$1" | tr -d '\0')"; }
+_get_recipient_age_opt() {
+    _dbg "SEC_RECIPIENTS: $SEC_RECIPIENTS"
+    [ -f "$SEC_RECIPIENTS" ] && printf ' -R ''%s''' "$SEC_RECIPIENTS" && return 0
+    printf "%s" "$SEC_RECIPIENTS" | while IFS=, read -r r; do printf ' -r ''%s'' ' "$r"; done
+}
+_sec_encrypt_content() {
+    content_to_encrypt="$1"
+    [ -z "$content_to_encrypt" ] && return 0
+    [ -z "$SEC_RECIPIENTS" ] && _err "you have no recipients in SEC_RECIPIENTS >:|"
+    printf "%s" "$content_to_encrypt" | $age -a $(_get_recipient_age_opt) || _err "cannot encrypt input stream"
+    RET=$?
+    _is_content_encrypted "$content_to_encrypt" && _warn "input stream was already encrypted"
+    return $RET
+}
+_sec_decrypt_content() {
+    content_to_decrypt="$1"
+    _dbg "stream decrypt: content_to_decrypt $content_to_decrypt"
+    [ -z "$content_to_decrypt" ] && return 0
+    if ! _is_content_encrypted "$content_to_decrypt"; then
+        _dbg "stream decrypt: content_to_decrypt is not encrypted"
+        printf "%s" "$content_to_decrypt"
+        return 0; fi
+    [ -z "$SEC_IDENTITY" ] && _err "you have not set SEC_IDENTITY >:|"
+    printf "%s" "$content_to_decrypt" | $age -d -i "$SEC_IDENTITY" || _err "cannot decrypt input stream"
+}
+_sec_encrypt_file() {
+    file_to_encrypt="$1"
+    ! [ -f "$file_to_encrypt" ] && _warn "file [$file_to_encrypt] does not exists" && return 1
+    tmpfile_encrypt_file=$(_mktemp); trap 'rm -f "$tmpfile_encrypt_file"' EXIT
+    _sec_encrypt_content "$(cat "$file_to_encrypt")" >  "$tmpfile_encrypt_file"
+    mv -f "$tmpfile_encrypt_file" "$file_to_encrypt"
+    _dbg "encrypted file [$file_to_encrypt]"
+}
+_sec_decrypt_file() {
+    file_to_decrypt="$1"
+    ! [ -f "$file_to_decrypt" ] && _warn "file [$file_to_decrypt] does not exists" && return 1
+    tmpfile_decrypt_file=$(_mktemp); trap 'rm -f "$tmpfile_decrypt_file"' EXIT
+    _sec_decrypt_content "$(cat "$file_to_decrypt")" >  "$tmpfile_decrypt_file"
+    mv -f "$tmpfile_decrypt_file" "$file_to_decrypt"
+    _dbg "decrypted file [$file_to_decrypt]"
+}
+_sec_decrypt_paths() {
+    for ff in "$@"; do if _is_file_encrypted "$ff"; then
+        _sec_decrypt_file "$ff"; _info "[$ff] decrypted"
+        else _info "[$ff] is unencrypted"; fi
+    done
+}
+_sec_encrypt_paths() {
+    for ff in "$@"; do [ -z "$ff" ] && continue
+        if _is_file_encrypted "$ff"; then
+            _sec_decrypt_file "$ff"; _sec_encrypt_file "$ff"; _info "[$ff] re-encrypted"
+        else _sec_encrypt_file "$ff"; _info "[$ff] encrypted"; fi
+    done
+}
+sec_encrypt() {
+    paths="${1}"
+    if [ -z "$paths" ]; then _sec_encrypt_content "$(cat | tr -d '\0')"
+    else _sec_encrypt_paths "$@"; fi
+}
+sec_decrypt() {
+    paths="${1}"
+    if [ -z "$paths" ]; then _sec_decrypt_content "$(cat | tr -d '\0')"
+    else _sec_decrypt_paths "$@"; fi
+}
+main() {
+    age=$(command -v age || command -v rage) ||
+        _err "age not found, install per https://age-encryption.org"
+    cmd="$1"; shift
+    case $cmd in
+        e) sec_encrypt "$@";;
+        d) sec_decrypt "$@";;
+        *) if command -v sec-"$cmd">/dev/null;then sec-"$cmd" "$@"; else usage; exit 0; fi;
+    esac
+}
+[ "$1" ] || { usage; exit 0; } && main "$@"
+
+# vim: set expandtab tabstop=4 shiftwidth=4:

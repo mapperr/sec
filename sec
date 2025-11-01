@@ -7,7 +7,7 @@ usage() {
     s="$(basename "$0")"
     printf %s "\
 $s
-    a rough handler for age-based secrets eventually stored in git
+    a rough wrapper for age
 
 commands:
     l  - lists recipients and tracked paths

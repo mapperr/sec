@@ -1,0 +1,134 @@
+#!/bin/sh
+usage() {
+    s="$(basename "$0")"
+    printf "%s" "\
+$s
+    handles git configs to transparently use sec in your repo
+
+    on  - activates sec in your git repo
+    off  - deactivates sec from your git repo
+
+    l  - lists infos about recipients, tracked paths, etc.
+
+    a '<recipient>' [ '<recipient>'... ]  - adds recipients
+    r '<recipient>' [ '<recipient>'... ]  - removes recipients
+
+    t '<path>' [ '<path>'... ]  - tracks paths to .gitattributes (remember to quote globbings)
+    u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
+
+env vars:
+    SEC_IDENTITY  - path to an age identity file (needed for decrypt)
+
+files:
+    <repo-root-dir>/$sec_recipient_filename  - this file will store the recipient list
+"
+}
+seccmd=secage
+age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
+sec_recipient_filename=".sec-recipients"
+_die() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
+_warn() { printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2; }
+_info() { printf "%s: %s\n" "$(basename "$0")" "$1" >&2; }
+_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2; }
+_is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_header\$" >/dev/null; }
+_is_git_mode_on() { git config --local filter.sec.clean >/dev/null 2>&1; }
+_is_git_status_clean() { [ -z "$(git status --porcelain)" ]; }
+_is_cwd_in_a_git_repo() { git rev-parse --is-inside-work-tree > /dev/null 2>&1; }
+_rand_chars() {
+    # $1 = number of chars to receive, $2 = filter for the chars
+    LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null
+}
+_mktemp() {
+    tmpdir=/dev/shm
+    [ -w /dev/shm ] || tmpdir=${TMPDIR:-/tmp}
+    tmpfile=$tmpdir/sec.$(_rand_chars 16 'A-Za-z0-9') || _die "couldn't generate random characters"
+    mkdir -p "$(dirname "$tmpfile")" || _die "couldn't create temp dir"
+    touch "$tmpfile" || _die "couldn't create temp file"
+    printf "%s" "$tmpfile"
+}
+secgit_off() {
+    git config --local --unset-all filter.sec.clean
+    git config --local --unset-all filter.sec.smudge
+    git config --local --unset-all filter.sec.required
+    git config --local --unset-all diff.sec.textconv
+    _info "deactivated :("
+}
+secgit_on() {
+    git config --local filter.sec.clean "secgit clean %f"
+    git config --local filter.sec.smudge "secgit smudge %f"
+    git config --local filter.sec.required true
+    git config --local diff.sec.textconv "secgit diff"
+    _info "activated \o/"
+}
+secgit_clean() {
+    content=$(cat | tr -d '\0')
+    file="$1"
+    git_file_content=$(git show HEAD:"$file" 2>/dev/null || echo "")
+
+    # if a previous version of the file exists in git
+    if [ -n "$git_file_content" ]; then
+        # check if that verison was encrypted, if not, then encrypt the current version
+        # it means that we just added a new path to the .gitattributes
+        ! _is_content_encrypted "$git_file_content" && printf "%s" "$content" | $seccmd e && return $?
+
+        # else check if the new version differs from the old one
+        decrypted_git_file_content="$(printf "%s" "$git_file_content" | $seccmd d)"
+        if [ "$content" = "$decrypted_git_file_content" ]; then
+            # if it's not changed, then output the previous encrypted content
+            # we do this due to the age's non-deterministic encryption
+            printf "%s" "$git_file_content"
+            return 0; fi
+    fi
+    # if the file is new, just encrypt it
+    printf "%s" "$content" | $seccmd e
+}
+secgit_smudge () {
+    content=$(cat | tr -d '\0')
+    [ -z "$content" ] && return 0
+    printf "%s" "$content" | $seccmd d
+}
+secgit_textconv () {
+    content=$(cat "$1" | tr -d '\0')
+    [ -z "$content" ] && return 0
+    printf "%s" "$content" | $seccmd d
+}
+secgit_track() {
+    _is_git_mode_on || secgit_on
+    git_root_dir=$(git rev-parse --show-toplevel)
+    gitattr_file="$git_root_dir/.gitattributes"
+    [ -f "$gitattr_file" ] || touch "$gitattr_file"
+    for c in "$@"; do
+        line="$c  filter=sec diff=sec"
+        grep "$line" "$gitattr_file" >/dev/null ||
+            echo "$line" >> "$gitattr_file"
+    done; _info "paths [$*] tracked"
+}
+secgit_untrack() {
+    git_root_dir=$(git rev-parse --show-toplevel)
+    gitattr_file="$git_root_dir/.gitattributes"
+    ! [ -f "$gitattr_file" ] && _warn ".gitattribute file does not exists" && return 1
+    tmpfile_paths_to_remove="$(_mktemp)"; trap 'rm -f "$tmpfile_paths_to_remove"' EXIT
+    for c in "$@";
+        do line="$c  filter=sec diff=sec"
+        echo "$line" >> "$tmpfile_paths_to_remove"; done
+    new_gitattr_content="$(grep -v -F -f "$tmpfile_paths_to_remove" "$gitattr_file")"
+    if [ -z "$new_gitattr_content" ]; then rm -f "$gitattr_file"
+    else printf "%s" "$new_gitattr_content" > "$gitattr_file"
+        _is_git_mode_on || secgit_on; fi
+    _info "paths [$*] untracked"
+}
+! _is_cwd_in_a_git_repo && _die "you are not in a git repo >:|"
+cmd="$1"; [ -n "$cmd" ] && shift
+case $cmd in
+    on) secgit_off; secgit_on;;
+    off) secgit_off;;
+    l) secgit_list;;
+    a) secgit_add_recipients "$@";;
+    r) secgit_rm_recipients "$@";;
+    t) secgit_track "$@";;
+    u) secgit_untrack "$@";;
+    clean) secgit_clean "$@";;
+    smudge) secgit_smudge;;
+    textconv) secgit_textconv "$@";;
+    *) usage; exit 0;;
+esac
