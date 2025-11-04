@@ -17,7 +17,7 @@ $s
     u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
 
     # utilities:
-    s  - try to force git to encrypt your fresh-tracked file (works only on a clean git status)
+    f  - try to force git to encrypt your fresh-tracked file (works only on a clean git status)
 
 env vars:
     SEC_IDENTITY  - path to an age identity file (needed for decrypt)
@@ -138,17 +138,22 @@ secgit_remove_recipients() {
     _info "recipients removed"
 }
 secgit_list() {
+    cd $git_root || _err "cannot cd to repo root"
     echo "# recipients:"
-    cat "$recipients_file"
+    if [ -f "$recipients_file" ]; then cat "$recipients_file"
+    else _warn "no recipients yet!"; fi
     echo
     echo "# trackings:"
-    cat "$gitattrs_file" | sed 's/  filter=sec diff=sec//'
+    if [ -f "$gitattrs_file" ]; then cat "$gitattrs_file" | sed 's/  filter=sec diff=sec//'
+    else _warn "no trackings yet!"; fi
     echo
     echo "# tracked files:"
-    cd $git_root && git ls-files |
-        xargs git check-attr filter |
-        grep 'filter: sec' |
-        sed 's/: filter: sec//'
+    tracked_files=$(git ls-files |
+      xargs git check-attr filter |
+      grep 'filter: sec' |
+      sed 's/: filter: sec//')
+    if [ ! -z "$tracked_files" ]; then echo "$tracked_files"
+    else _warn "no tracked files"; fi
 }
 main() {
     git_root="$(git rev-parse --show-toplevel 2>/dev/null)"
@@ -164,7 +169,7 @@ main() {
         r) secgit_remove_recipients "$@";;
         t) secgit_track "$@";;
         u) secgit_untrack "$@";;
-        s) secgit_force_git;;
+        f) secgit_force_git;;
         clean) secgit_clean "$@";;
         smudge) secgit_smudge;;
         textconv) secgit_textconv "$@";;
