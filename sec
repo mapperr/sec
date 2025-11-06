@@ -39,14 +39,19 @@ _is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_head
 _is_file_encrypted() { _is_content_encrypted "$(cat "$1" | tr -d '\0')"; }
 _get_recipient_age_opt() {
     _dbg "SEC_RECIPIENTS: $SEC_RECIPIENTS"
-    [ -f "$SEC_RECIPIENTS" ] && printf ' -R ''%s''' "$SEC_RECIPIENTS" && return 0
-    printf "%s" "$SEC_RECIPIENTS" | while IFS=, read -r r; do printf ' -r ''%s'' ' "$r"; done
+    [ -f "$SEC_RECIPIENTS" ] && _dgb "SEC_RECIPIENT is a file" &&
+        printf ' -R ''%s''' "$SEC_RECIPIENTS" && return 0
+    _dbg "SEC_RECIPIENT is a string"
+    printf "%s" "$SEC_RECIPIENTS" | tr ',' '\n' | sort | uniq |
+        while IFS= read -r r; do [ -n "$r" ] && printf ' -r ''%s'' ' "$r"; done
 }
 _sec_encrypt_content() {
     content_to_encrypt="$1"
     [ -z "$content_to_encrypt" ] && return 0
     [ -z "$SEC_RECIPIENTS" ] && _err "you have no recipients in SEC_RECIPIENTS >:|"
-    printf "%s" "$content_to_encrypt" | $age -a $(_get_recipient_age_opt) || _err "cannot encrypt input stream"
+    age_recipients_opt="$(_get_recipient_age_opt)"
+    _dbg "recipient age option: [$age_recipients_opt]"
+    printf "%s" "$content_to_encrypt" | $age -a $age_recipients_opt || _err "cannot encrypt input stream"
     RET=$?
     _is_content_encrypted "$content_to_encrypt" && _warn "input stream was already encrypted"
     return $RET
