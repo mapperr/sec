@@ -10,6 +10,7 @@ $s
 
     l  - lists infos about recipients, tracked paths, etc.
 
+    # recipients
     a '<recipient>' [ '<recipient>'... ]  - adds recipients
     r '<recipient>' [ '<recipient>'... ]  - removes recipients
 
@@ -17,22 +18,26 @@ $s
     u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
 
     # utilities:
-    f  - try to force git to encrypt your fresh-tracked file (works only on a clean git status)
+    f  - try to force git to (re-)encrypt your fresh-tracked file (works only on a clean git status)
 
 env vars:
     SEC_IDENTITY  - path to an age identity file (needed for decrypt)
 
 files:
-    <repo-root-dir>/$recipients_filename  - this file will store the recipient list
+    <repo-root-dir>/$recipients_filename  - this file will store the recipient list for your repo
+        remember to add the recipient of your identity file!
 "
 }
 seccmd=sec
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
 recipients_filename=".sec-recipients"
-_err() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
-_warn() { printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2; }
-_info() { printf "%s: %s\n" "$(basename "$0")" "$1" >&2; }
-_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2; }
+tmpdir="${TMPDIR:-/tmp}"
+logfile="$tmpdir/sec-git.log"
+_now() { printf "%s" "$(date '+%Y-%m-%dT%H:%M:%S')"; }
+_err() { printf "%s - %s: error: %s\n" "$(_now)" "$(basename "$0")" "$1" >&2; exit 1; }
+_warn() { printf "%s: warn: %s\n" "$(_now) - $(basename "$0")" "$1" >&2; }
+_info() { printf "%s: %s\n" "$(_now) - $(basename "$0")" "$1" >&2; }
+_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(_now) - $(basename "$0")" "$1" >&2; return 0; }
 _is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_header\$" >/dev/null; }
 _is_git_mode_on() { git config --local filter.sec.clean >/dev/null 2>&1; }
 _is_git_status_clean() { [ -z "$(git status --porcelain)" ]; }
@@ -66,44 +71,69 @@ secgit_on() {
     git config --local diff.sec.textconv "$s textconv"
 }
 secgit_clean() {
-    content=$(cat | tr -d '\0')
+    _dbg "clean filter"
+    content_tmp="$(_mktemp)"
+    decrypted_content_tmp="$(_mktemp)"
+    trap 'rm -f "$content_tmp" "$decrypted_content_tmp"' EXIT
     file="$1"
-    git_file_content=$(git show HEAD:"$file" 2>/dev/null || echo "")
+    _dbg "file passed: $file"
+    if [ -n "$file" ]; then cat "$file" > "$content_tmp"
+    else cat > "$content_tmp"; fi
+    git_file_content=$(git -C "$git_root" --no-pager show HEAD:"$file" 2>/dev/null || echo "")
+    _dbg "git stored content:"
+    _dbg "$git_file_content"
+
     export SEC_RECIPIENTS="$git_root/$recipients_filename"
 
     # if a previous version of the file exists in git
     if [ -n "$git_file_content" ]; then
         # check if that verison was encrypted, if not, then encrypt the current version
         # it means that we just added a new path to the .gitattributes
-        ! _is_content_encrypted "$git_file_content" && printf "%s" "$content" | $seccmd e && return $?
+        if ! _is_content_encrypted "$git_file_content"; then
+            _dbg "git stored content was not encrypted, encrypting"
+            $seccmd e < "$content_tmp"
+            return $?
+        fi
 
+        _dbg "git stored content is encrypted, decrypting to check for changes"
         # else check if the new version differs from the old one
-        decrypted_git_file_content="$(printf "%s" "$git_file_content" | $seccmd d)"
-        if [ "$content" = "$decrypted_git_file_content" ]; then
+        printf "%s" "$git_file_content" | $seccmd d >"$decrypted_content_tmp"
+        _dbg "decrypted git stored content:"
+        _dbg "$(cat "$decrypted_content_tmp")"
+        if cmp -s "$content_tmp" "$decrypted_content_tmp"; then
+            _dbg "git stored content is the same as working copy content, printing git stored content"
             # if it's not changed, then output the previous encrypted content
             # we do this due to the age's non-deterministic encryption
-            printf "%s" "$git_file_content"
+            git -C "$git_root" --no-pager show HEAD:"$file" 2>/dev/null || echo ""
             return 0; fi
     fi
+    _dbg "git stored content differs from working copy content, encrypting working copy content"
     # if the file is new, just encrypt it
-    printf "%s" "$content" | $seccmd e
+    $seccmd e < "$content_tmp"
 }
 secgit_smudge () {
-    content=$(cat | tr -d '\0')
-    [ -z "$content" ] && return 0
-    printf "%s" "$content" | $seccmd d
+    content_tmp="$(_mktemp)"; trap 'rm -f "$content_tmp"' EXIT
+    file="$1"
+    if [ -n "$file" ]; then cat "$file" > "$content_tmp"
+    else cat > "$content_tmp"; fi
+    [ -s "$content_tmp" ] || return 0
+    $seccmd d < "$content_tmp"
 }
 secgit_textconv () {
-    content=$(cat "$1" | tr -d '\0')
-    [ -z "$content" ] && return 0
-    printf "%s" "$content" | $seccmd d
+    content_tmp="$(_mktemp)"; trap 'rm -f "$content_tmp"' EXIT
+    file="$1"
+    if [ -n "$file" ]; then cat "$file" > "$content_tmp"
+    else cat > "$content_tmp"; fi
+    [ -s "$content_tmp" ] || return 0
+    ! _is_content_encrypted <"$content_tmp" && cat "$content_tmp" && return 0
+    $seccmd d < "$content_tmp"
 }
 secgit_track() {
     ( ! [ -f "$recipients_file" ] || [ -z "$(cat "$recipients_file")" ] ) &&
         _err "add some recipients first!"
     [ -f "$gitattrs_file" ] || touch "$gitattrs_file"
     for c in "$@"; do
-        line="$c  filter=sec diff=sec"
+        line="$c  filter=sec diff=sec -text"
         grep "$line" "$gitattrs_file" >/dev/null ||
             echo "$line" >> "$gitattrs_file"
     done; _info "paths [$*] tracked"
@@ -111,7 +141,7 @@ secgit_track() {
 secgit_untrack() {
     ! [ -f "$gitattrs_file" ] && _warn ".gitattribute file does not exists" && return 1
     tmpfile_paths_to_remove="$(_mktemp)"; trap 'rm -f "$tmpfile_paths_to_remove"' EXIT
-    for c in "$@"; do line="$c  filter=sec diff=sec"; echo "$line" >> "$tmpfile_paths_to_remove"; done
+    for c in "$@"; do line="$c  filter=sec diff=sec -text"; echo "$line" >> "$tmpfile_paths_to_remove"; done
     new_gitattr_content="$(grep -v -F -f "$tmpfile_paths_to_remove" "$gitattrs_file")"
     if [ -z "$new_gitattr_content" ]; then rm -f "$gitattrs_file"
     else printf "%s" "$new_gitattr_content" > "$gitattrs_file"; fi
@@ -121,7 +151,7 @@ secgit_add_recipients() {
     for r in "$@"; do
         if [ -f "$recipients_file" ] && grep "^$r\$" "$recipients_file" >/dev/null; then
             _warn "recipient already present [$r]"
-        else
+        else [ -n "$(tail -c1 "$recipients_file")" ] && printf "\n" >> "$recipients_file"
             printf "%s\n" "$r" >> "$recipients_file"
             _info "added recipient [$r]"
         fi
@@ -145,7 +175,7 @@ secgit_list() {
     echo
     echo "# trackings:"
     if [ -f "$gitattrs_file" ]; then cat "$gitattrs_file" |
-        sed 's/  filter=sec diff=sec//' | sort | uniq
+        sed 's/  filter=sec diff=sec -text//' | sort | uniq
     else _warn "no trackings yet!"; fi
     echo
     echo "# tracked files:"

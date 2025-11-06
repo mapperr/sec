@@ -4,14 +4,14 @@ usage() {
     s="$(basename "$0")"
     printf %s "\
 $s
-    a boring wrapper for age
+    a tiny wrapper for age
 
 commands:
     e  - encrypts from stdin and prints result to stdout
-    e <path> [<path> ...] - (re-)encrypts paths
+    e <path> [<path> ...] - (re-)encrypts paths inline
 
     d  - decrypts from stdin and prints result to stdout
-    d <path> [<path> ...] - decrypts paths
+    d <path> [<path> ...] - decrypts paths inline
 
 env vars:
     SEC_IDENTITY  - path to an age identity file (needed to decrypt)
@@ -22,7 +22,7 @@ env vars:
 _err() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
 _warn() { printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2; }
 _info() { printf "%s: %s\n" "$(basename "$0")" "$1" >&2; }
-_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2; }
+_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2; return 0; }
 _rand_chars() {
     # $1 = number of chars to receive, $2 = filter for the chars
     LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null
@@ -39,7 +39,7 @@ _is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_head
 _is_file_encrypted() { _is_content_encrypted "$(cat "$1" | tr -d '\0')"; }
 _get_recipient_age_opt() {
     _dbg "SEC_RECIPIENTS: $SEC_RECIPIENTS"
-    [ -f "$SEC_RECIPIENTS" ] && _dgb "SEC_RECIPIENT is a file" &&
+    [ -f "$SEC_RECIPIENTS" ] && _dbg "SEC_RECIPIENT is a file" &&
         printf ' -R ''%s''' "$SEC_RECIPIENTS" && return 0
     _dbg "SEC_RECIPIENT is a string"
     printf "%s" "$SEC_RECIPIENTS" | tr ',' '\n' | sort | uniq |
@@ -117,5 +117,3 @@ main() {
     esac
 }
 [ "$1" ] || { usage; exit 0; } && main "$@"
-
-# vim: set expandtab tabstop=4 shiftwidth=4:

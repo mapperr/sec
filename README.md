@@ -1,56 +1,73 @@
 # sec
 
+`sec` is a wrapper for the already easy-to-use age.  
+
+But, if age is already easy to use, then, why a *wrapper*?  
+For few additional ergonomics and a minimal git clean/smudge integration.  
+Moreover, `sec` and its companion `sec-git` are just tiny POSIX-ish shell scripts,
+very easy to hack on.
+
+Usage:
+
 ```
 sec
-    a rough handler for age-based secrets eventually stored in git
+    a tiny wrapper for age
 
 commands:
-    l|list  - list tracked files and recipients
+    e  - encrypts from stdin and prints result to stdout
+    e <path> [<path> ...] - (re-)encrypts paths inline
 
-    t|track <path> [<path>] ...  - track files
-    u|untrack <path> [<path>] ...  - untrack files
-
-    e|encrypt  - encrypt all tracked files
-    d|decrypt  - decrypt all tracked files
-
-    fe|fencrypt <path>  - encrypt a single file
-    fd|fdecrypt <path>  - decrypt a single file
-    se|sencrypt  - encrypt content from stdin and prints to stdout
-    sd|sdecrypt  - decrypt content from stdin and prints to stdout
-
-    a|add <public_key> [<public_key>] ...  - add recipients
-    r|rm <public_key> [<public_key>] ...  - remove recipients
-
-    m|modify  - edit tracking file directly with \$EDITOR, use caution!
+    d  - decrypts from stdin and prints result to stdout
+    d <path> [<path> ...] - decrypts paths inline
 
 env vars:
-    SEC_IDENTITY_FILE  - [mandatory] age identity file to use for decryption
-
-    SEC_RECIPIENT  - [optional] your age publickey to use for encryption .
-        Set this to always ensure that your pubkey is present in the recipients,
-        to avoid an epic lock-out : )
-
-    SEC_ROOT_DIR  - [optional if PWD is in a git repo] set the root dir forcibly,
-        to address a bunch of use cases, like working with a normal directory that is not a git repo.
-        If this var is unset and CWD is in a git repo, then the git repo root is used.
-
-notes:
-    sec keeps a tracking file named '$sec_tracking_filename' in the SEC_ROOT_DIR .
-        The file contains paths of files tracked, relative to the root dir, one per line
-        and one line per recipient, starting with 'recipient: ' .
-        Empty lines and lines starting with '#' are ignored .
-
-    git dir and work tree: to work with a git dir that is, i.e. a bare repo used for dotfiles,
-        just set GIT_DIR and GIT_WORK_TREE env variables
-
+    SEC_IDENTITY  - path to an age identity file (needed to decrypt)
+    SEC_RECIPIENTS  - can be a path to an age recipient file
+        or a comma-separated list of age recipients (needed to encrypt)
 ```
 
-## Inspirations
+# sec-git
 
-- https://github.com/biox/pa
-- https://github.com/slok/agebox
-- https://github.com/vlaci/git-agecrypt
-- https://github.com/nxsy/shroudage
-- https://techgeneral.org/introducing-shroudage/
-- https://tech.j4m3s.eu/posts/git-filter-scripts/
-- https://blog.9wd.eu/posts/git-encryption-age/
+`sec-git` provides the sec integration with git:  
+using git clean/smudge filters and the .gitattributes file inside your repo,
+it can encrypt/decrypt tracked files transparently.  
+This way you can work with decrypted files on your working copy and
+encrypted files on your remote.  
+
+
+Usage:
+
+```
+sec-git
+    handles git configs to transparently use sec in your repo
+
+    on  - activates sec in your git repo
+    off  - deactivates sec from your git repo
+
+    l  - lists infos about recipients, tracked paths, etc.
+
+    # recipients
+    a '<recipient>' [ '<recipient>'... ]  - adds recipients
+    r '<recipient>' [ '<recipient>'... ]  - removes recipients
+
+    t '<path>' [ '<path>'... ]  - tracks paths to .gitattributes (remember to quote globbings)
+    u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
+
+    # utilities:
+    f  - try to force git to (re-)encrypt your fresh-tracked file (works only on a clean git status)
+
+env vars:
+    SEC_IDENTITY  - path to an age identity file (needed for decrypt)
+
+files:
+    <repo-root-dir>/.sec-recipients  - this file will store the recipient list for your repo
+        remember to add the recipient of your identity file!
+```
+
+## References
+
+- [age](https://github.com/FiloSottile/age): the awesome encryption tool by Filippo Valsorda
+- [pa](https://github.com/biox/pa): an amazing password manager writter in a few lines of POSIX shell
+- [git-crypt](https://github.com/AGWA/git-crypt): a long standing tool, same concept as sec-git, but using GPG
+- [shroudage](https://github.com/nxsy/shroudage): the inspiration for sec-git, written in bash
+- [git-agecrypt](https://github.com/vlaci/git-agecrypt): another inspiration for sec-git, written in rust
