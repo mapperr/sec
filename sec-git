@@ -151,7 +151,8 @@ secgit_add_recipients() {
     for r in "$@"; do
         if [ -f "$recipients_file" ] && grep "^$r\$" "$recipients_file" >/dev/null; then
             _warn "recipient already present [$r]"
-        else [ -n "$(tail -c1 "$recipients_file")" ] && printf "\n" >> "$recipients_file"
+        else [ -f "$recipients_file" ] && 
+            [ -n "$(tail -c1 "$recipients_file")" ] && printf "\n" >> "$recipients_file"
             printf "%s\n" "$r" >> "$recipients_file"
             _info "added recipient [$r]"
         fi
