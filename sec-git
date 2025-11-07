@@ -24,15 +24,14 @@ env vars:
     SEC_IDENTITY  - path to an age identity file (needed for decrypt)
 
 files:
-    <repo-root-dir>/$recipients_filename  - this file will store the recipient list for your repo
-        remember to add the recipient of your identity file!
+    <repo-root>/$recipients_filename  - this file will store the recipient list for your repo.
+        Remember to add the recipient of your identity file.
+        You can track and encrypt this file too.
 "
 }
 seccmd=sec
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
 recipients_filename=".sec-recipients"
-tmpdir="${TMPDIR:-/tmp}"
-logfile="$tmpdir/sec-git.log"
 _now() { printf "%s" "$(date '+%Y-%m-%dT%H:%M:%S')"; }
 _err() { printf "%s - %s: error: %s\n" "$(_now)" "$(basename "$0")" "$1" >&2; exit 1; }
 _warn() { printf "%s: warn: %s\n" "$(_now) - $(basename "$0")" "$1" >&2; }
@@ -203,7 +202,7 @@ main() {
         u) secgit_untrack "$@";;
         f) secgit_force_git;;
         clean) secgit_clean "$@";;
-        smudge) secgit_smudge;;
+        smudge) secgit_smudge "$@";;
         textconv) secgit_textconv "$@";;
         *) usage; exit 0;;
     esac
