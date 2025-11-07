@@ -114,8 +114,9 @@ secgit_clean() {
 secgit_smudge () {
     content_tmp="$(_mktemp)"; trap 'rm -f "$content_tmp"' EXIT
     file="$1"
-    if [ -n "$file" ]; then cat "$file" > "$content_tmp"
-    else cat > "$content_tmp"; fi
+    # if [ -n "$file" ]; then cat "$file" > "$content_tmp"
+    # else cat > "$content_tmp"; fi
+    cat > "$content_tmp"
     [ -s "$content_tmp" ] || return 0
     $seccmd d < "$content_tmp"
 }
