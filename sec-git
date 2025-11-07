@@ -133,7 +133,7 @@ secgit_track() {
         _err "add some recipients first!"
     [ -f "$gitattrs_file" ] || touch "$gitattrs_file"
     for c in "$@"; do
-        line="$c  filter=sec diff=sec -text"
+        line="$c  filter=sec diff=sec"
         grep "$line" "$gitattrs_file" >/dev/null ||
             echo "$line" >> "$gitattrs_file"
     done; _info "paths [$*] tracked"
@@ -141,7 +141,7 @@ secgit_track() {
 secgit_untrack() {
     ! [ -f "$gitattrs_file" ] && _warn ".gitattribute file does not exists" && return 1
     tmpfile_paths_to_remove="$(_mktemp)"; trap 'rm -f "$tmpfile_paths_to_remove"' EXIT
-    for c in "$@"; do line="$c  filter=sec diff=sec -text"; echo "$line" >> "$tmpfile_paths_to_remove"; done
+    for c in "$@"; do line="$c  filter=sec diff=sec"; echo "$line" >> "$tmpfile_paths_to_remove"; done
     new_gitattr_content="$(grep -v -F -f "$tmpfile_paths_to_remove" "$gitattrs_file")"
     if [ -z "$new_gitattr_content" ]; then rm -f "$gitattrs_file"
     else printf "%s" "$new_gitattr_content" > "$gitattrs_file"; fi
