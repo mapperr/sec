@@ -150,6 +150,7 @@ secgit_untrack() {
     _info "paths [$*] untracked"
 }
 secgit_add_recipients() {
+    [ -z "$1" ] && [ ! -t 0 ] && set -- "$(cat)"
     for r in "$@"; do
         if [ -f "$recipients_file" ] && grep "^$r\$" "$recipients_file" >/dev/null; then
             _warn "recipient already present [$r]"
@@ -164,6 +165,7 @@ secgit_remove_recipients() {
     ! [ -f "$recipients_file" ] &&
         _warn "recipient file does not exists, first add some recipients" && return 0
     tmpfile_rm_recipient=$(_mktemp); trap 'rm -f "$tmpfile_rm_recipient"' EXIT
+    [ -z "$1" ] && [ ! -t 0 ] && set -- "$(cat)"
     for r in "$@"; do printf "%s\n" "$r" >> "$tmpfile_rm_recipient"; done
     new_recipient_content="$(grep -v -F -f "$tmpfile_rm_recipient" "$recipients_file")"
     if [ -z "$new_recipient_content" ]; then rm -f "$recipients_file"
