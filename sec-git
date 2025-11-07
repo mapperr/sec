@@ -78,6 +78,7 @@ secgit_clean() {
     _dbg "file passed: $file"
     if [ -n "$file" ]; then cat "$file" > "$content_tmp"
     else cat > "$content_tmp"; fi
+    if [ -n "$SEC_FORCE_ENCRYPTION" ]; then $seccmd e < "$content_tmp"; return $?; fi
     git_file_content=$(git -C "$git_root" --no-pager show HEAD:"$file" 2>/dev/null || echo "")
     _dbg "git stored content:"
     _dbg "$git_file_content"
