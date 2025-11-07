@@ -32,11 +32,12 @@ files:
 seccmd=sec
 age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
 recipients_filename=".sec-recipients"
+s="$(basename "$0")"
 _now() { printf "%s" "$(date '+%Y-%m-%dT%H:%M:%S')"; }
-_err() { printf "%s - %s: error: %s\n" "$(_now)" "$(basename "$0")" "$1" >&2; exit 1; }
-_warn() { printf "%s: warn: %s\n" "$(_now) - $(basename "$0")" "$1" >&2; }
-_info() { printf "%s: %s\n" "$(_now) - $(basename "$0")" "$1" >&2; }
-_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(_now) - $(basename "$0")" "$1" >&2; return 0; }
+_err() { printf "%s %s error: %s\n" "$(_now)" "$s" "$1" >&2; exit 1; }
+_warn() { printf "%s %s warn: %s\n" "$(_now)" "$s" "$1" >&2; }
+_info() { printf "%s %s: %s\n" "$(_now)" "$s" "$1" >&2; }
+_dbg() { [ "$SEC_DEBUG" ] && printf "%s %s debug: %s\n" "$(_now)" "$s" "$1" >&2; return 0; }
 _is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_header\$" >/dev/null; }
 _is_git_mode_on() { git config --local filter.sec.clean >/dev/null 2>&1; }
 _is_git_status_clean() { [ -z "$(git status --porcelain)" ]; }
@@ -79,7 +80,7 @@ secgit_clean() {
     if [ -n "$file" ]; then cat "$file" > "$content_tmp"
     else cat > "$content_tmp"; fi
     if [ -n "$SEC_FORCE_ENCRYPTION" ]; then $seccmd e < "$content_tmp"; return $?; fi
-    git_file_content=$(git -C "$git_root" --no-pager show HEAD:"$file" 2>/dev/null || echo "")
+    git_file_content=$(git -C "$git_root" --no-pager show HEAD:"$file"  || echo "")
     _dbg "git stored content:"
     _dbg "$git_file_content"
 
@@ -90,7 +91,7 @@ secgit_clean() {
         # check if that verison was encrypted, if not, then encrypt the current version
         # it means that we just added a new path to the .gitattributes
         if ! _is_content_encrypted "$git_file_content"; then
-            _dbg "git stored content was not encrypted, encrypting"
+            _info "[$file] file inside git was not encrypted, encrypting."
             $seccmd e < "$content_tmp"
             return $?
         fi
