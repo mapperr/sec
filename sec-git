@@ -169,21 +169,19 @@ secgit_remove_recipients() {
 }
 secgit_list() {
     cd $git_root || _err "cannot cd to repo root"
-    echo "# recipients:"
-    if [ -f "$recipients_file" ]; then cat "$recipients_file" | sort | uniq
+    echo "# r: recipient, t: tracking, f: file tracked -> grep as you wish"; echo
+    if [ -f "$recipients_file" ]; then cat "$recipients_file" | xargs -I% echo "r: %" | sort | uniq
     else _warn "no recipients yet!"; fi
     echo
-    echo "# trackings:"
     if [ -f "$gitattrs_file" ]; then cat "$gitattrs_file" |
-        sed 's/  filter=sec diff=sec -text//' | sort | uniq
+        cut -d' ' -f1 | xargs -I% echo "t: %" | sort | uniq
     else _warn "no trackings yet!"; fi
     echo
-    echo "# tracked files:"
     tracked_files=$(git ls-files |
       xargs git check-attr filter |
       grep 'filter: sec' |
-      sed 's/: filter: sec//' | sort | uniq)
-    if [ ! -z "$tracked_files" ]; then echo "$tracked_files"
+      cut -d: -f1)
+    if [ ! -z "$tracked_files" ]; then echo "$tracked_files" | xargs -I% echo "f: %" | sort | uniq
     else _warn "no tracked files"; fi
 }
 main() {
