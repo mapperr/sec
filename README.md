@@ -46,22 +46,22 @@ sec-git
 
     l  - lists infos about recipients, tracked paths, etc.
 
-    # recipients
-    a '<recipient>' [ '<recipient>'... ]  - adds recipients
-    r '<recipient>' [ '<recipient>'... ]  - removes recipients
+    a '<recipient>' [ '<recipient>'... ]  - adds recipients (you can also pipe them in)
+    r '<recipient>' [ '<recipient>'... ]  - removes recipients (you can also pipe them in)
 
     t '<path>' [ '<path>'... ]  - tracks paths to .gitattributes (remember to quote globbings)
     u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
 
-    # utilities:
-    f  - try to force git to (re-)encrypt your fresh-tracked file (works only on a clean git status)
+    f  - try to force git to (re-)encrypt your tracked files (works only on a clean git status)
+        useful if you have just changed recipients and want to re-encrypt files only for the current ones
 
 env vars:
     SEC_IDENTITY  - path to an age identity file (needed for decrypt)
 
 files:
-    <repo-root-dir>/.sec-recipients  - this file will store the recipient list for your repo
-        remember to add the recipient of your identity file!
+    <repo-root>/.sec-recipients  - this file will store the recipient list for your repo.
+        Remember to add the recipient of your identity file.
+        You can track and encrypt this file too.
 ```
 
 ## References
