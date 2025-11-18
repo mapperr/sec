@@ -10,15 +10,14 @@ $s
 
     l  - lists infos about recipients, tracked paths, etc.
 
-    # recipients
-    a '<recipient>' [ '<recipient>'... ]  - adds recipients
-    r '<recipient>' [ '<recipient>'... ]  - removes recipients
+    a '<recipient>' [ '<recipient>'... ]  - adds recipients (you can also pipe them in)
+    r '<recipient>' [ '<recipient>'... ]  - removes recipients (you can also pipe them in)
 
     t '<path>' [ '<path>'... ]  - tracks paths to .gitattributes (remember to quote globbings)
     u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
 
-    # utilities:
-    f  - try to force git to (re-)encrypt your fresh-tracked file (works only on a clean git status)
+    f  - try to force git to (re-)encrypt your tracked files (works only on a clean git status)
+        useful if you have just changed recipients and want to re-encrypt files only for the current ones
 
 env vars:
     SEC_IDENTITY  - path to an age identity file (needed for decrypt)
@@ -174,6 +173,7 @@ secgit_remove_recipients() {
 }
 secgit_list() {
     cd $git_root || _err "cannot cd to repo root"
+    _is_git_mode_on || _warn "sec git is not active!"
     echo "# r: recipient, t: tracking, f: file tracked -> grep as you wish"; echo
     if [ -f "$recipients_file" ]; then cat "$recipients_file" | xargs -I% echo "r: %" | sort | uniq
     else _warn "no recipients yet!"; fi
@@ -187,7 +187,7 @@ secgit_list() {
       grep 'filter: sec' |
       cut -d: -f1)
     if [ ! -z "$tracked_files" ]; then echo "$tracked_files" | xargs -I% echo "f: %" | sort | uniq
-    else _warn "no tracked files"; fi
+    else _warn "no tracked files!"; fi
 }
 main() {
     git_root="$(git rev-parse --show-toplevel 2>/dev/null)"
