@@ -15,8 +15,8 @@ commands:
 
 env vars:
     SEC_IDENTITY  - path to an age identity file (needed to decrypt)
-    SEC_RECIPIENTS  - can be a path to an age recipient file
-        or a comma-separated list of age recipients (needed to encrypt)
+    SEC_RECIPIENTS  - a comma-separated list of age recipients
+        or recipient files, age or ssh pubkeys (needed to encrypt)
 "
 }
 _err() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
@@ -43,7 +43,11 @@ _get_recipient_age_opt() {
         printf ' -R ''%s''' "$SEC_RECIPIENTS" && return 0
     _dbg "SEC_RECIPIENT is a string"
     printf "%s" "$SEC_RECIPIENTS" | tr ',' '\n' | sort | uniq |
-        while IFS= read -r r; do [ -n "$r" ] && printf ' -r ''%s'' ' "$r"; done
+        while IFS= read -r r; do
+            [ -z "$r" ] && continue
+            [ -f "$r" ] && printf ' -R %s ' "$r"
+            [ ! -f "$r" ] && printf ' -r %s ' "$r"
+        done
 }
 _sec_encrypt_content() {
     content_to_encrypt="$1"
