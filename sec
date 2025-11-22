@@ -62,7 +62,8 @@ _sec_encrypt_content() {
 }
 _sec_decrypt_content() {
     content_to_decrypt="$1"
-    _dbg "stream decrypt: content_to_decrypt $content_to_decrypt"
+    _dbg "stream decrypt: content_to_decrypt:
+$content_to_decrypt"
     [ -z "$content_to_decrypt" ] && return 0
     if ! _is_content_encrypted "$content_to_decrypt"; then
         _dbg "stream decrypt: content_to_decrypt is not encrypted"
