@@ -70,6 +70,7 @@ $content_to_decrypt"
         printf "%s" "$content_to_decrypt"
         return 0; fi
     [ -z "$SEC_IDENTITY" ] && _err "you have not set SEC_IDENTITY >:|"
+    _dbg "stream decrypt: using $SEC_IDENTITY for decryption"
     printf "%s" "$content_to_decrypt" | $age -d -i "$SEC_IDENTITY" || _err "cannot decrypt input stream"
 }
 _sec_encrypt_file() {

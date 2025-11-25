@@ -52,7 +52,8 @@ _mktemp() {
 }
 secgit_force_git() {
     _is_git_status_clean || _err "ensure you have a clean git status to run this command"
-    cd $git_root && git rm --cached -r . && SEC_FORCE_ENCRYPTION=y git add -A
+    export SEC_FORCE_ENCRYPTION=y 
+    cd $git_root && git rm --cached -r . && git add -A
 }
 secgit_off() {
     git config --local --unset-all filter.sec.clean
@@ -71,6 +72,7 @@ secgit_on() {
 }
 secgit_clean() {
     _dbg "clean filter"
+    export SEC_RECIPIENTS="$git_root/$recipients_filename"
     content_tmp="$(_mktemp)"
     decrypted_content_tmp="$(_mktemp)"
     trap 'rm -f "$content_tmp" "$decrypted_content_tmp"' EXIT
@@ -82,8 +84,6 @@ secgit_clean() {
     git_file_content=$(git -C "$git_root" --no-pager show HEAD:"$file"  || echo "")
     _dbg "git stored content:"
     _dbg "$git_file_content"
-
-    export SEC_RECIPIENTS="$git_root/$recipients_filename"
 
     # if a previous version of the file exists in git
     if [ -n "$git_file_content" ]; then
