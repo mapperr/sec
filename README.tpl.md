@@ -124,6 +124,21 @@ $ git diff
 $ git sec on
 2025-11-25T13:25:14 git-sec: activated \o/
 
+$ git sec l
+# r: recipient, t: tracking, f: file tracked -> grep as you wish
+
+r: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORfYBrvJ40V6W4rvYJ4y9r4Ccwy48DBobjXwGUUYZR0 my_ssh_key
+
+t: **/*.tfstate
+t: **/secret.yaml
+t: .sec-recipients
+
+f: .sec-recipients
+f: homelab/my_very_secret.yaml
+f: cloud/terraform.tfstate
+f: work/terraform.tfstate
+f: work/work_secret.yaml
+
 $ git add . && git ci -m 'setup git sec'
 # let's force an encryption on tracked files
 $ git sec f
