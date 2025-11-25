@@ -21,9 +21,9 @@ commands:
     d <path> [<path> ...] - decrypts paths inline
 
 env vars:
-    SEC_IDENTITY  - path to an age identity file (needed to decrypt)
-    SEC_RECIPIENTS  - a comma-separated list of age recipients
-        or recipient files, age or ssh pubkeys (needed to encrypt)
+    SEC_IDENTITY  - path to an age or ssh identity file (needed to decrypt)
+    SEC_RECIPIENTS  - a comma-separated list of recipients,
+        they can be age pubkeys, age pubkey files or ssh pubkey files (needed to encrypt)
 ```
 
 # git-sec
@@ -34,7 +34,7 @@ it can encrypt/decrypt tracked files transparently.
 This way you can work with decrypted files on your working copy and
 encrypted files on your remote.  
 
-After you link or place it your PATH you can also use it as a git subcommand: `git sec <stuff>`
+After you link or place it in your PATH you can also use it as a git subcommand: `git sec <stuff>`
 
 Usage:
 
@@ -57,7 +57,7 @@ git-sec
         useful if you have just changed recipients and want to re-encrypt files only for the current ones
 
 env vars:
-    SEC_IDENTITY  - path to an age identity file (needed for decrypt)
+    SEC_IDENTITY  - path to an age or ssh identity file (needed for decrypt)
 
 files:
     <repo-root>/.sec-recipients  - this file will store the recipient list for your repo.

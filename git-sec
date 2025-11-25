@@ -20,7 +20,7 @@ $s
         useful if you have just changed recipients and want to re-encrypt files only for the current ones
 
 env vars:
-    SEC_IDENTITY  - path to an age identity file (needed for decrypt)
+    SEC_IDENTITY  - path to an age or ssh identity file (needed for decrypt)
 
 files:
     <repo-root>/$recipients_filename  - this file will store the recipient list for your repo.

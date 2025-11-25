@@ -14,9 +14,9 @@ commands:
     d <path> [<path> ...] - decrypts paths inline
 
 env vars:
-    SEC_IDENTITY  - path to an age identity file (needed to decrypt)
-    SEC_RECIPIENTS  - a comma-separated list of age recipients
-        or recipient files, age or ssh pubkeys (needed to encrypt)
+    SEC_IDENTITY  - path to an age or ssh identity file (needed to decrypt)
+    SEC_RECIPIENTS  - a comma-separated list of recipients,
+        they can be age pubkeys, age pubkey files or ssh pubkey files (needed to encrypt)
 "
 }
 _err() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
