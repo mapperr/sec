@@ -21,6 +21,7 @@ it can encrypt/decrypt tracked files transparently.
 This way you can work with decrypted files on your working copy and
 encrypted files on your remote.  
 
+After you link or place it your PATH you can also use it as a git subcommand: `git sec <stuff>`
 
 Usage:
 
