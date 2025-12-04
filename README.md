@@ -189,3 +189,7 @@ $ git add . && git ci -m 'encrypt secret files!' && git push
 - [git-crypt](https://github.com/AGWA/git-crypt): a long standing tool, same concept as git-sec, but using GPG
 - [shroudage](https://github.com/nxsy/shroudage): the inspiration for git-sec, written in bash
 - [git-agecrypt](https://github.com/vlaci/git-agecrypt): another inspiration for git-sec, written in rust
+
+## Development
+
+The source is hosted on https://git.sr.ht/~mapperr/sec
