@@ -1,125 +1,271 @@
 #!/bin/sh
-age_armored_header="-----BEGIN AGE ENCRYPTED FILE-----"
+
+AGE_ARMOR_HEADER='-----BEGIN AGE ENCRYPTED FILE-----'
+AGE_BINARY_HEADER='age-encryption.org/v1'
+umask 077
+
 usage() {
-    s="$(basename "$0")"
-    printf %s "\
+	s=$(basename "$0")
+	cat <<EOF_USAGE
 $s
     a tiny wrapper for age
 
 commands:
-    e  - encrypts from stdin and prints result to stdout
-    e <path> [<path> ...] - (re-)encrypts paths inline
-
-    d  - decrypts from stdin and prints result to stdout
-    d <path> [<path> ...] - decrypts paths inline
+    e                       encrypt stdin to stdout
+    e <path> [<path> ...]   encrypt files in place
+    d                       decrypt stdin to stdout
+    d <path> [<path> ...]   decrypt files in place
 
 env vars:
-    SEC_IDENTITY  - path to an age or ssh identity file (needed to decrypt)
-    SEC_RECIPIENTS  - a comma-separated list of recipients,
-        they can be age pubkeys, age pubkey files or ssh pubkey files (needed to encrypt)
-"
+    SEC_IDENTITY    age/ssh identity file used for decryption
+    SEC_RECIPIENTS  comma-separated recipients or recipient files;
+                    if the whole value is a file, use it directly
+    SEC_DEBUG       enable debug messages
+EOF_USAGE
 }
-_err() { printf "%s: error: %s\n" "$(basename "$0")" "$1" >&2; exit 1; }
-_warn() { printf "%s: warn: %s\n" "$(basename "$0")" "$1" >&2; }
-_info() { printf "%s: %s\n" "$(basename "$0")" "$1" >&2; }
-_dbg() { [ "$SEC_DEBUG" ] && printf "%s: debug: %s\n" "$(basename "$0")" "$1" >&2; return 0; }
-_rand_chars() {
-    # $1 = number of chars to receive, $2 = filter for the chars
-    LC_ALL=C tr -dc "$2" </dev/urandom | dd ibs=1 obs=1 count="$1" 2>/dev/null
+
+_name() { basename "$0"; }
+_die() { printf '%s: error: %s\n' "$(_name)" "$1" >&2; exit 1; }
+_error() { printf '%s: error: %s\n' "$(_name)" "$1" >&2; return 1; }
+_info() { printf '%s: %s\n' "$(_name)" "$1" >&2; }
+_debug() {
+	[ -n "${SEC_DEBUG:-}" ] && printf '%s: debug: %s\n' "$(_name)" "$1" >&2
+	return 0
 }
-_mktemp() {
-    tmpdir=/dev/shm
-    [ -w /dev/shm ] || tmpdir=${TMPDIR:-/tmp}
-    tmpfile=$tmpdir/sec.$(_rand_chars 16 'A-Za-z0-9') || _err "couldn't generate random characters"
-    mkdir -p "$(dirname "$tmpfile")" || _err "couldn't create temp dir"
-    touch "$tmpfile" || _err "couldn't create temp file"
-    printf "%s" "$tmpfile"
+
+_runtime_dir() {
+	for d in "${XDG_RUNTIME_DIR:-}" /dev/shm "${TMPDIR:-/tmp}"; do
+		[ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && {
+			printf '%s\n' "$d"
+			return 0
+		}
+	done
+	return 1
 }
-_is_content_encrypted() { printf "%s" "$1" | head -n1 | grep "^$age_armored_header\$" >/dev/null; }
-_is_file_encrypted() { _is_content_encrypted "$(cat "$1" | tr -d '\0')"; }
-_get_recipient_age_opt() {
-    _dbg "SEC_RECIPIENTS: $SEC_RECIPIENTS"
-    [ -f "$SEC_RECIPIENTS" ] && _dbg "SEC_RECIPIENT is a file" &&
-        printf ' -R ''%s''' "$SEC_RECIPIENTS" && return 0
-    _dbg "SEC_RECIPIENT is a string"
-    printf "%s" "$SEC_RECIPIENTS" | tr ',' '\n' | sort | uniq |
-        while IFS= read -r r; do
-            [ -z "$r" ] && continue
-            [ -f "$r" ] && printf ' -R %s ' "$r"
-            [ ! -f "$r" ] && printf ' -r %s ' "$r"
-        done
+
+_tmpfile() {
+	d=$(_runtime_dir) || return 1
+	mktemp "$d/sec.XXXXXX"
 }
-_sec_encrypt_content() {
-    content_to_encrypt="$1"
-    [ -z "$content_to_encrypt" ] && return 0
-    [ -z "$SEC_RECIPIENTS" ] && _err "you have no recipients in SEC_RECIPIENTS >:|"
-    age_recipients_opt="$(_get_recipient_age_opt)"
-    _dbg "recipient age option: [$age_recipients_opt]"
-    printf "%s" "$content_to_encrypt" | $age -a $age_recipients_opt || _err "cannot encrypt input stream"
-    RET=$?
-    _is_content_encrypted "$content_to_encrypt" && _warn "input stream was already encrypted"
-    return $RET
+
+_same_dir_tmp() {
+	d=$(dirname -- "$1") || return 1
+	mktemp "$d/.sec.tmp.XXXXXX"
 }
-_sec_decrypt_content() {
-    content_to_decrypt="$1"
-    _dbg "stream decrypt: content_to_decrypt:
-$content_to_decrypt"
-    [ -z "$content_to_decrypt" ] && return 0
-    if ! _is_content_encrypted "$content_to_decrypt"; then
-        _dbg "stream decrypt: content_to_decrypt is not encrypted"
-        printf "%s" "$content_to_decrypt"
-        return 0; fi
-    [ -z "$SEC_IDENTITY" ] && _err "you have not set SEC_IDENTITY >:|"
-    _dbg "stream decrypt: using $SEC_IDENTITY for decryption"
-    printf "%s" "$content_to_decrypt" | $age -d -i "$SEC_IDENTITY" || _err "cannot decrypt input stream"
+
+_validate_file() {
+	[ -L "$1" ] && { _error "refusing symlink [$1]"; return 1; }
+	[ -f "$1" ] || { _error "file [$1] does not exist or is not a regular file"; return 1; }
+
+	n=$(stat -c '%h' -- "$1" 2>/dev/null || printf '1')
+	[ "$n" -le 1 ] 2>/dev/null || {
+		_error "refusing multiply-linked file [$1]"
+		return 1
+	}
 }
-_sec_encrypt_file() {
-    file_to_encrypt="$1"
-    ! [ -f "$file_to_encrypt" ] && _warn "file [$file_to_encrypt] does not exists" && return 1
-    tmpfile_encrypt_file=$(_mktemp); trap 'rm -f "$tmpfile_encrypt_file"' EXIT
-    _sec_encrypt_content "$(cat "$file_to_encrypt")" >  "$tmpfile_encrypt_file"
-    mv -f "$tmpfile_encrypt_file" "$file_to_encrypt"
-    _dbg "encrypted file [$file_to_encrypt]"
+
+_is_encrypted() {
+	LC_ALL=C head -n 1 -- "$1" 2>/dev/null |
+		grep -Fqx -e "$AGE_ARMOR_HEADER" -e "$AGE_BINARY_HEADER"
 }
-_sec_decrypt_file() {
-    file_to_decrypt="$1"
-    ! [ -f "$file_to_decrypt" ] && _warn "file [$file_to_decrypt] does not exists" && return 1
-    tmpfile_decrypt_file=$(_mktemp); trap 'rm -f "$tmpfile_decrypt_file"' EXIT
-    _sec_decrypt_content "$(cat "$file_to_decrypt")" >  "$tmpfile_decrypt_file"
-    mv -f "$tmpfile_decrypt_file" "$file_to_decrypt"
-    _dbg "decrypted file [$file_to_decrypt]"
+
+_require_identity() {
+	[ -n "${SEC_IDENTITY:-}" ] || { _error 'you have not set SEC_IDENTITY >:|'; return 1; }
+	[ -r "$SEC_IDENTITY" ] || { _error "identity [$SEC_IDENTITY] is not readable"; return 1; }
 }
-_sec_decrypt_paths() {
-    for ff in "$@"; do if _is_file_encrypted "$ff"; then
-        _sec_decrypt_file "$ff"; _info "[$ff] decrypted"
-        else _info "[$ff] is unencrypted"; fi
-    done
+
+# Build one age recipients file. This avoids constructing shell arguments in a
+# string and also handles ssh recipients containing spaces.
+_make_recipients() {
+	out=$1
+	[ -n "${SEC_RECIPIENTS:-}" ] || {
+		_error 'you have no recipients in SEC_RECIPIENTS >:|'
+		return 1
+	}
+
+	if [ -f "$SEC_RECIPIENTS" ]; then
+		cat -- "$SEC_RECIPIENTS" >"$out" || return 1
+		return 0
+	fi
+
+	rest=$SEC_RECIPIENTS
+	found=0
+	while :; do
+		case $rest in
+			*,*) r=${rest%%,*}; rest=${rest#*,}; more=1 ;;
+			*)   r=$rest; rest=; more=0 ;;
+		esac
+
+		# Recipient specifications are public data, so trimming them through sed
+		# does not risk putting secret material in a shell variable.
+		r=$(printf '%s' "$r" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+		if [ -n "$r" ]; then
+			found=1
+			if [ -f "$r" ]; then
+				cat -- "$r" >>"$out" || return 1
+				printf '\n' >>"$out" || return 1
+			else
+				printf '%s\n' "$r" >>"$out" || return 1
+			fi
+		fi
+		[ "$more" -eq 1 ] || break
+	done
+
+	[ "$found" -eq 1 ] || { _error 'SEC_RECIPIENTS contains no recipients'; return 1; }
 }
-_sec_encrypt_paths() {
-    for ff in "$@"; do [ -z "$ff" ] && continue
-        if _is_file_encrypted "$ff"; then
-            _sec_decrypt_file "$ff"; _sec_encrypt_file "$ff"; _info "[$ff] re-encrypted"
-        else _sec_encrypt_file "$ff"; _info "[$ff] encrypted"; fi
-    done
+
+# Consume only a small prefix from stdin. Both age encodings have a textual
+# first line: the PEM armor header, or the native age version line. The caller
+# can replay the prefix followed by the still-unread stdin byte-for-byte.
+_prefix_is_encrypted() {
+	LC_ALL=C head -n 1 -- "$1" 2>/dev/null |
+		grep -Fqx -e "$AGE_ARMOR_HEADER" -e "$AGE_BINARY_HEADER"
 }
-sec_encrypt() {
-    paths="${1}"
-    if [ -z "$paths" ]; then _sec_encrypt_content "$(cat | tr -d '\0')"
-    else _sec_encrypt_paths "$@"; fi
+
+_sniff_stdin() {
+	prefix=$1
+	n=$(printf '%s\n' "$AGE_ARMOR_HEADER" | wc -c | tr -d ' ')
+	dd bs=1 count="$n" of="$prefix" 2>/dev/null || return 2
+	_prefix_is_encrypted "$prefix"
 }
-sec_decrypt() {
-    paths="${1}"
-    if [ -z "$paths" ]; then _sec_decrypt_content "$(cat | tr -d '\0')"
-    else _sec_decrypt_paths "$@"; fi
+
+_encrypt_stream() (
+	prefix=$(_tmpfile) || { _error 'cannot create temporary input prefix'; exit 1; }
+	recip=$(_tmpfile) || { rm -f -- "$prefix"; _error 'cannot create recipients file'; exit 1; }
+	trap 'rm -f -- "$prefix" "$recip"' 0 HUP INT TERM
+
+	_make_recipients "$recip" || exit 1
+	_sniff_stdin "$prefix"
+	rc=$?
+	[ "$rc" -eq 2 ] && { _error 'cannot read input stream'; exit 1; }
+	[ "$rc" -eq 0 ] && { _error 'input stream is already age-encrypted'; exit 1; }
+
+	_debug 'encrypting input stream'
+	{ cat -- "$prefix"; cat; } | "$age" -a -R "$recip"
+	rc=$?
+	[ "$rc" -eq 0 ] || _error 'cannot encrypt input stream'
+	exit "$rc"
+)
+
+_decrypt_stream() (
+	prefix=$(_tmpfile) || { _error 'cannot create temporary input prefix'; exit 1; }
+	trap 'rm -f -- "$prefix"' 0 HUP INT TERM
+
+	_sniff_stdin "$prefix"
+	rc=$?
+	[ "$rc" -eq 2 ] && { _error 'cannot read input stream'; exit 1; }
+
+	if [ "$rc" -ne 0 ]; then
+		_error 'input stream is not age-encrypted'
+		exit 1
+	fi
+
+	_require_identity || exit 1
+	_debug 'decrypting input stream'
+	{ cat -- "$prefix"; cat; } | "$age" -d -i "$SEC_IDENTITY"
+	rc=$?
+	[ "$rc" -eq 0 ] || _error 'cannot decrypt input stream'
+	exit "$rc"
+)
+
+_replace() {
+	tmp=$1 file=$2
+	chmod --reference="$file" "$tmp" 2>/dev/null || {
+		mode=$(stat -c '%a' -- "$file") || return 1
+		chmod "$mode" "$tmp" || return 1
+	}
+	mv -f -- "$tmp" "$file"
 }
+
+_encrypt_file() (
+	file=$1
+	_validate_file "$file" || exit 1
+	tmp=$(_same_dir_tmp "$file") || { _error "cannot create temporary file next to [$file]"; exit 1; }
+	recip=$(_tmpfile) || { rm -f -- "$tmp"; _error 'cannot create recipients file'; exit 1; }
+	trap 'rm -f -- "$tmp" "$recip"' 0 HUP INT TERM
+
+	_make_recipients "$recip" || exit 1
+	_debug "encrypting file [$file]"
+	"$age" -a -R "$recip" -- "$file" >"$tmp" || {
+		_error "cannot encrypt [$file]"
+		exit 1
+	}
+	_replace "$tmp" "$file" || { _error "cannot replace [$file]"; exit 1; }
+	tmp=
+)
+
+_decrypt_file() (
+	file=$1
+	_validate_file "$file" || exit 1
+	_require_identity || exit 1
+	tmp=$(_same_dir_tmp "$file") || { _error "cannot create temporary file next to [$file]"; exit 1; }
+	trap 'rm -f -- "$tmp"' 0 HUP INT TERM
+
+	_debug "decrypting file [$file]"
+	"$age" -d -i "$SEC_IDENTITY" -- "$file" >"$tmp" || {
+		_error "cannot decrypt [$file]"
+		exit 1
+	}
+	_replace "$tmp" "$file" || { _error "cannot replace [$file]"; exit 1; }
+	tmp=
+)
+
+_encrypt_paths() {
+	rc=0
+	for file do
+		[ -n "$file" ] || continue
+		if ! _validate_file "$file"; then
+			rc=1
+		elif _is_encrypted "$file"; then
+			_error "file [$file] is already age-encrypted"
+			rc=1
+		else
+			_encrypt_file "$file" && _info "[$file] encrypted" || rc=1
+		fi
+	done
+	return "$rc"
+}
+
+_decrypt_paths() {
+	rc=0
+	for file do
+		[ -n "$file" ] || continue
+		if ! _validate_file "$file"; then
+			rc=1
+		elif ! _is_encrypted "$file"; then
+			_error "file [$file] is not age-encrypted"
+			rc=1
+		else
+			_decrypt_file "$file" && _info "[$file] decrypted" || rc=1
+		fi
+	done
+	return "$rc"
+}
+
 main() {
-    age=$(command -v age || command -v rage) ||
-        _err "age not found, install per https://age-encryption.org"
-    cmd="$1"; shift
-    case $cmd in
-        e) sec_encrypt "$@";;
-        d) sec_decrypt "$@";;
-        *) if command -v sec-"$cmd">/dev/null;then sec-"$cmd" "$@"; else usage; exit 0; fi;
-    esac
+	cmd=$1
+	shift
+
+	case $cmd in
+		e|d) age=$(command -v age || command -v rage) || _die 'age not found, install per https://age-encryption.org' ;;
+	esac
+
+	case $cmd in
+		e)
+			if [ "$#" -eq 0 ]; then _encrypt_stream; else _encrypt_paths "$@"; fi
+			;;
+		d)
+			if [ "$#" -eq 0 ]; then _decrypt_stream; else _decrypt_paths "$@"; fi
+			;;
+		*)
+			if command -v "sec-$cmd" >/dev/null 2>&1; then
+				"sec-$cmd" "$@"
+			else
+				usage
+			fi
+			;;
+	esac
 }
-[ "$1" ] || { usage; exit 0; } && main "$@"
+
+[ "$#" -gt 0 ] || { usage; exit 0; }
+main "$@"
