@@ -1,0 +1,747 @@
+#!/bin/sh
+
+umask 077
+set -f
+
+usage() {
+	cat <<'EOF'
+sec-git
+    transparent age encryption for selected paths in a Git repository
+
+usage:
+    sec git on
+    sec git off
+    sec git status | l
+
+    sec git recipient add | a <recipient> [...]
+    sec git recipient rm  | r <recipient> [...]
+    sec git recipient list
+
+    sec git track   | t <gitattributes-pattern> [...]
+    sec git untrack | u <gitattributes-pattern> [...]
+
+    sec git rekey   | f
+    sec git refresh
+
+internal filter commands:
+    sec git clean [path]
+    sec git smudge [path]
+    sec git textconv <file>
+
+commands:
+    on          configure the local Git clean/smudge and diff filters
+    off         remove the local filter configuration
+    status      show filter state, recipients, tracked patterns and files
+
+    recipient add
+                add recipients; recipients can also be read line-by-line
+                from stdin
+    recipient rm
+                remove recipients; recipients can also be read line-by-line
+                from stdin
+    recipient list
+                print the repository recipient list
+
+    track       add paths/patterns to .gitattributes
+    untrack     remove paths/patterns previously added by sec-git
+
+    rekey       re-encrypt all filtered tracked files with the current
+                recipients and stage the new ciphertexts
+    refresh     rewrite clean filtered working-tree files from the index,
+                applying the smudge filter
+
+env vars:
+    SEC_GIT_SEC                 sec executable (default: sec)
+    SEC_GIT_FILTER_CMD          command stored in Git filter config
+                                (default: sec-git)
+    SEC_GIT_RECIPIENTS_FILE     recipient file; relative paths are resolved
+                                from the repository root
+                                (default: .sec-recipients)
+    SEC_GIT_ARMOR               if 1, store armored age ciphertext;
+                                default is native binary age
+    SEC_GIT_DEBUG               enable debug messages
+
+repository files:
+    .sec-recipients             public recipient policy by default
+    .gitattributes              paths using filter=sec diff=sec -text
+
+notes:
+    Keep .sec-recipients in Git, but normally do not encrypt it. Recipients
+    are public keys and leaving the policy readable makes bootstrap/rekey
+    substantially simpler.
+
+    Local Git filter configuration is not versioned. Each checkout must run
+    "sec git on". On an existing checkout containing ciphertext in the work
+    tree, run "sec git refresh" after enabling the filter.
+EOF
+}
+
+_name() { basename "$0"; }
+_error() { printf '%s: error: %s\n' "$(_name)" "$1" >&2; return 1; }
+_warn() { printf '%s: warning: %s\n' "$(_name)" "$1" >&2; }
+_info() { printf '%s: %s\n' "$(_name)" "$1" >&2; }
+_debug() {
+	[ -n "${SEC_GIT_DEBUG:-}" ] &&
+		printf '%s: debug: %s\n' "$(_name)" "$1" >&2
+	return 0
+}
+
+_sec() {
+	printf '%s\n' "${SEC_GIT_SEC:-sec}"
+}
+
+_filter_cmd() {
+	printf '%s\n' "${SEC_GIT_FILTER_CMD:-sec-git}"
+}
+
+_repo_root() {
+	git rev-parse --show-toplevel 2>/dev/null
+}
+
+_require_repo() {
+	_git_root=$(_repo_root) || {
+		_error 'not inside a Git working tree'
+		return 1
+	}
+	[ -n "$_git_root" ] || {
+		_error 'not inside a Git working tree'
+		return 1
+	}
+}
+
+_recipients_file() {
+	_rf_root=${_git_root:-$(_repo_root)} || return 1
+	_rf_value=${SEC_GIT_RECIPIENTS_FILE:-.sec-recipients}
+
+	case $_rf_value in
+		/*) printf '%s\n' "$_rf_value" ;;
+		*)  printf '%s/%s\n' "$_rf_root" "$_rf_value" ;;
+	esac
+}
+
+_gitattrs_file() {
+	printf '%s/.gitattributes\n' "${_git_root:-$(_repo_root)}"
+}
+
+_runtime_dir() {
+	for _rd in "${XDG_RUNTIME_DIR:-}" /dev/shm "${TMPDIR:-/tmp}"; do
+		[ -n "$_rd" ] && [ -d "$_rd" ] && [ -w "$_rd" ] && {
+			printf '%s\n' "$_rd"
+			return 0
+		}
+	done
+	return 1
+}
+
+_tmpdir() {
+	_td=$(_runtime_dir) || return 1
+	mktemp -d "$_td/sec-git.XXXXXX"
+}
+
+_same_dir_tmp() {
+	_st_dir=$(dirname -- "$1") || return 1
+	mktemp "$_st_dir/.sec-git.tmp.XXXXXX"
+}
+
+_is_age_file() {
+	LC_ALL=C head -n 1 -- "$1" 2>/dev/null |
+		grep -Fqx \
+			-e '-----BEGIN AGE ENCRYPTED FILE-----' \
+			-e 'age-encryption.org/v1'
+}
+
+_is_on() {
+	git config --local --get filter.sec.clean >/dev/null 2>&1 &&
+	git config --local --get filter.sec.smudge >/dev/null 2>&1
+}
+
+_has_tracking() {
+	_ht_file=$(_gitattrs_file) || return 1
+	[ -f "$_ht_file" ] &&
+		grep -F 'filter=sec' "$_ht_file" >/dev/null 2>&1
+}
+
+_encrypt() (
+	_en_recip=$(_recipients_file) || exit 1
+
+	unset SEC_RECIPIENTS SEC_RECIPIENTS_FILE SEC_ARMOR
+	SEC_RECIPIENTS_FILE=$_en_recip
+	export SEC_RECIPIENTS_FILE
+
+	if [ "${SEC_GIT_ARMOR:-0}" = 1 ]; then
+		SEC_ARMOR=1
+		export SEC_ARMOR
+	fi
+
+	"$( _sec )" e
+)
+
+_decrypt() {
+	"$( _sec )" d
+}
+
+_validate_recipients() {
+	_vr_file=$(_recipients_file) || return 1
+	[ -f "$_vr_file" ] && [ -r "$_vr_file" ] || {
+		_error "recipient file [$_vr_file] does not exist or is not readable"
+		return 1
+	}
+
+	_encrypt </dev/null >/dev/null 2>&1 || {
+		_error "recipient file [$_vr_file] is empty or invalid"
+		return 1
+	}
+}
+
+_attr_quote() {
+	# Git accepts C-style double-quoted attribute patterns. Always quoting the
+	# pattern avoids accidental whitespace/comment parsing while preserving
+	# glob metacharacters.
+	printf '%s' "$1" |
+		sed 's/\\/\\\\/g; s/"/\\"/g; s/^/"/; s/$/"/'
+}
+
+_tracking_line() {
+	_tl_pattern=$(_attr_quote "$1") || return 1
+	printf '%s filter=sec diff=sec -text\n' "$_tl_pattern"
+}
+
+_old_tracking_line() {
+	printf '%s  filter=sec diff=sec\n' "$1"
+}
+
+_cmd_on() {
+	[ "$#" -eq 0 ] || { _error 'usage: sec git on'; return 1; }
+	_require_repo || return 1
+
+	if _has_tracking; then
+		_validate_recipients || return 1
+	fi
+
+	_co_filter=$(_filter_cmd) || return 1
+
+	git config --local filter.sec.clean "$_co_filter clean %f" &&
+	git config --local filter.sec.smudge "$_co_filter smudge %f" &&
+	git config --local filter.sec.required true &&
+	git config --local diff.sec.textconv "$_co_filter textconv" &&
+	git config --local diff.sec.cachetextconv false || {
+		_error 'cannot configure Git filters'
+		return 1
+	}
+
+	_info 'Git filter activated'
+}
+
+_cmd_off() {
+	[ "$#" -eq 0 ] || { _error 'usage: sec git off'; return 1; }
+	_require_repo || return 1
+
+	for _co_key in \
+		filter.sec.clean \
+		filter.sec.smudge \
+		filter.sec.required \
+		diff.sec.textconv \
+		diff.sec.cachetextconv
+	do
+		git config --local --unset-all "$_co_key" >/dev/null 2>&1 || :
+	done
+
+	_info 'Git filter deactivated'
+}
+
+_collect_lines() {
+	_cl_out=$1
+	shift
+	: >"$_cl_out" || return 1
+
+	for _cl_line do
+		[ -n "$_cl_line" ] && printf '%s\n' "$_cl_line" >>"$_cl_out"
+	done
+
+	if [ ! -t 0 ]; then
+		while IFS= read -r _cl_line || [ -n "$_cl_line" ]; do
+			[ -n "$_cl_line" ] && printf '%s\n' "$_cl_line" >>"$_cl_out"
+		done
+	fi
+
+	[ -s "$_cl_out" ] || {
+		_error 'no values supplied'
+		return 1
+	}
+}
+
+_install_recipients() {
+	_ir_candidate=$1
+	_ir_file=$(_recipients_file) || return 1
+	_ir_parent=$(dirname -- "$_ir_file") || return 1
+
+	[ -d "$_ir_parent" ] || {
+		_error "recipient directory [$_ir_parent] does not exist"
+		return 1
+	}
+
+	_ir_tmp=$(_same_dir_tmp "$_ir_file") || {
+		_error "cannot create temporary recipient file in [$_ir_parent]"
+		return 1
+	}
+	trap 'rm -f -- "$_ir_tmp"' 0 HUP INT TERM
+
+	cat "$_ir_candidate" >"$_ir_tmp" || return 1
+	mv -f -- "$_ir_tmp" "$_ir_file" || return 1
+	_ir_tmp=
+}
+
+_recipient_add() (
+	_require_repo || exit 1
+
+	_ra_dir=$(_tmpdir) || {
+		_error 'cannot create temporary recipient directory'
+		exit 1
+	}
+	_ra_add=$_ra_dir/add
+	_ra_candidate=$_ra_dir/candidate
+	trap 'rm -rf -- "$_ra_dir"' 0 HUP INT TERM
+
+	_collect_lines "$_ra_add" "$@" || exit 1
+
+	_ra_file=$(_recipients_file) || exit 1
+
+	{
+		[ -f "$_ra_file" ] && cat "$_ra_file"
+		cat "$_ra_add"
+	} |
+		awk 'NF && !seen[$0]++' >"$_ra_candidate" || exit 1
+
+	# Validate the candidate through sec/age before replacing repository policy.
+	(
+		unset SEC_RECIPIENTS SEC_RECIPIENTS_FILE SEC_ARMOR
+		SEC_RECIPIENTS_FILE=$_ra_candidate
+		export SEC_RECIPIENTS_FILE
+		[ "${SEC_GIT_ARMOR:-0}" = 1 ] && { SEC_ARMOR=1; export SEC_ARMOR; }
+		"$( _sec )" e </dev/null >/dev/null
+	) || {
+		_error 'new recipient set is invalid'
+		exit 1
+	}
+
+	_install_recipients "$_ra_candidate" || {
+		_error 'cannot update recipient file'
+		exit 1
+	}
+
+	_info "recipient policy updated [$_ra_file]"
+)
+
+_recipient_rm() (
+	_require_repo || exit 1
+
+	_rr_file=$(_recipients_file) || exit 1
+	[ -f "$_rr_file" ] || {
+		_warn "recipient file [$_rr_file] does not exist"
+		exit 0
+	}
+
+	_rr_dir=$(_tmpdir) || {
+		_error 'cannot create temporary recipient directory'
+		exit 1
+	}
+	_rr_remove=$_rr_dir/remove
+	_rr_candidate=$_rr_dir/candidate
+	trap 'rm -rf -- "$_rr_dir"' 0 HUP INT TERM
+
+	_collect_lines "$_rr_remove" "$@" || exit 1
+
+	awk '
+		NR == FNR { remove[$0] = 1; next }
+		!($0 in remove)
+	' "$_rr_remove" "$_rr_file" >"$_rr_candidate" || exit 1
+
+	if [ ! -s "$_rr_candidate" ]; then
+		rm -f -- "$_rr_file" || exit 1
+		_info 'all recipients removed'
+		exit 0
+	fi
+
+	(
+		unset SEC_RECIPIENTS SEC_RECIPIENTS_FILE SEC_ARMOR
+		SEC_RECIPIENTS_FILE=$_rr_candidate
+		export SEC_RECIPIENTS_FILE
+		[ "${SEC_GIT_ARMOR:-0}" = 1 ] && { SEC_ARMOR=1; export SEC_ARMOR; }
+		"$( _sec )" e </dev/null >/dev/null
+	) || {
+		_error 'remaining recipient set is invalid'
+		exit 1
+	}
+
+	_install_recipients "$_rr_candidate" || {
+		_error 'cannot update recipient file'
+		exit 1
+	}
+
+	_info "recipient policy updated [$_rr_file]"
+)
+
+_recipient_list() {
+	[ "$#" -eq 0 ] || { _error 'usage: sec git recipient list'; return 1; }
+	_require_repo || return 1
+
+	_rl_file=$(_recipients_file) || return 1
+	[ -f "$_rl_file" ] || return 0
+	cat "$_rl_file"
+}
+
+_cmd_recipient() {
+	_cr_cmd=${1:-}
+	[ "$#" -gt 0 ] && shift
+
+	case $_cr_cmd in
+		add|a) _recipient_add "$@" ;;
+		rm|remove|r) _recipient_rm "$@" ;;
+		list|ls|l) _recipient_list "$@" ;;
+		*) _error 'usage: sec git recipient add|rm|list ...'; return 1 ;;
+	esac
+}
+
+_cmd_track() {
+	[ "$#" -gt 0 ] || { _error 'usage: sec git track <pattern> [...]'; return 1; }
+	_require_repo || return 1
+	_validate_recipients || return 1
+
+	_ct_attrs=$(_gitattrs_file) || return 1
+	[ -e "$_ct_attrs" ] && [ ! -f "$_ct_attrs" ] && {
+		_error "[$_ct_attrs] is not a regular file"
+		return 1
+	}
+	[ -f "$_ct_attrs" ] || : >"$_ct_attrs" || return 1
+
+	for _ct_pattern do
+		_ct_line=$(_tracking_line "$_ct_pattern") || return 1
+
+		if grep -Fqx -e "$_ct_line" "$_ct_attrs"; then
+			_warn "already tracked pattern [$_ct_pattern]"
+		else
+			printf '%s\n' "$_ct_line" >>"$_ct_attrs" || return 1
+			_info "tracked pattern [$_ct_pattern]"
+		fi
+	done
+
+	_info 'run "sec git rekey" (or git add the affected paths) to normalize already tracked files'
+}
+
+_cmd_untrack() (
+	[ "$#" -gt 0 ] || { _error 'usage: sec git untrack <pattern> [...]'; exit 1; }
+	_require_repo || exit 1
+
+	_cu_attrs=$(_gitattrs_file) || exit 1
+	[ -f "$_cu_attrs" ] || {
+		_warn 'no .gitattributes file'
+		exit 0
+	}
+
+	_cu_dir=$(_tmpdir) || {
+		_error 'cannot create temporary untrack directory'
+		exit 1
+	}
+	_cu_remove=$_cu_dir/remove
+	_cu_new=$_cu_dir/new
+	trap 'rm -rf -- "$_cu_dir"' 0 HUP INT TERM
+	: >"$_cu_remove"
+
+	for _cu_pattern do
+		_tracking_line "$_cu_pattern" >>"$_cu_remove" || exit 1
+		_old_tracking_line "$_cu_pattern" >>"$_cu_remove" || exit 1
+		printf '%s filter=sec diff=sec\n' "$_cu_pattern" >>"$_cu_remove"
+	done
+
+	grep -Fvx -f "$_cu_remove" "$_cu_attrs" >"$_cu_new"
+	_cu_rc=$?
+	[ "$_cu_rc" -eq 0 ] || [ "$_cu_rc" -eq 1 ] || exit "$_cu_rc"
+
+	if [ -s "$_cu_new" ]; then
+		_cu_tmp=$(_same_dir_tmp "$_cu_attrs") || exit 1
+		trap 'rm -rf -- "$_cu_dir"; rm -f -- "$_cu_tmp"' 0 HUP INT TERM
+		cat "$_cu_new" >"$_cu_tmp" &&
+			mv -f -- "$_cu_tmp" "$_cu_attrs" || exit 1
+		_cu_tmp=
+	else
+		rm -f -- "$_cu_attrs" || exit 1
+	fi
+
+	_info "untracked patterns [$*]"
+)
+
+_filtered_status() {
+	git status --porcelain -- ':(attr:filter=sec)'
+}
+
+_cmd_rekey() {
+	[ "$#" -eq 0 ] || { _error 'usage: sec git rekey'; return 1; }
+	_require_repo || return 1
+	_is_on || { _error 'sec Git filter is not active; run "sec git on"'; return 1; }
+	_validate_recipients || return 1
+
+	_cr_status=$(_filtered_status) || return 1
+	[ -z "$_cr_status" ] || {
+		_error 'filtered files have staged or unstaged changes; commit/stash them before rekey'
+		return 1
+	}
+
+	_info 're-encrypting filtered tracked files'
+	SEC_GIT_FORCE=1 git add --renormalize -- ':(attr:filter=sec)' || {
+		_error 'Git renormalization/rekey failed'
+		return 1
+	}
+
+	_info 'rekey complete; new ciphertexts are staged'
+}
+
+_refresh_one() (
+	_ro_path=$1
+	_ro_root=${_git_root:-$(_repo_root)} || exit 1
+	_ro_dst=$_ro_root/$_ro_path
+	_ro_parent=$(dirname -- "$_ro_dst") || exit 1
+
+	[ -d "$_ro_parent" ] || mkdir -p -- "$_ro_parent" || exit 1
+	[ -L "$_ro_dst" ] && {
+		_error "refusing symlink working-tree path [$_ro_path]"
+		exit 1
+	}
+
+	_ro_dir=$(_tmpdir) || exit 1
+	_ro_blob=$_ro_dir/blob
+	_ro_tmp=$(_same_dir_tmp "$_ro_dst") || {
+		rm -rf -- "$_ro_dir"
+		exit 1
+	}
+	trap 'rm -rf -- "$_ro_dir"; rm -f -- "$_ro_tmp"' 0 HUP INT TERM
+
+	_ro_oid=$(git rev-parse --verify ":$_ro_path" 2>/dev/null) || {
+		_error "cannot resolve index blob [$_ro_path]"
+		exit 1
+	}
+	git cat-file blob "$_ro_oid" >"$_ro_blob" || exit 1
+
+	if _is_age_file "$_ro_blob"; then
+		_decrypt <"$_ro_blob" >"$_ro_tmp" || {
+			_error "cannot decrypt indexed file [$_ro_path]"
+			exit 1
+		}
+	else
+		cat "$_ro_blob" >"$_ro_tmp" || exit 1
+	fi
+
+	if [ -e "$_ro_dst" ]; then
+		chmod --reference="$_ro_dst" "$_ro_tmp" 2>/dev/null || :
+	else
+		_ro_mode=$(git ls-files -s -- "$_ro_path" | sed -n '1{s/ .*//;p;}')
+		case $_ro_mode in
+			100755) chmod 755 "$_ro_tmp" ;;
+			*)      chmod 644 "$_ro_tmp" ;;
+		esac
+	fi
+
+	mv -f -- "$_ro_tmp" "$_ro_dst" || exit 1
+	_ro_tmp=
+)
+
+_cmd_refresh() (
+	[ "$#" -eq 0 ] || { _error 'usage: sec git refresh'; exit 1; }
+	_require_repo || exit 1
+	_is_on || { _error 'sec Git filter is not active; run "sec git on"'; exit 1; }
+
+	_cf_status=$(_filtered_status) || exit 1
+	[ -z "$_cf_status" ] || {
+		_error 'filtered files have changes; refusing to overwrite the working tree'
+		exit 1
+	}
+
+	_cf_dir=$(_tmpdir) || {
+		_error 'cannot create refresh temporary directory'
+		exit 1
+	}
+	_cf_paths=$_cf_dir/paths
+	trap 'rm -rf -- "$_cf_dir"' 0 HUP INT TERM
+
+	# Newline-delimited here keeps the implementation POSIX-shell-only and is
+	# safe for normal paths including spaces and tabs. Git filenames containing
+	# literal newlines are deliberately not supported by refresh.
+	git ls-files -- ':(attr:filter=sec)' >"$_cf_paths" || exit 1
+
+	[ -s "$_cf_paths" ] || {
+		_info 'no filtered tracked files'
+		exit 0
+	}
+
+	_cf_rc=0
+	while IFS= read -r _cf_path || [ -n "$_cf_path" ]; do
+		[ -n "$_cf_path" ] || continue
+		_refresh_one "$_cf_path" || _cf_rc=1
+	done <"$_cf_paths"
+
+	[ "$_cf_rc" -eq 0 ] || exit "$_cf_rc"
+	_info 'filtered working-tree files refreshed'
+)
+
+_cmd_clean() (
+	[ "$#" -le 1 ] || exit 1
+	_require_repo || exit 1
+
+	_cc_path=${1:-}
+	_cc_dir=$(_tmpdir) || {
+		_error 'cannot create clean-filter temporary directory'
+		exit 1
+	}
+	_cc_input=$_cc_dir/input
+	_cc_old_cipher=$_cc_dir/old.age
+	_cc_old_plain=$_cc_dir/old.plain
+	trap 'rm -rf -- "$_cc_dir"' 0 HUP INT TERM
+
+	cat >"$_cc_input" || exit 1
+
+	# Make clean idempotent. This also lets a newly activated checkout contain
+	# repository-format ciphertext until "sec git refresh" is run.
+	if _is_age_file "$_cc_input"; then
+		if [ "${SEC_GIT_FORCE:-0}" = 1 ]; then
+			_validate_recipients || exit 1
+			_decrypt <"$_cc_input" >"$_cc_old_plain" || exit 1
+			_encrypt <"$_cc_old_plain"
+		else
+			cat "$_cc_input"
+		fi
+		exit $?
+	fi
+
+	_validate_recipients || exit 1
+
+	if [ "${SEC_GIT_FORCE:-0}" = 1 ]; then
+		_debug "force encryption [$_cc_path]"
+		_encrypt <"$_cc_input"
+		exit $?
+	fi
+
+	# Reuse the ciphertext currently in the index when plaintext is unchanged.
+	# This avoids spurious Git changes caused by age's randomized encryption.
+	if [ -n "$_cc_path" ]; then
+		_cc_oid=$(git rev-parse --verify ":$_cc_path" 2>/dev/null) || _cc_oid=
+
+		if [ -n "$_cc_oid" ] &&
+		   git cat-file blob "$_cc_oid" >"$_cc_old_cipher" 2>/dev/null &&
+		   _is_age_file "$_cc_old_cipher"; then
+			if _decrypt <"$_cc_old_cipher" >"$_cc_old_plain" 2>/dev/null &&
+			   cmp -s "$_cc_input" "$_cc_old_plain"; then
+				_debug "unchanged plaintext, reusing indexed ciphertext [$_cc_path]"
+				cat "$_cc_old_cipher"
+				exit 0
+			fi
+		fi
+	fi
+
+	_debug "encrypting changed/new plaintext [$_cc_path]"
+	_encrypt <"$_cc_input"
+)
+
+_cmd_smudge() (
+	[ "$#" -le 1 ] || exit 1
+	_require_repo || exit 1
+
+	_cs_dir=$(_tmpdir) || {
+		_error 'cannot create smudge-filter temporary directory'
+		exit 1
+	}
+	_cs_input=$_cs_dir/input
+	trap 'rm -rf -- "$_cs_dir"' 0 HUP INT TERM
+
+	cat >"$_cs_input" || exit 1
+
+	# Be tolerant of historical/plaintext blobs; encrypted blobs must decrypt
+	# successfully because filter.sec.required is enabled.
+	if _is_age_file "$_cs_input"; then
+		_decrypt <"$_cs_input"
+	else
+		cat "$_cs_input"
+	fi
+)
+
+_cmd_textconv() {
+	[ "$#" -eq 1 ] || { _error 'usage: sec git textconv <file>'; return 1; }
+	_tc_file=$1
+	[ -f "$_tc_file" ] || return 1
+
+	if _is_age_file "$_tc_file"; then
+		_decrypt <"$_tc_file"
+	else
+		cat "$_tc_file"
+	fi
+}
+
+_cmd_status() {
+	[ "$#" -eq 0 ] || { _error 'usage: sec git status'; return 1; }
+	_require_repo || return 1
+
+	if _is_on; then
+		printf 'state: on\n'
+	else
+		printf 'state: off\n'
+	fi
+
+	_cs_recip=$(_recipients_file) || return 1
+	printf 'recipients-file: %s\n' "$_cs_recip"
+
+	printf '\n# recipients\n'
+	if [ -f "$_cs_recip" ]; then
+		while IFS= read -r _cs_line || [ -n "$_cs_line" ]; do
+			[ -n "$_cs_line" ] && printf 'r: %s\n' "$_cs_line"
+		done <"$_cs_recip"
+	else
+		printf '(none)\n'
+	fi
+
+	printf '\n# tracked patterns\n'
+	_cs_attrs=$(_gitattrs_file) || return 1
+	if [ -f "$_cs_attrs" ] && grep -F 'filter=sec' "$_cs_attrs" >/dev/null 2>&1; then
+		grep -F 'filter=sec' "$_cs_attrs" |
+			sed 's/^/t: /'
+	else
+		printf '(none)\n'
+	fi
+
+	printf '\n# tracked files\n'
+	_cs_files=$(git ls-files -- ':(attr:filter=sec)' 2>/dev/null) || return 1
+	if [ -n "$_cs_files" ]; then
+		printf '%s\n' "$_cs_files" | sed 's/^/f: /'
+	else
+		printf '(none)\n'
+	fi
+}
+
+main() {
+	[ "$#" -gt 0 ] || { usage; exit 0; }
+
+	cmd=$1
+	shift
+
+	case $cmd in
+		on)      _cmd_on "$@" ;;
+		off)     _cmd_off "$@" ;;
+		status|l) _cmd_status "$@" ;;
+
+		recipient) _cmd_recipient "$@" ;;
+		a) _recipient_add "$@" ;;
+		r) _recipient_rm "$@" ;;
+
+		track|t)   _cmd_track "$@" ;;
+		untrack|u) _cmd_untrack "$@" ;;
+
+		rekey|f) _cmd_rekey "$@" ;;
+		refresh) _cmd_refresh "$@" ;;
+
+		clean)    _cmd_clean "$@" ;;
+		smudge)   _cmd_smudge "$@" ;;
+		textconv) _cmd_textconv "$@" ;;
+
+		help|-h|--help) usage ;;
+		*) _error "unknown command [$cmd]"; usage >&2; exit 1 ;;
+	esac
+}
+
+main "$@"
