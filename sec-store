@@ -19,6 +19,7 @@ commands:
     policy <name>                show the effective recipient policy
     rekey [prefix]               re-encrypt secrets using current policies
     check                        validate store structure and ciphertexts
+    git|g [args ...]             run git in SEC_STORE_DIR (default: status)
 
 env vars:
     SEC_STORE_DIR                store directory
@@ -672,6 +673,23 @@ _cmd_check() (
 	exit "$_ch_rc"
 )
 
+
+_cmd_git() {
+	_require_store || return 1
+	command -v git >/dev/null 2>&1 || {
+		_error 'git not found'
+		return 1
+	}
+
+	_cgit_root=$(_root) || return 1
+	if [ "$#" -eq 0 ]; then
+		set -- status
+	fi
+
+	_debug "git -C [$_cgit_root] $*"
+	git -C "$_cgit_root" "$@"
+}
+
 main() {
 	[ "$#" -gt 0 ] || { usage; exit 0; }
 	_m_cmd=$1
@@ -687,6 +705,7 @@ main() {
 		policy) _cmd_policy "$@" ;;
 		rekey)  _cmd_rekey "$@" ;;
 		check)  _cmd_check "$@" ;;
+		git|g)  _cmd_git "$@" ;;
 		help|-h|--help) usage ;;
 		*)
 			if command -v "sec-store-$_m_cmd" >/dev/null 2>&1; then
