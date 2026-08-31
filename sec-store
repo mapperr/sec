@@ -1,0 +1,703 @@
+#!/bin/sh
+
+umask 077
+set -f
+
+usage() {
+	s=$(basename "$0")
+	cat <<EOF
+$s
+    encrypted personal/team secret store for sec
+
+commands:
+    init                         initialize the store
+    put <name> [file]            store stdin or file as <name>
+    get <name>                   decrypt <name> to stdout
+    edit <name>                  edit <name> without plaintext in the store
+    ls [prefix]                  list secrets
+    rm <name> [<name> ...]       remove secrets
+    policy <name>                show the effective recipient policy
+    rekey [prefix]               re-encrypt secrets using current policies
+    check                        validate store structure and ciphertexts
+
+env vars:
+    SEC_STORE_DIR                store directory
+                                 default: \${XDG_DATA_HOME:-~/.local/share}/sec
+    SEC_STORE_SEC                sec executable
+                                 default: sec
+    SEC_STORE_EDITOR             editor executable
+                                 default: \$VISUAL, \$EDITOR, vi
+    SEC_STORE_CHECK_DECRYPT      if non-empty, try decrypting secrets during check
+    SEC_STORE_DEBUG              enable debug messages
+
+recipient policies:
+    A .recipients file applies to secrets in its directory and descendants.
+    The nearest .recipients file wins. If none exists, sec's self-recipient
+    discovery is used.
+
+    Explicit store policies are authoritative: sec-store never adds self to a
+    .recipients policy.
+
+notes:
+    Secret names are store-relative paths and are stored as <name>.age.
+    Plaintext is never written inside SEC_STORE_DIR.
+EOF
+}
+
+_name() { basename "$0"; }
+_error() { printf '%s: error: %s\n' "$(_name)" "$1" >&2; return 1; }
+_info() { printf '%s: %s\n' "$(_name)" "$1" >&2; }
+_debug() {
+	[ -n "${SEC_STORE_DEBUG:-}" ] &&
+		printf '%s: debug: %s\n' "$(_name)" "$1" >&2
+	return 0
+}
+
+_sec() {
+	printf '%s\n' "${SEC_STORE_SEC:-sec}"
+}
+
+_root_raw() {
+	printf '%s\n' "${SEC_STORE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/sec}"
+}
+
+_root() {
+	_sr=$(_root_raw) || return 1
+	case $_sr in
+		/) ;;
+		*/) _sr=${_sr%/} ;;
+	esac
+
+	if [ -d "$_sr" ]; then
+		(cd "$_sr" 2>/dev/null && pwd -P)
+	else
+		case $_sr in
+			/*) printf '%s\n' "$_sr" ;;
+			*) printf '%s/%s\n' "$PWD" "$_sr" ;;
+		esac
+	fi
+}
+
+_require_store() {
+	_rs=$(_root) || return 1
+	[ -d "$_rs" ] || {
+		_error "store [$_rs] does not exist; run 'sec store init'"
+		return 1
+	}
+	[ -r "$_rs" ] && [ -x "$_rs" ] || {
+		_error "store [$_rs] is not accessible"
+		return 1
+	}
+}
+
+_runtime_dir() {
+	for _rd in "${XDG_RUNTIME_DIR:-}" /dev/shm "${TMPDIR:-/tmp}"; do
+		[ -n "$_rd" ] && [ -d "$_rd" ] && [ -w "$_rd" ] && {
+			printf '%s\n' "$_rd"
+			return 0
+		}
+	done
+	return 1
+}
+
+_runtime_tmp() {
+	_rt=$(_runtime_dir) || return 1
+	mktemp "$_rt/sec-store.XXXXXX"
+}
+
+_runtime_tmpdir() {
+	_rt=$(_runtime_dir) || return 1
+	mktemp -d "$_rt/sec-store.XXXXXX"
+}
+
+_same_dir_tmp() {
+	_sd=$(dirname -- "$1") || return 1
+	mktemp "$_sd/.sec-store.tmp.XXXXXX"
+}
+
+_normalize_name() {
+	_nn=$1
+	case $_nn in
+		*.age) _nn=${_nn%.age} ;;
+	esac
+
+	case $_nn in
+		''|/|/*|.|..|./*|../*|*/.|*/..|*/./*|*/../*|*//*)
+			_error "invalid secret name [$1]"
+			return 1
+			;;
+		.recipients|*/.recipients|.git|.git/*)
+			_error "reserved secret name [$1]"
+			return 1
+			;;
+	esac
+
+	printf '%s\n' "$_nn"
+}
+
+# Reject symlinks in a managed secret path. This prevents a store entry from
+# escaping SEC_STORE_DIR through a symlinked directory or file.
+_check_path_components() {
+	_cp_root=$1
+	_cp_rel=$2
+	_cp_cur=$_cp_root
+	_cp_rest=$_cp_rel
+
+	while :; do
+		case $_cp_rest in
+			*/*)
+				_cp_part=${_cp_rest%%/*}
+				_cp_rest=${_cp_rest#*/}
+				_cp_more=1
+				;;
+			*)
+				_cp_part=$_cp_rest
+				_cp_rest=
+				_cp_more=0
+				;;
+		esac
+
+		_cp_cur=$_cp_cur/$_cp_part
+		[ -L "$_cp_cur" ] && {
+			_error "refusing symlink in store path [$_cp_cur]"
+			return 1
+		}
+
+		[ "$_cp_more" -eq 1 ] || break
+	done
+}
+
+_secret_path() {
+	_sp_name=$(_normalize_name "$1") || return 1
+	_sp_root=$(_root) || return 1
+	_check_path_components "$_sp_root" "$_sp_name.age" || return 1
+	printf '%s/%s.age\n' "$_sp_root" "$_sp_name"
+}
+
+_prepare_parent() {
+	_pp_path=$1
+	_pp_parent=$(dirname -- "$_pp_path") || return 1
+	mkdir -p -- "$_pp_parent" || {
+		_error "cannot create directory [$_pp_parent]"
+		return 1
+	}
+}
+
+_validate_secret_file() {
+	_vf=$1
+	[ -L "$_vf" ] && { _error "refusing symlink [$_vf]"; return 1; }
+	[ -f "$_vf" ] || { _error "secret [$_vf] does not exist"; return 1; }
+	[ -r "$_vf" ] || { _error "secret [$_vf] is not readable"; return 1; }
+}
+
+_is_age_file() {
+	LC_ALL=C head -n 1 -- "$1" 2>/dev/null |
+		grep -Fqx \
+			-e '-----BEGIN AGE ENCRYPTED FILE-----' \
+			-e 'age-encryption.org/v1'
+}
+
+# Print the closest .recipients policy path, or nothing when the secret uses
+# sec's self-recipient fallback.
+_policy_for_file() {
+	_pf_file=$1
+	_pf_root=$(_root) || return 1
+	_pf_dir=$(dirname -- "$_pf_file") || return 1
+
+	case $_pf_dir in
+		"$_pf_root"|"$_pf_root"/*) ;;
+		*) _error "path [$_pf_file] is outside the store"; return 1 ;;
+	esac
+
+	while :; do
+		_pf_policy=$_pf_dir/.recipients
+
+		if [ -L "$_pf_policy" ]; then
+			_error "refusing symlink recipient policy [$_pf_policy]"
+			return 1
+		fi
+
+		if [ -e "$_pf_policy" ]; then
+			[ -f "$_pf_policy" ] && [ -r "$_pf_policy" ] || {
+				_error "recipient policy [$_pf_policy] is not readable"
+				return 1
+			}
+			printf '%s\n' "$_pf_policy"
+			return 0
+		fi
+
+		[ "$_pf_dir" = "$_pf_root" ] && break
+		_pf_dir=$(dirname -- "$_pf_dir") || return 1
+	done
+
+	return 0
+}
+
+# sec-store owns recipient policy selection. Clear any ambient core recipient
+# variables before invoking sec so old shell exports cannot alter store ACLs.
+_encrypt_with_policy() (
+	_ewp_policy=$1
+	unset SEC_RECIPIENTS SEC_RECIPIENTS_FILE
+
+	if [ -n "$_ewp_policy" ]; then
+		SEC_RECIPIENTS_FILE=$_ewp_policy
+		export SEC_RECIPIENTS_FILE
+	fi
+
+	"$( _sec )" e
+)
+
+_core_decrypt() {
+	"$( _sec )" d
+}
+
+_replace_cipher() {
+	_rc_tmp=$1
+	_rc_dst=$2
+
+	if [ -e "$_rc_dst" ]; then
+		chmod --reference="$_rc_dst" "$_rc_tmp" 2>/dev/null || {
+			_rc_mode=$(stat -c '%a' -- "$_rc_dst" 2>/dev/null) || return 1
+			chmod "$_rc_mode" "$_rc_tmp" || return 1
+		}
+	fi
+
+	mv -f -- "$_rc_tmp" "$_rc_dst"
+}
+
+_cmd_init() {
+	[ "$#" -eq 0 ] || { _error 'usage: sec store init'; return 1; }
+
+	_ci_raw=$(_root_raw) || return 1
+	if [ -e "$_ci_raw" ] && [ ! -d "$_ci_raw" ]; then
+		_error "cannot initialize store: [$_ci_raw] is not a directory"
+		return 1
+	fi
+
+	_ci_new=0
+	[ -d "$_ci_raw" ] || _ci_new=1
+	mkdir -p -- "$_ci_raw" || {
+		_error "cannot create store [$_ci_raw]"
+		return 1
+	}
+	[ "$_ci_new" -eq 0 ] || chmod 700 "$_ci_raw" 2>/dev/null || :
+
+	_ci_root=$(_root) || return 1
+	_info "store initialized at [$_ci_root]"
+}
+
+_cmd_put() (
+	[ "$#" -ge 1 ] && [ "$#" -le 2 ] ||
+		{ _error 'usage: sec store put <name> [file]'; exit 1; }
+
+	_require_store || exit 1
+	_cp_name=$1
+	_cp_src=${2:-}
+	_cp_path=$(_secret_path "$_cp_name") || exit 1
+	_prepare_parent "$_cp_path" || exit 1
+
+	if [ -e "$_cp_path" ] && [ ! -f "$_cp_path" ]; then
+		_error "store path [$_cp_path] is not a regular file"
+		exit 1
+	fi
+
+	if [ -n "$_cp_src" ]; then
+		[ -f "$_cp_src" ] && [ -r "$_cp_src" ] || {
+			_error "input file [$_cp_src] is not readable"
+			exit 1
+		}
+	fi
+
+	_cp_policy=$(_policy_for_file "$_cp_path") || exit 1
+	_cp_tmp=$(_same_dir_tmp "$_cp_path") ||
+		{ _error "cannot create temporary ciphertext next to [$_cp_path]"; exit 1; }
+	trap 'rm -f -- "$_cp_tmp"' 0 HUP INT TERM
+
+	_debug "put [$(_normalize_name "$_cp_name")] policy [${_cp_policy:-self}]"
+
+	if [ -n "$_cp_src" ]; then
+		_encrypt_with_policy "$_cp_policy" <"$_cp_src" >"$_cp_tmp" || {
+			_error "cannot encrypt [$_cp_name]"
+			exit 1
+		}
+	else
+		_encrypt_with_policy "$_cp_policy" >"$_cp_tmp" || {
+			_error "cannot encrypt [$_cp_name]"
+			exit 1
+		}
+	fi
+
+	_replace_cipher "$_cp_tmp" "$_cp_path" || {
+		_error "cannot replace [$_cp_path]"
+		exit 1
+	}
+	_cp_tmp=
+	_info "[$(_normalize_name "$_cp_name")] stored"
+)
+
+_cmd_get() {
+	[ "$#" -eq 1 ] || { _error 'usage: sec store get <name>'; return 1; }
+	_require_store || return 1
+
+	_cg_path=$(_secret_path "$1") || return 1
+	_validate_secret_file "$_cg_path" || return 1
+	_is_age_file "$_cg_path" || {
+		_error "secret [$1] is not age-encrypted"
+		return 1
+	}
+
+	_debug "get [$(_normalize_name "$1")]"
+	_core_decrypt <"$_cg_path"
+}
+
+_editor() {
+	printf '%s\n' "${SEC_STORE_EDITOR:-${VISUAL:-${EDITOR:-vi}}}"
+}
+
+_cmd_edit() (
+	[ "$#" -eq 1 ] || { _error 'usage: sec store edit <name>'; exit 1; }
+	_require_store || exit 1
+
+	_ce_name=$(_normalize_name "$1") || exit 1
+	_ce_path=$(_secret_path "$_ce_name") || exit 1
+	_prepare_parent "$_ce_path" || exit 1
+
+	if [ -e "$_ce_path" ] && [ ! -f "$_ce_path" ]; then
+		_error "store path [$_ce_path] is not a regular file"
+		exit 1
+	fi
+
+	_ce_dir=$(_runtime_tmpdir) ||
+		{ _error 'cannot create temporary plaintext directory'; exit 1; }
+	_ce_plain=$_ce_dir/secret
+	_ce_cipher=$(_same_dir_tmp "$_ce_path") || {
+		rm -rf -- "$_ce_dir"
+		_error "cannot create temporary ciphertext next to [$_ce_path]"
+		exit 1
+	}
+	trap 'rm -rf -- "$_ce_dir"; rm -f -- "$_ce_cipher"' 0 HUP INT TERM
+
+	if [ -f "$_ce_path" ]; then
+		_validate_secret_file "$_ce_path" || exit 1
+		_is_age_file "$_ce_path" || {
+			_error "secret [$_ce_name] is not age-encrypted"
+			exit 1
+		}
+		_core_decrypt <"$_ce_path" >"$_ce_plain" || {
+			_error "cannot decrypt [$_ce_name]"
+			exit 1
+		}
+	else
+		: >"$_ce_plain" || exit 1
+	fi
+	chmod 600 "$_ce_plain" 2>/dev/null || :
+
+	_ce_before=$(cksum <"$_ce_plain") || exit 1
+	_ce_editor=$(_editor) || exit 1
+	"$_ce_editor" "$_ce_plain"
+	_ce_erc=$?
+	[ "$_ce_erc" -eq 0 ] || {
+		_error "editor exited with status $_ce_erc"
+		exit "$_ce_erc"
+	}
+
+	_ce_after=$(cksum <"$_ce_plain") || exit 1
+	if [ "$_ce_before" = "$_ce_after" ]; then
+		_info "[$_ce_name] unchanged"
+		exit 0
+	fi
+
+	_ce_policy=$(_policy_for_file "$_ce_path") || exit 1
+	_encrypt_with_policy "$_ce_policy" <"$_ce_plain" >"$_ce_cipher" || {
+		_error "cannot encrypt [$_ce_name]"
+		exit 1
+	}
+
+	_replace_cipher "$_ce_cipher" "$_ce_path" || {
+		_error "cannot replace [$_ce_path]"
+		exit 1
+	}
+	_ce_cipher=
+	_info "[$_ce_name] stored"
+)
+
+_list_under() {
+	_lu_base=$1
+	_lu_root=$(_root) || return 1
+	_lu_prefix=$_lu_root/
+
+	find "$_lu_base" \
+		\( -path "$_lu_root/.git" -o -path "$_lu_root/.git/*" \) -prune -o \
+		-type f -name '*.age' -print 2>/dev/null |
+		while IFS= read -r _lu_file; do
+			_lu_rel=${_lu_file#"$_lu_prefix"}
+			printf '%s\n' "${_lu_rel%.age}"
+		done |
+		LC_ALL=C sort
+}
+
+_cmd_ls() {
+	[ "$#" -le 1 ] || { _error 'usage: sec store ls [prefix]'; return 1; }
+	_require_store || return 1
+
+	_cl_root=$(_root) || return 1
+
+	if [ "$#" -eq 0 ]; then
+		_list_under "$_cl_root"
+		return
+	fi
+
+	_cl_name=$(_normalize_name "$1") || return 1
+	_cl_secret=$(_secret_path "$_cl_name") || return 1
+	if [ -f "$_cl_secret" ]; then
+		printf '%s\n' "$_cl_name"
+		return 0
+	fi
+
+	_cl_dir=$_cl_root/$_cl_name
+	_check_path_components "$_cl_root" "$_cl_name" || return 1
+	[ -d "$_cl_dir" ] || {
+		_error "no secret or prefix [$1]"
+		return 1
+	}
+	_list_under "$_cl_dir"
+}
+
+_cmd_rm() {
+	[ "$#" -gt 0 ] || { _error 'usage: sec store rm <name> [<name> ...]'; return 1; }
+	_require_store || return 1
+
+	_cr_rc=0
+	for _cr_name do
+		_cr_path=$(_secret_path "$_cr_name") || { _cr_rc=1; continue; }
+		if _validate_secret_file "$_cr_path"; then
+			rm -f -- "$_cr_path" && _info "[$(_normalize_name "$_cr_name")] removed" ||
+				{ _error "cannot remove [$_cr_name]"; _cr_rc=1; }
+		else
+			_cr_rc=1
+		fi
+	done
+	return "$_cr_rc"
+}
+
+_cmd_policy() {
+	[ "$#" -eq 1 ] || { _error 'usage: sec store policy <name>'; return 1; }
+	_require_store || return 1
+
+	_cpo_path=$(_secret_path "$1") || return 1
+	_cpo_policy=$(_policy_for_file "$_cpo_path") || return 1
+	if [ -n "$_cpo_policy" ]; then
+		printf '%s\n' "$_cpo_policy"
+	else
+		printf '%s\n' self
+	fi
+}
+
+_rekey_file() (
+	_rf_file=$1
+	_validate_secret_file "$_rf_file" || exit 1
+	_is_age_file "$_rf_file" || {
+		_error "secret [$_rf_file] is not age-encrypted"
+		exit 1
+	}
+
+	_rf_policy=$(_policy_for_file "$_rf_file") || exit 1
+	_rf_tmp=$(_same_dir_tmp "$_rf_file") ||
+		{ _error "cannot create temporary ciphertext next to [$_rf_file]"; exit 1; }
+	_rf_dir=$(_runtime_tmpdir) || {
+		rm -f -- "$_rf_tmp"
+		_error 'cannot create temporary rekey directory'
+		exit 1
+	}
+	_rf_fifo=$_rf_dir/plain
+	mkfifo "$_rf_fifo" || {
+		rm -f -- "$_rf_tmp"
+		rm -rf -- "$_rf_dir"
+		_error 'cannot create rekey FIFO'
+		exit 1
+	}
+	trap 'rm -f -- "$_rf_tmp"; rm -rf -- "$_rf_dir"' 0 HUP INT TERM
+
+	_core_decrypt <"$_rf_file" >"$_rf_fifo" &
+	_rf_dec_pid=$!
+
+	_encrypt_with_policy "$_rf_policy" <"$_rf_fifo" >"$_rf_tmp"
+	_rf_enc_rc=$?
+
+	wait "$_rf_dec_pid"
+	_rf_dec_rc=$?
+
+	if [ "$_rf_dec_rc" -ne 0 ] || [ "$_rf_enc_rc" -ne 0 ]; then
+		_error "cannot rekey [$_rf_file]"
+		exit 1
+	fi
+
+	_replace_cipher "$_rf_tmp" "$_rf_file" || {
+		_error "cannot replace [$_rf_file]"
+		exit 1
+	}
+	_rf_tmp=
+)
+
+_collect_secrets() {
+	_cs_target=${1:-}
+	_cs_out=$2
+	_cs_root=$(_root) || return 1
+	: >"$_cs_out" || return 1
+
+	if [ -z "$_cs_target" ]; then
+		find "$_cs_root" \
+			\( -path "$_cs_root/.git" -o -path "$_cs_root/.git/*" \) -prune -o \
+			-type f -name '*.age' -print >"$_cs_out" || return 1
+		return 0
+	fi
+
+	_cs_name=$(_normalize_name "$_cs_target") || return 1
+	_cs_secret=$(_secret_path "$_cs_name") || return 1
+	if [ -f "$_cs_secret" ]; then
+		printf '%s\n' "$_cs_secret" >"$_cs_out"
+		return 0
+	fi
+
+	_cs_dir=$_cs_root/$_cs_name
+	_check_path_components "$_cs_root" "$_cs_name" || return 1
+	[ -d "$_cs_dir" ] || {
+		_error "no secret or prefix [$_cs_target]"
+		return 1
+	}
+	find "$_cs_dir" \
+		\( -path "$_cs_root/.git" -o -path "$_cs_root/.git/*" \) -prune -o \
+		-type f -name '*.age' -print >"$_cs_out" || return 1
+}
+
+_cmd_rekey() (
+	[ "$#" -le 1 ] || { _error 'usage: sec store rekey [prefix]'; exit 1; }
+	_require_store || exit 1
+
+	_ck_list=$(_runtime_tmp) || { _error 'cannot create temporary secret list'; exit 1; }
+	trap 'rm -f -- "$_ck_list"' 0 HUP INT TERM
+	_collect_secrets "${1:-}" "$_ck_list" || exit 1
+
+	_ck_rc=0
+	_ck_count=0
+	while IFS= read -r _ck_file || [ -n "$_ck_file" ]; do
+		[ -n "$_ck_file" ] || continue
+		_ck_count=$((_ck_count + 1))
+		if _rekey_file "$_ck_file"; then
+			_ck_root=$(_root)
+			_ck_rel=${_ck_file#"$_ck_root"/}
+			_info "[${_ck_rel%.age}] rekeyed"
+		else
+			_ck_rc=1
+		fi
+	done <"$_ck_list"
+
+	[ "$_ck_count" -gt 0 ] || _info 'no secrets to rekey'
+	exit "$_ck_rc"
+)
+
+_validate_policy() {
+	_vp=$1
+	[ -L "$_vp" ] && { _error "recipient policy [$_vp] is a symlink"; return 1; }
+	[ -f "$_vp" ] && [ -r "$_vp" ] || {
+		_error "recipient policy [$_vp] is not readable"
+		return 1
+	}
+
+	# Let age validate the full recipient-file grammar.
+	_encrypt_with_policy "$_vp" </dev/null >/dev/null
+}
+
+_cmd_check() (
+	[ "$#" -eq 0 ] || { _error 'usage: sec store check'; exit 1; }
+	_require_store || exit 1
+	_ch_root=$(_root) || exit 1
+	_ch_list=$(_runtime_tmp) || { _error 'cannot create temporary check list'; exit 1; }
+	trap 'rm -f -- "$_ch_list"' 0 HUP INT TERM
+
+	_ch_rc=0
+	_ch_ok=0
+	_ch_warn=0
+
+	# Git metadata is deliberately outside sec-store's security model.
+	find "$_ch_root" \
+		\( -path "$_ch_root/.git" -o -path "$_ch_root/.git/*" \) -prune -o \
+		\( -type l -o -type f \) -print >"$_ch_list" || exit 1
+
+	while IFS= read -r _ch_file || [ -n "$_ch_file" ]; do
+		[ -n "$_ch_file" ] || continue
+		_ch_rel=${_ch_file#"$_ch_root"/}
+
+		if [ -L "$_ch_file" ]; then
+			printf 'ERROR  %s  symlink in store\n' "$_ch_rel"
+			_ch_rc=1
+			continue
+		fi
+
+		case $_ch_rel in
+			.recipients|*/.recipients)
+				if _validate_policy "$_ch_file" >/dev/null 2>&1; then
+					printf 'OK     %s  recipient policy\n' "$_ch_rel"
+					_ch_ok=$((_ch_ok + 1))
+				else
+					printf 'ERROR  %s  invalid recipient policy\n' "$_ch_rel"
+					_ch_rc=1
+				fi
+				;;
+			*.age)
+				if ! _is_age_file "$_ch_file"; then
+					printf 'ERROR  %s  invalid age ciphertext\n' "$_ch_rel"
+					_ch_rc=1
+				elif [ -n "${SEC_STORE_CHECK_DECRYPT:-}" ]; then
+					if _core_decrypt <"$_ch_file" >/dev/null 2>&1; then
+						printf 'OK     %s\n' "$_ch_rel"
+						_ch_ok=$((_ch_ok + 1))
+					else
+						printf 'WARN   %s  not decryptable by current identities\n' "$_ch_rel"
+						_ch_warn=$((_ch_warn + 1))
+					fi
+				else
+					printf 'OK     %s\n' "$_ch_rel"
+					_ch_ok=$((_ch_ok + 1))
+				fi
+				;;
+			*)
+				printf 'ERROR  %s  plaintext/unmanaged file in store\n' "$_ch_rel"
+				_ch_rc=1
+				;;
+		esac
+	done <"$_ch_list"
+
+	_debug "check: $_ch_ok ok, $_ch_warn warnings"
+	exit "$_ch_rc"
+)
+
+main() {
+	[ "$#" -gt 0 ] || { usage; exit 0; }
+	_m_cmd=$1
+	shift
+
+	case $_m_cmd in
+		init)   _cmd_init "$@" ;;
+		put)    _cmd_put "$@" ;;
+		get)    _cmd_get "$@" ;;
+		edit)   _cmd_edit "$@" ;;
+		ls)     _cmd_ls "$@" ;;
+		rm)     _cmd_rm "$@" ;;
+		policy) _cmd_policy "$@" ;;
+		rekey)  _cmd_rekey "$@" ;;
+		check)  _cmd_check "$@" ;;
+		help|-h|--help) usage ;;
+		*)
+			if command -v "sec-store-$_m_cmd" >/dev/null 2>&1; then
+				"sec-store-$_m_cmd" "$@"
+			else
+				_error "unknown command [$_m_cmd]"
+				usage >&2
+				exit 1
+			fi
+			;;
+	esac
+}
+
+main "$@"

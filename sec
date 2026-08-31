@@ -39,6 +39,8 @@ env vars:
     SEC_RECIPIENTS       comma-separated explicit recipients or recipient files;
                          if the whole value is a file, use it directly
     SEC_RECIPIENTS_FILE  explicit age recipients file
+    SEC_ARMOR            set to 1 to produce ASCII-armored age output;
+                         default output is native binary age format
     SEC_DEBUG            enable debug messages
 
 config files:
@@ -326,9 +328,11 @@ _prepare_encryption() {
 }
 
 _age_encrypt_stream() {
-	case $_encrypt_mode in
-		recipients) "$age" -a -R "$1" ;;
-		identity)   "$age" -e -a -i "$_encrypt_identity" ;;
+	case $_encrypt_mode:${SEC_ARMOR:-0} in
+		recipients:1) "$age" -a -R "$1" ;;
+		recipients:*) "$age" -R "$1" ;;
+		identity:1)   "$age" -e -a -i "$_encrypt_identity" ;;
+		identity:*)   "$age" -e -i "$_encrypt_identity" ;;
 		*) _error 'internal error: no encryption mode selected'; return 1 ;;
 	esac
 }
@@ -336,9 +340,11 @@ _age_encrypt_stream() {
 _age_encrypt_file() {
 	_aef_recip=$1
 	_aef_file=$2
-	case $_encrypt_mode in
-		recipients) "$age" -a -R "$_aef_recip" -- "$_aef_file" ;;
-		identity)   "$age" -e -a -i "$_encrypt_identity" -- "$_aef_file" ;;
+	case $_encrypt_mode:${SEC_ARMOR:-0} in
+		recipients:1) "$age" -a -R "$_aef_recip" -- "$_aef_file" ;;
+		recipients:*) "$age" -R "$_aef_recip" -- "$_aef_file" ;;
+		identity:1)   "$age" -e -a -i "$_encrypt_identity" -- "$_aef_file" ;;
+		identity:*)   "$age" -e -i "$_encrypt_identity" -- "$_aef_file" ;;
 		*) _error 'internal error: no encryption mode selected'; return 1 ;;
 	esac
 }

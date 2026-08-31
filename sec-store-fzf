@@ -1,0 +1,348 @@
+#!/bin/sh
+
+umask 077
+set -f
+
+usage() {
+	cat <<'EOF'
+sec-store-fzf
+    fzf interface for sec-store
+
+usage:
+    sec-store-fzf [prefix]
+    sec store fzf [prefix]
+
+keys:
+    Enter    copy first decrypted line to clipboard
+    Ctrl-N   copy entry name to clipboard
+    Ctrl-Y   copy full decrypted entry to clipboard
+    Ctrl-E   edit entry
+    Ctrl-O   show decrypted entry
+    Ctrl-P   show effective recipient policy
+    Ctrl-R   rekey entry
+    Ctrl-D   remove entry (with confirmation)
+    Ctrl-A   create/edit a new entry
+    Ctrl-K   run sec store check
+    Ctrl-G   show git status for the store
+
+env vars:
+    SEC_STORE_FZF_SEC          sec executable (default: sec)
+    SEC_STORE_FZF_FZF          fzf executable (default: fzf)
+    SEC_STORE_FZF_CLIP_CMD     custom shell command reading clipboard data on stdin
+    SEC_STORE_FZF_PAGER        custom shell command reading secret data on stdin
+    SEC_STORE_FZF_PASTE_ONCE   if 1 and wl-copy is used, use --paste-once
+    SEC_STORE_FZF_HEIGHT       fzf height (default: 80%)
+    SEC_STORE_FZF_DEBUG        enable debug messages
+
+sec-store configuration itself continues to use SEC_STORE_* variables.
+EOF
+}
+
+_name() { basename "$0"; }
+_error() { printf '%s: error: %s\n' "$(_name)" "$1" >&2; return 1; }
+_info() { printf '%s: %s\n' "$(_name)" "$1" >&2; }
+_debug() {
+	[ -n "${SEC_STORE_FZF_DEBUG:-}" ] &&
+		printf '%s: debug: %s\n' "$(_name)" "$1" >&2
+	return 0
+}
+
+_sec() {
+	printf '%s\n' "${SEC_STORE_FZF_SEC:-sec}"
+}
+
+_fzf() {
+	printf '%s\n' "${SEC_STORE_FZF_FZF:-fzf}"
+}
+
+_store() {
+	"$( _sec )" store "$@"
+}
+
+_require_commands() {
+	command -v "$( _sec )" >/dev/null 2>&1 || {
+		_error "sec executable [$( _sec )] not found"
+		return 1
+	}
+	command -v "$( _fzf )" >/dev/null 2>&1 || {
+		_error "fzf executable [$( _fzf )] not found"
+		return 1
+	}
+}
+
+_tmpfile() {
+	_tf_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+	[ -d "$_tf_dir" ] && [ -w "$_tf_dir" ] || _tf_dir=${TMPDIR:-/tmp}
+	mktemp "$_tf_dir/sec-store-fzf.XXXXXX"
+}
+
+_tmpdir() {
+	_td_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+	[ -d "$_td_dir" ] && [ -w "$_td_dir" ] || _td_dir=${TMPDIR:-/tmp}
+	mktemp -d "$_td_dir/sec-store-fzf.XXXXXX"
+}
+
+_clip() {
+	if [ -n "${SEC_STORE_FZF_CLIP_CMD:-}" ]; then
+		sh -c "$SEC_STORE_FZF_CLIP_CMD"
+		return
+	fi
+
+	if command -v wl-copy >/dev/null 2>&1; then
+		if [ "${SEC_STORE_FZF_PASTE_ONCE:-0}" = 1 ]; then
+			wl-copy --paste-once
+		else
+			wl-copy
+		fi
+	elif command -v xclip >/dev/null 2>&1; then
+		xclip -selection clipboard
+	elif command -v xsel >/dev/null 2>&1; then
+		xsel --clipboard --input
+	else
+		_error 'no clipboard command found (tried wl-copy, xclip, xsel); set SEC_STORE_FZF_CLIP_CMD'
+		return 1
+	fi
+}
+
+_copy_name() {
+	_cn_name=$1
+	printf '%s' "$_cn_name" | _clip || return 1
+	_info "name [$_cn_name] copied to clipboard"
+}
+
+_copy_first_line() (
+	_cfl_name=$1
+	_cfl_dir=$(_tmpdir) || {
+		_error 'cannot create temporary clipboard directory'
+		exit 1
+	}
+	_cfl_fifo=$_cfl_dir/plain
+	mkfifo "$_cfl_fifo" || {
+		rm -rf -- "$_cfl_dir"
+		_error 'cannot create clipboard FIFO'
+		exit 1
+	}
+	trap 'rm -rf -- "$_cfl_dir"' 0 HUP INT TERM
+
+	_store get "$_cfl_name" >"$_cfl_fifo" &
+	_cfl_dec_pid=$!
+
+	# Consume the complete decrypted stream, while forwarding only line 1.
+	awk 'NR == 1 { printf "%s", $0 }' <"$_cfl_fifo" | _clip
+	_cfl_clip_rc=$?
+
+	wait "$_cfl_dec_pid"
+	_cfl_dec_rc=$?
+
+	[ "$_cfl_dec_rc" -eq 0 ] && [ "$_cfl_clip_rc" -eq 0 ] || {
+		_error "cannot copy first line of [$_cfl_name]"
+		exit 1
+	}
+	_info "first line of [$_cfl_name] copied to clipboard"
+)
+
+_copy_full() (
+	_cf_name=$1
+	_cf_dir=$(_tmpdir) || {
+		_error 'cannot create temporary clipboard directory'
+		exit 1
+	}
+	_cf_fifo=$_cf_dir/plain
+	mkfifo "$_cf_fifo" || {
+		rm -rf -- "$_cf_dir"
+		_error 'cannot create clipboard FIFO'
+		exit 1
+	}
+	trap 'rm -rf -- "$_cf_dir"' 0 HUP INT TERM
+
+	_store get "$_cf_name" >"$_cf_fifo" &
+	_cf_dec_pid=$!
+
+	_clip <"$_cf_fifo"
+	_cf_clip_rc=$?
+
+	wait "$_cf_dec_pid"
+	_cf_dec_rc=$?
+
+	[ "$_cf_dec_rc" -eq 0 ] && [ "$_cf_clip_rc" -eq 0 ] || {
+		_error "cannot copy [$_cf_name]"
+		exit 1
+	}
+	_info "[$_cf_name] copied to clipboard"
+)
+
+_pager() {
+	if [ -n "${SEC_STORE_FZF_PAGER:-}" ]; then
+		sh -c "$SEC_STORE_FZF_PAGER"
+	elif command -v less >/dev/null 2>&1; then
+		less
+	else
+		cat
+	fi
+}
+
+_show() (
+	_sh_name=$1
+	_sh_dir=$(_tmpdir) || {
+		_error 'cannot create temporary display directory'
+		exit 1
+	}
+	_sh_fifo=$_sh_dir/plain
+	mkfifo "$_sh_fifo" || {
+		rm -rf -- "$_sh_dir"
+		_error 'cannot create display FIFO'
+		exit 1
+	}
+	trap 'rm -rf -- "$_sh_dir"' 0 HUP INT TERM
+
+	printf '\n--- %s ---\n' "$_sh_name" >&2
+	_store get "$_sh_name" >"$_sh_fifo" &
+	_sh_dec_pid=$!
+
+	_pager <"$_sh_fifo"
+	_sh_pager_rc=$?
+
+	wait "$_sh_dec_pid"
+	_sh_dec_rc=$?
+
+	[ "$_sh_dec_rc" -eq 0 ] && [ "$_sh_pager_rc" -eq 0 ]
+)
+
+_pause() {
+	printf '\npress Enter to continue...' >/dev/tty
+	IFS= read -r _pause_dummy </dev/tty || :
+}
+
+_confirm_remove() {
+	_cr_name=$1
+	printf 'remove [%s]? [y/N] ' "$_cr_name" >/dev/tty
+	IFS= read -r _cr_answer </dev/tty || return 1
+	case $_cr_answer in
+		y|Y|yes|YES|Yes) return 0 ;;
+		*) return 1 ;;
+	esac
+}
+
+_new_entry() {
+	printf 'new entry name: ' >/dev/tty
+	IFS= read -r _ne_name </dev/tty || return 1
+	[ -n "$_ne_name" ] || return 0
+	_store edit "$_ne_name"
+}
+
+_git_status() {
+	printf '\n' >&2
+	_store git status --short --branch
+	_gs_rc=$?
+	_pause
+	return "$_gs_rc"
+}
+
+_check_store() {
+	printf '\n' >&2
+	_store check
+	_cs_rc=$?
+	_pause
+	return "$_cs_rc"
+}
+
+_show_policy() {
+	_sp_name=$1
+	printf '\n%s: ' "$_sp_name" >&2
+	_store policy "$_sp_name" >&2
+	_sp_rc=$?
+	_pause
+	return "$_sp_rc"
+}
+
+_select() {
+	_sel_prefix=$1
+	_sel_file=$(_tmpfile) || {
+		_error 'cannot create temporary entry list'
+		return 1
+	}
+	trap 'rm -f -- "$_sel_file"' 0 HUP INT TERM
+
+	if [ -n "$_sel_prefix" ]; then
+		_store ls "$_sel_prefix" >"$_sel_file" || return 1
+	else
+		_store ls >"$_sel_file" || return 1
+	fi
+
+	"$( _fzf )" \
+		--height="${SEC_STORE_FZF_HEIGHT:-80%}" \
+		--layout=reverse \
+		--border \
+		--cycle \
+		--no-multi \
+		--prompt='sec> ' \
+		--header='Enter:first line  ^N:name  ^Y:full  ^E:edit  ^O:show  ^P:policy  ^R:rekey  ^D:rm  ^A:new  ^K:check  ^G:git' \
+		--expect=enter,ctrl-n,ctrl-y,ctrl-e,ctrl-o,ctrl-p,ctrl-r,ctrl-d,ctrl-a,ctrl-k,ctrl-g \
+		<"$_sel_file"
+}
+
+main() {
+	case ${1:-} in
+		-h|--help|help)
+			usage
+			exit 0
+			;;
+	esac
+
+	[ "$#" -le 1 ] || {
+		_error 'usage: sec-store-fzf [prefix]'
+		exit 1
+	}
+
+	_require_commands || exit 1
+	_m_prefix=${1:-}
+
+	while :; do
+		_m_result=$(_select "$_m_prefix")
+		_m_rc=$?
+
+		# fzf returns non-zero on Esc/Ctrl-C/no selection.
+		[ "$_m_rc" -eq 0 ] || exit 0
+
+		_m_key=$(printf '%s\n' "$_m_result" | sed -n '1p')
+		_m_entry=$(printf '%s\n' "$_m_result" | sed -n '2p')
+
+		case $_m_key in
+			ctrl-a)
+				_new_entry || :
+				continue
+				;;
+			ctrl-k)
+				_check_store || :
+				continue
+				;;
+			ctrl-g)
+				_git_status || :
+				continue
+				;;
+		esac
+
+		[ -n "$_m_entry" ] || continue
+
+		case $_m_key in
+			enter|'') _copy_first_line "$_m_entry" || : ;;
+			ctrl-n)   _copy_name "$_m_entry" || : ;;
+			ctrl-y)   _copy_full "$_m_entry" || : ;;
+			ctrl-e)   _store edit "$_m_entry" || : ;;
+			ctrl-o)
+				_show "$_m_entry" || :
+				_pause
+				;;
+			ctrl-p)   _show_policy "$_m_entry" || : ;;
+			ctrl-r)   _store rekey "$_m_entry" || : ;;
+			ctrl-d)
+				if _confirm_remove "$_m_entry"; then
+					_store rm "$_m_entry" || :
+				fi
+				;;
+			*) ;;
+		esac
+	done
+}
+
+main "$@"

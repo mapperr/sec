@@ -1,0 +1,153 @@
+#!/bin/sh
+
+umask 077
+set -f
+
+usage() {
+	cat <<'EOF'
+sec-store-otp
+    generate a TOTP from a sec-store entry
+
+usage:
+    sec-store-otp <name>
+    sec store otp <name>
+
+entry format:
+    The decrypted entry must contain exactly one line:
+
+        totp: <base32-secret>
+
+    Leading whitespace before "totp:" and surrounding whitespace around the
+    secret are ignored.
+
+env vars:
+    SEC_STORE_OTP_SEC      sec executable (default: sec)
+    SEC_STORE_OTP_CMD      custom shell command; reads the Base32 secret from
+                           stdin and writes the generated OTP to stdout
+                           (default: oathtool --totp -b -)
+    SEC_STORE_OTP_DEBUG    enable debug messages
+
+sec-store configuration continues to use SEC_STORE_* variables.
+EOF
+}
+
+_name() { basename "$0"; }
+_error() { printf '%s: error: %s\n' "$(_name)" "$1" >&2; return 1; }
+_debug() {
+	[ -n "${SEC_STORE_OTP_DEBUG:-}" ] &&
+		printf '%s: debug: %s\n' "$(_name)" "$1" >&2
+	return 0
+}
+
+_sec() {
+	printf '%s\n' "${SEC_STORE_OTP_SEC:-sec}"
+}
+
+_store() {
+	"$( _sec )" store "$@"
+}
+
+_runtime_dir() {
+	for d in "${XDG_RUNTIME_DIR:-}" /dev/shm "${TMPDIR:-/tmp}"; do
+		[ -n "$d" ] && [ -d "$d" ] && [ -w "$d" ] && {
+			printf '%s\n' "$d"
+			return 0
+		}
+	done
+	return 1
+}
+
+_tmpdir() {
+	d=$(_runtime_dir) || return 1
+	mktemp -d "$d/sec-store-otp.XXXXXX"
+}
+
+_generate() {
+	if [ -n "${SEC_STORE_OTP_CMD:-}" ]; then
+		sh -c "$SEC_STORE_OTP_CMD"
+		return
+	fi
+
+	command -v oathtool >/dev/null 2>&1 || {
+		_error 'oathtool not found; install OATH Toolkit or set SEC_STORE_OTP_CMD'
+		return 1
+	}
+
+	# "-" makes oathtool read the key from stdin, avoiding exposure through argv.
+	oathtool --totp -b -
+}
+
+main() (
+	[ "$#" -eq 1 ] || {
+		usage >&2
+		exit 1
+	}
+
+	name=$1
+	dir=$(_tmpdir) || {
+		_error 'cannot create temporary OTP directory'
+		exit 1
+	}
+	entry_fifo=$dir/entry
+	secret_fifo=$dir/secret
+	mkfifo "$entry_fifo" "$secret_fifo" || {
+		rm -rf -- "$dir"
+		_error 'cannot create OTP FIFOs'
+		exit 1
+	}
+	trap 'rm -rf -- "$dir"' 0 HUP INT TERM
+
+	_debug "reading [$name]"
+
+	_store get "$name" >"$entry_fifo" &
+	decrypt_pid=$!
+
+	# Consume the complete entry and emit the secret only after validating that
+	# there is exactly one non-empty totp: line.
+	awk '
+		/^[[:space:]]*totp:[[:space:]]*/ {
+			line = $0
+			sub(/^[[:space:]]*totp:[[:space:]]*/, "", line)
+			sub(/[[:space:]]+$/, "", line)
+			count++
+			secret = line
+		}
+		END {
+			if (count != 1 || secret == "")
+				exit 3
+			print secret
+		}
+	' <"$entry_fifo" >"$secret_fifo" &
+	extract_pid=$!
+
+	_generate <"$secret_fifo"
+	generate_rc=$?
+
+	wait "$extract_pid"
+	extract_rc=$?
+
+	wait "$decrypt_pid"
+	decrypt_rc=$?
+
+	if [ "$decrypt_rc" -ne 0 ]; then
+		_error "cannot decrypt [$name]"
+		exit 1
+	fi
+	if [ "$extract_rc" -ne 0 ]; then
+		_error "entry [$name] must contain exactly one non-empty 'totp:' line"
+		exit 1
+	fi
+	if [ "$generate_rc" -ne 0 ]; then
+		_error "cannot generate TOTP for [$name]"
+		exit 1
+	fi
+)
+
+case ${1:-} in
+	-h|--help|help)
+		usage
+		exit 0
+		;;
+esac
+
+main "$@"
