@@ -14,16 +14,45 @@ sec
     a tiny wrapper for age
 
 commands:
-    e  - encrypts from stdin and prints result to stdout
-    e <path> [<path> ...] - (re-)encrypts paths inline
+    e                       encrypt stdin to stdout
+    e <path> [<path> ...]   encrypt files in place
+    d                       decrypt stdin to stdout
+    d <path> [<path> ...]   decrypt files in place
+    identity                print the selected identity
+    identity --all          print all discovered identities
+    recipient               print the self recipient(s), when derivable
 
-    d  - decrypts from stdin and prints result to stdout
-    d <path> [<path> ...] - decrypts paths inline
+identity discovery order:
+    1. SEC_IDENTITY
+    2. $SEC_CONFIG_DIR/identity
+    3. ~/.ssh/id_ed25519
+    4. ~/.ssh/id_rsa
+    5. paths listed in $SEC_CONFIG_DIR/identities
+
+recipient selection:
+    SEC_RECIPIENTS_FILE / SEC_RECIPIENTS are explicit and authoritative.
+    If neither is set, encryption falls back to self:
+      SEC_RECIPIENT, $SEC_CONFIG_DIR/recipient, or the selected identity.
 
 env vars:
-    SEC_IDENTITY  - path to an age or ssh identity file (needed to decrypt)
-    SEC_RECIPIENTS  - a comma-separated list of recipients,
-        they can be age pubkeys, age pubkey files or ssh pubkey files (needed to encrypt)
+    SEC_CONFIG_DIR       config directory
+                         default: ${XDG_CONFIG_HOME:-~/.config}/sec
+    SEC_IDENTITY         preferred age/ssh/plugin identity file
+    SEC_RECIPIENT        explicit public self recipient
+    SEC_RECIPIENTS       comma-separated explicit recipients or recipient files;
+                         if the whole value is a file, use it directly
+    SEC_RECIPIENTS_FILE  explicit age recipients file
+    SEC_DEBUG            enable debug messages
+
+config files:
+    identity             preferred age/ssh/plugin identity file
+    identities           additional identity FILE PATHS, one per line
+    recipient            explicit public self recipient(s), one per line
+
+notes:
+    Explicit recipients never get self added implicitly.
+    Plugin identities are never discovered from PATH: list their identity
+    files explicitly in $SEC_CONFIG_DIR/identities or SEC_IDENTITY.
 ```
 
 # git-sec

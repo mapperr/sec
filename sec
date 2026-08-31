@@ -15,12 +15,41 @@ commands:
     e <path> [<path> ...]   encrypt files in place
     d                       decrypt stdin to stdout
     d <path> [<path> ...]   decrypt files in place
+    identity                print the selected identity
+    identity --all          print all discovered identities
+    recipient               print the self recipient(s), when derivable
+
+identity discovery order:
+    1. SEC_IDENTITY
+    2. \$SEC_CONFIG_DIR/identity
+    3. ~/.ssh/id_ed25519
+    4. ~/.ssh/id_rsa
+    5. paths listed in \$SEC_CONFIG_DIR/identities
+
+recipient selection:
+    SEC_RECIPIENTS_FILE / SEC_RECIPIENTS are explicit and authoritative.
+    If neither is set, encryption falls back to self:
+      SEC_RECIPIENT, \$SEC_CONFIG_DIR/recipient, or the selected identity.
 
 env vars:
-    SEC_IDENTITY    age/ssh identity file used for decryption
-    SEC_RECIPIENTS  comma-separated recipients or recipient files;
-                    if the whole value is a file, use it directly
-    SEC_DEBUG       enable debug messages
+    SEC_CONFIG_DIR       config directory
+                         default: \${XDG_CONFIG_HOME:-~/.config}/sec
+    SEC_IDENTITY         preferred age/ssh/plugin identity file
+    SEC_RECIPIENT        explicit public self recipient
+    SEC_RECIPIENTS       comma-separated explicit recipients or recipient files;
+                         if the whole value is a file, use it directly
+    SEC_RECIPIENTS_FILE  explicit age recipients file
+    SEC_DEBUG            enable debug messages
+
+config files:
+    identity             preferred age/ssh/plugin identity file
+    identities           additional identity FILE PATHS, one per line
+    recipient            explicit public self recipient(s), one per line
+
+notes:
+    Explicit recipients never get self added implicitly.
+    Plugin identities are never discovered from PATH: list their identity
+    files explicitly in \$SEC_CONFIG_DIR/identities or SEC_IDENTITY.
 EOF_USAGE
 }
 
@@ -31,6 +60,10 @@ _info() { printf '%s: %s\n' "$(_name)" "$1" >&2; }
 _debug() {
 	[ -n "${SEC_DEBUG:-}" ] && printf '%s: debug: %s\n' "$(_name)" "$1" >&2
 	return 0
+}
+
+_config_dir() {
+	printf '%s\n' "${SEC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/sec}"
 }
 
 _runtime_dir() {
@@ -69,54 +102,268 @@ _is_encrypted() {
 		grep -Fqx -e "$AGE_ARMOR_HEADER" -e "$AGE_BINARY_HEADER"
 }
 
-_require_identity() {
-	[ -n "${SEC_IDENTITY:-}" ] || { _error 'you have not set SEC_IDENTITY >:|'; return 1; }
-	[ -r "$SEC_IDENTITY" ] || { _error "identity [$SEC_IDENTITY] is not readable"; return 1; }
+_expand_config_path() {
+	case $1 in
+		\~/*) printf '%s/%s\n' "$HOME" "${1#~/}" ;;
+		*) printf '%s\n' "$1" ;;
+	esac
 }
 
-# Build one age recipients file. This avoids constructing shell arguments in a
-# string and also handles ssh recipients containing spaces.
-_make_recipients() {
-	out=$1
-	[ -n "${SEC_RECIPIENTS:-}" ] || {
-		_error 'you have no recipients in SEC_RECIPIENTS >:|'
-		return 1
-	}
+_append_identity() {
+	_ai_out=$1
+	_ai_path=$2
+	_ai_required=$3
 
-	if [ -f "$SEC_RECIPIENTS" ]; then
-		cat -- "$SEC_RECIPIENTS" >"$out" || return 1
+	[ -n "$_ai_path" ] || return 1
+
+	if [ -f "$_ai_path" ] && [ -r "$_ai_path" ]; then
+		if ! grep -Fqx -e "$_ai_path" "$_ai_out" 2>/dev/null; then
+			printf '%s\n' "$_ai_path" >>"$_ai_out" || return 2
+		fi
 		return 0
 	fi
 
-	rest=$SEC_RECIPIENTS
-	found=0
-	while :; do
-		case $rest in
-			*,*) r=${rest%%,*}; rest=${rest#*,}; more=1 ;;
-			*)   r=$rest; rest=; more=0 ;;
-		esac
-
-		# Recipient specifications are public data, so trimming them through sed
-		# does not risk putting secret material in a shell variable.
-		r=$(printf '%s' "$r" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
-		if [ -n "$r" ]; then
-			found=1
-			if [ -f "$r" ]; then
-				cat -- "$r" >>"$out" || return 1
-				printf '\n' >>"$out" || return 1
-			else
-				printf '%s\n' "$r" >>"$out" || return 1
-			fi
-		fi
-		[ "$more" -eq 1 ] || break
-	done
-
-	[ "$found" -eq 1 ] || { _error 'SEC_RECIPIENTS contains no recipients'; return 1; }
+	if [ "$_ai_required" -eq 1 ]; then
+		_error "identity [$_ai_path] does not exist or is not readable"
+		return 2
+	fi
+	return 1
 }
 
-# Consume only a small prefix from stdin. Both age encodings have a textual
-# first line: the PEM armor header, or the native age version line. The caller
-# can replay the prefix followed by the still-unread stdin byte-for-byte.
+_make_identity_list() {
+	_il_out=$1
+	: >"$_il_out" || return 1
+	_il_found=0
+	_il_cfg=$(_config_dir) || return 1
+
+	if [ -n "${SEC_IDENTITY:-}" ]; then
+		_append_identity "$_il_out" "$SEC_IDENTITY" 1
+		_il_rc=$?
+		[ "$_il_rc" -eq 2 ] && return 1
+		[ "$_il_rc" -eq 0 ] && _il_found=1
+	fi
+
+	_il_primary="$_il_cfg/identity"
+	if [ -e "$_il_primary" ] || [ -L "$_il_primary" ]; then
+		_append_identity "$_il_out" "$_il_primary" 1
+		_il_rc=$?
+		[ "$_il_rc" -eq 2 ] && return 1
+		[ "$_il_rc" -eq 0 ] && _il_found=1
+	fi
+
+	for _il_ssh in "$HOME/.ssh/id_ed25519" "$HOME/.ssh/id_rsa"; do
+		if _append_identity "$_il_out" "$_il_ssh" 0; then
+			_il_found=1
+		fi
+	done
+
+	_il_extra="$_il_cfg/identities"
+	if [ -e "$_il_extra" ] || [ -L "$_il_extra" ]; then
+		[ -f "$_il_extra" ] && [ -r "$_il_extra" ] || {
+			_error "identity list [$_il_extra] is not readable"
+			return 1
+		}
+
+		while IFS= read -r _il_line || [ -n "$_il_line" ]; do
+			_il_line=$(printf '%s' "$_il_line" |
+				sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+			[ -n "$_il_line" ] || continue
+			case $_il_line in \#*) continue ;; esac
+
+			_il_line=$(_expand_config_path "$_il_line") || return 1
+			_append_identity "$_il_out" "$_il_line" 1
+			_il_rc=$?
+			[ "$_il_rc" -eq 2 ] && return 1
+			[ "$_il_rc" -eq 0 ] && _il_found=1
+		done <"$_il_extra"
+	fi
+
+	[ "$_il_found" -eq 1 ] || {
+		_error 'no usable identity found'
+		return 1
+	}
+}
+
+_first_identity() {
+	_fi_tmp=$(_tmpfile) || return 1
+	trap 'rm -f -- "$_fi_tmp"' 0 HUP INT TERM
+	_make_identity_list "$_fi_tmp" || return 1
+	IFS= read -r _fi_id <"$_fi_tmp" || return 1
+	printf '%s\n' "$_fi_id"
+}
+
+_derive_recipient() {
+	_dr_identity=$1
+
+	if command -v age-keygen >/dev/null 2>&1; then
+		age-keygen -y "$_dr_identity" 2>/dev/null && return 0
+	fi
+	if command -v rage-keygen >/dev/null 2>&1; then
+		rage-keygen -y "$_dr_identity" 2>/dev/null && return 0
+	fi
+	if command -v ssh-keygen >/dev/null 2>&1; then
+		ssh-keygen -y -f "$_dr_identity" 2>/dev/null && return 0
+	fi
+	return 1
+}
+
+_config_self_recipient() {
+	_csr_cfg=$(_config_dir) || return 1
+	_csr_file="$_csr_cfg/recipient"
+
+	if [ -n "${SEC_RECIPIENT:-}" ]; then
+		printf '%s\n' "$SEC_RECIPIENT"
+		return 0
+	fi
+
+	if [ -e "$_csr_file" ] || [ -L "$_csr_file" ]; then
+		[ -f "$_csr_file" ] && [ -r "$_csr_file" ] || {
+			_error "recipient file [$_csr_file] is not readable"
+			return 1
+		}
+		cat -- "$_csr_file"
+		return 0
+	fi
+
+	return 1
+}
+
+_self_recipient() {
+	if _config_self_recipient; then
+		return 0
+	fi
+
+	_sr_identity=$(_first_identity) || return 1
+	if _derive_recipient "$_sr_identity"; then
+		return 0
+	fi
+
+	_error "cannot derive recipient from identity [$_sr_identity]; set SEC_RECIPIENT or $(_config_dir)/recipient"
+	return 1
+}
+
+_has_explicit_recipients() {
+	[ -n "${SEC_RECIPIENTS_FILE:-}" ] || [ -n "${SEC_RECIPIENTS:-}" ]
+}
+
+_make_explicit_recipients() {
+	_er_out=$1
+	: >"$_er_out" || return 1
+	_er_found=0
+
+	if [ -n "${SEC_RECIPIENTS_FILE:-}" ]; then
+		[ -f "$SEC_RECIPIENTS_FILE" ] && [ -r "$SEC_RECIPIENTS_FILE" ] || {
+			_error "recipients file [$SEC_RECIPIENTS_FILE] is not readable"
+			return 1
+		}
+		cat -- "$SEC_RECIPIENTS_FILE" >>"$_er_out" || return 1
+		printf '\n' >>"$_er_out" || return 1
+		_er_found=1
+	fi
+
+	if [ -n "${SEC_RECIPIENTS:-}" ]; then
+		if [ -f "$SEC_RECIPIENTS" ]; then
+			cat -- "$SEC_RECIPIENTS" >>"$_er_out" || return 1
+			printf '\n' >>"$_er_out" || return 1
+			_er_found=1
+		else
+			_er_rest=$SEC_RECIPIENTS
+			while :; do
+				case $_er_rest in
+					*,*) _er_r=${_er_rest%%,*}; _er_rest=${_er_rest#*,}; _er_more=1 ;;
+					*)   _er_r=$_er_rest; _er_rest=; _er_more=0 ;;
+				esac
+
+				_er_r=$(printf '%s' "$_er_r" |
+					sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+				if [ -n "$_er_r" ]; then
+					_er_found=1
+					if [ -f "$_er_r" ]; then
+						cat -- "$_er_r" >>"$_er_out" || return 1
+						printf '\n' >>"$_er_out" || return 1
+					else
+						printf '%s\n' "$_er_r" >>"$_er_out" || return 1
+					fi
+				fi
+				[ "$_er_more" -eq 1 ] || break
+			done
+		fi
+	fi
+
+	[ "$_er_found" -eq 1 ] || {
+		_error 'explicit recipient configuration contains no recipients'
+		return 1
+	}
+}
+
+_prepare_encryption() {
+	_pe_recip=$1
+	_encrypt_mode=
+	_encrypt_identity=
+
+	if _has_explicit_recipients; then
+		_make_explicit_recipients "$_pe_recip" || return 1
+		_encrypt_mode=recipients
+		return 0
+	fi
+
+	if _config_self_recipient >"$_pe_recip"; then
+		_encrypt_mode=recipients
+		return 0
+	fi
+
+	_encrypt_identity=$(_first_identity) || return 1
+	if _derive_recipient "$_encrypt_identity" >"$_pe_recip"; then
+		_encrypt_mode=recipients
+		return 0
+	fi
+
+	# Current age can encrypt directly to an identity with explicit -e -i.
+	# This is especially useful for plugin identities whose public recipient
+	# can't be derived generically.
+	_encrypt_mode=identity
+	return 0
+}
+
+_age_encrypt_stream() {
+	case $_encrypt_mode in
+		recipients) "$age" -a -R "$1" ;;
+		identity)   "$age" -e -a -i "$_encrypt_identity" ;;
+		*) _error 'internal error: no encryption mode selected'; return 1 ;;
+	esac
+}
+
+_age_encrypt_file() {
+	_aef_recip=$1
+	_aef_file=$2
+	case $_encrypt_mode in
+		recipients) "$age" -a -R "$_aef_recip" -- "$_aef_file" ;;
+		identity)   "$age" -e -a -i "$_encrypt_identity" -- "$_aef_file" ;;
+		*) _error 'internal error: no encryption mode selected'; return 1 ;;
+	esac
+}
+
+_age_decrypt_stream() {
+	_ads_ids=$1
+	set -- "$age" -d
+	while IFS= read -r _ads_id || [ -n "$_ads_id" ]; do
+		[ -n "$_ads_id" ] || continue
+		set -- "$@" -i "$_ads_id"
+	done <"$_ads_ids"
+	"$@"
+}
+
+_age_decrypt_file() {
+	_adf_ids=$1
+	_adf_file=$2
+	set -- "$age" -d
+	while IFS= read -r _adf_id || [ -n "$_adf_id" ]; do
+		[ -n "$_adf_id" ] || continue
+		set -- "$@" -i "$_adf_id"
+	done <"$_adf_ids"
+	"$@" -- "$_adf_file"
+}
+
 _prefix_is_encrypted() {
 	LC_ALL=C head -n 1 -- "$1" 2>/dev/null |
 		grep -Fqx -e "$AGE_ARMOR_HEADER" -e "$AGE_BINARY_HEADER"
@@ -134,14 +381,14 @@ _encrypt_stream() (
 	recip=$(_tmpfile) || { rm -f -- "$prefix"; _error 'cannot create recipients file'; exit 1; }
 	trap 'rm -f -- "$prefix" "$recip"' 0 HUP INT TERM
 
-	_make_recipients "$recip" || exit 1
+	_prepare_encryption "$recip" || exit 1
 	_sniff_stdin "$prefix"
 	rc=$?
 	[ "$rc" -eq 2 ] && { _error 'cannot read input stream'; exit 1; }
 	[ "$rc" -eq 0 ] && { _error 'input stream is already age-encrypted'; exit 1; }
 
 	_debug 'encrypting input stream'
-	{ cat -- "$prefix"; cat; } | "$age" -a -R "$recip"
+	{ cat -- "$prefix"; cat; } | _age_encrypt_stream "$recip"
 	rc=$?
 	[ "$rc" -eq 0 ] || _error 'cannot encrypt input stream'
 	exit "$rc"
@@ -149,20 +396,17 @@ _encrypt_stream() (
 
 _decrypt_stream() (
 	prefix=$(_tmpfile) || { _error 'cannot create temporary input prefix'; exit 1; }
-	trap 'rm -f -- "$prefix"' 0 HUP INT TERM
+	ids=$(_tmpfile) || { rm -f -- "$prefix"; _error 'cannot create identity list'; exit 1; }
+	trap 'rm -f -- "$prefix" "$ids"' 0 HUP INT TERM
 
 	_sniff_stdin "$prefix"
 	rc=$?
 	[ "$rc" -eq 2 ] && { _error 'cannot read input stream'; exit 1; }
+	[ "$rc" -eq 0 ] || { _error 'input stream is not age-encrypted'; exit 1; }
 
-	if [ "$rc" -ne 0 ]; then
-		_error 'input stream is not age-encrypted'
-		exit 1
-	fi
-
-	_require_identity || exit 1
+	_make_identity_list "$ids" || exit 1
 	_debug 'decrypting input stream'
-	{ cat -- "$prefix"; cat; } | "$age" -d -i "$SEC_IDENTITY"
+	{ cat -- "$prefix"; cat; } | _age_decrypt_stream "$ids"
 	rc=$?
 	[ "$rc" -eq 0 ] || _error 'cannot decrypt input stream'
 	exit "$rc"
@@ -184,9 +428,9 @@ _encrypt_file() (
 	recip=$(_tmpfile) || { rm -f -- "$tmp"; _error 'cannot create recipients file'; exit 1; }
 	trap 'rm -f -- "$tmp" "$recip"' 0 HUP INT TERM
 
-	_make_recipients "$recip" || exit 1
+	_prepare_encryption "$recip" || exit 1
 	_debug "encrypting file [$file]"
-	"$age" -a -R "$recip" -- "$file" >"$tmp" || {
+	_age_encrypt_file "$recip" "$file" >"$tmp" || {
 		_error "cannot encrypt [$file]"
 		exit 1
 	}
@@ -197,12 +441,13 @@ _encrypt_file() (
 _decrypt_file() (
 	file=$1
 	_validate_file "$file" || exit 1
-	_require_identity || exit 1
 	tmp=$(_same_dir_tmp "$file") || { _error "cannot create temporary file next to [$file]"; exit 1; }
-	trap 'rm -f -- "$tmp"' 0 HUP INT TERM
+	ids=$(_tmpfile) || { rm -f -- "$tmp"; _error 'cannot create identity list'; exit 1; }
+	trap 'rm -f -- "$tmp" "$ids"' 0 HUP INT TERM
 
+	_make_identity_list "$ids" || exit 1
 	_debug "decrypting file [$file]"
-	"$age" -d -i "$SEC_IDENTITY" -- "$file" >"$tmp" || {
+	_age_decrypt_file "$ids" "$file" >"$tmp" || {
 		_error "cannot decrypt [$file]"
 		exit 1
 	}
@@ -242,6 +487,23 @@ _decrypt_paths() {
 	return "$rc"
 }
 
+_cmd_identity() (
+	ids=$(_tmpfile) || { _error 'cannot create identity list'; exit 1; }
+	trap 'rm -f -- "$ids"' 0 HUP INT TERM
+	_make_identity_list "$ids" || exit 1
+
+	case ${1:-} in
+		'') IFS= read -r id <"$ids" && printf '%s\n' "$id" ;;
+		--all) cat -- "$ids" ;;
+		*) _error 'usage: sec identity [--all]'; exit 1 ;;
+	esac
+)
+
+_cmd_recipient() {
+	[ "$#" -eq 0 ] || { _error 'usage: sec recipient'; return 1; }
+	_self_recipient
+}
+
 main() {
 	cmd=$1
 	shift
@@ -256,6 +518,12 @@ main() {
 			;;
 		d)
 			if [ "$#" -eq 0 ]; then _decrypt_stream; else _decrypt_paths "$@"; fi
+			;;
+		identity)
+			_cmd_identity "$@"
+			;;
+		recipient)
+			_cmd_recipient "$@"
 			;;
 		*)
 			if command -v "sec-$cmd" >/dev/null 2>&1; then
