@@ -1,10 +1,7 @@
+core_name := "sec"
+
 @_default:
     just -f {{justfile()}} --list
-
-doc:
-    #!/bin/sh
-    SEC_USAGE="$(./sec)" SECGIT_USAGE="$(./git-sec)" \
-        envsubst '$SEC_USAGE $SECGIT_USAGE' <README.tpl.md >README.md
 
 link bindir='$HOME/bin':
     #!/bin/sh
@@ -12,7 +9,7 @@ link bindir='$HOME/bin':
     [ ! -d "$bindir" ] &&
         echo "bindir does not exists" &&
         exit 1
-    for f in sec*; do
+    for f in {{core_name}}*; do
         [ -x "$f" ] || continue
         [ -h "$bindir/$f" ] &&
             echo "[$f] is already a symlink" &&
