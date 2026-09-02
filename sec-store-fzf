@@ -128,6 +128,11 @@ _pager() {
 
 _copy_name() {
 	name=$1
+	basename "$name" | _clip || return 1
+	_info "entry name copied: [$name]"
+}
+_copy_path() {
+	name=$1
 	printf '%s' "$name" | _clip || return 1
 	_info "entry name copied: [$name]"
 }
@@ -344,6 +349,7 @@ _internal() {
 		--list)       _list_entries "${1:-}" ;;
 		--copy-first) [ "$#" -eq 1 ] && _copy_first_line "$1" ;;
 		--copy-name)  [ "$#" -eq 1 ] && _copy_name "$1" ;;
+		--copy-path)  [ "$#" -eq 1 ] && _copy_path "$1" ;;
 		--copy-full)  [ "$#" -eq 1 ] && _copy_full "$1" ;;
 		--otp)        [ "$#" -eq 1 ] && _copy_otp "$1" ;;
 		--view)       [ "$#" -eq 1 ] && _view_entry "$1" ;;
@@ -379,10 +385,11 @@ _run_fzf() (
 		--cycle \
 		--no-multi \
 		--prompt='sec> ' \
-		--header='Ctrl-i:1stline Ctrl-u:name Ctrl-o:TOTP Ctrl-y:full Ctrl-v:view Ctrl-e:edit Ctrl-a:new Ctrl-h:policy Ctrl-r:rekey Ctrl-d:rm' \
+		--header='Ctrl-i:1stline Ctrl-u:name Ctrl-o:TOTP Ctrl-y:full Ctrl-v:view Ctrl-e:edit Ctrl-a:new Ctrl-h:policy Ctrl-r:rekey Ctrl-d:rm Ctrl-b:path' \
 		--bind='Ctrl-i:execute("$SEC_STORE_FZF_SELF" --copy-first {})' \
 		--bind='ctrl-u:execute("$SEC_STORE_FZF_SELF" --copy-name {})' \
 		--bind='ctrl-y:execute("$SEC_STORE_FZF_SELF" --copy-full {})' \
+		--bind='ctrl-b:execute("$SEC_STORE_FZF_SELF" --copy-path {})' \
 		--bind='ctrl-o:execute("$SEC_STORE_FZF_SELF" --otp {})' \
 		--bind='ctrl-v:execute("$SEC_STORE_FZF_SELF" --view {})' \
 		--bind='ctrl-h:execute("$SEC_STORE_FZF_SELF" --policy {})' \
