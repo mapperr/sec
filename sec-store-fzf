@@ -246,7 +246,7 @@ _copy_otp() (
 	_info "TOTP copied: [$name]"
 )
 
-_view_entry() (
+_preview_entry() (
 	name=$1
 	dir=$(_tmpdir) || {
 		_error 'cannot create temporary view directory'
@@ -259,8 +259,6 @@ _view_entry() (
 		exit 1
 	}
 	trap 'rm -rf -- "$dir"' 0 HUP INT TERM
-
-	printf '\n--- %s ---\n' "$name" >&2
 
 	_store get "$name" >"$plain" &
 	decrypt_pid=$!
@@ -276,6 +274,15 @@ _view_entry() (
 		_error "cannot decrypt [$name]"
 		exit "$decrypt_rc"
 	}
+)
+
+_view_entry() (
+	name=$1
+	echo
+	echo ">sec view [$name]:"
+	echo
+	_preview_entry "$name"
+	echo
 	_pause
 )
 
@@ -353,6 +360,7 @@ _internal() {
 		--copy-full)  [ "$#" -eq 1 ] && _copy_full "$1" ;;
 		--otp)        [ "$#" -eq 1 ] && _copy_otp "$1" ;;
 		--view)       [ "$#" -eq 1 ] && _view_entry "$1" ;;
+		--preview)    [ "$#" -eq 1 ] && _preview_entry "$1" ;;
 		--policy)     [ "$#" -eq 1 ] && _show_policy "$1" ;;
 		--edit)       [ "$#" -eq 1 ] && _store edit "$1" ;;
 		--rekey)      [ "$#" -eq 1 ] && _store rekey "$1" ;;
@@ -386,6 +394,9 @@ _run_fzf() (
 		--no-multi \
 		--prompt='sec> ' \
 		--header='Ctrl-i:1stline Ctrl-u:name Ctrl-o:TOTP Ctrl-y:full Ctrl-v:view Ctrl-e:edit Ctrl-a:new Ctrl-h:policy Ctrl-r:rekey Ctrl-d:rm Ctrl-b:path' \
+        --preview '"$SEC_STORE_FZF_SELF" --preview {1}' \
+        --preview-window 'right:60%:wrap:hidden' \
+        --bind='ctrl-/:toggle-preview' \
 		--bind='Ctrl-i:execute("$SEC_STORE_FZF_SELF" --copy-first {})' \
 		--bind='ctrl-u:execute("$SEC_STORE_FZF_SELF" --copy-name {})' \
 		--bind='ctrl-y:execute("$SEC_STORE_FZF_SELF" --copy-full {})' \
@@ -397,12 +408,13 @@ _run_fzf() (
 		--bind='ctrl-r:execute("$SEC_STORE_FZF_SELF" --rekey {})' \
 		--bind='ctrl-d:execute("$SEC_STORE_FZF_SELF" --remove {})+reload("$SEC_STORE_FZF_SELF" --list "$SEC_STORE_FZF_PREFIX")' \
 		--bind='ctrl-a:execute("$SEC_STORE_FZF_SELF" --new)+reload("$SEC_STORE_FZF_SELF" --list "$SEC_STORE_FZF_PREFIX")' \
-		<"$list" >/dev/null
+		<"$list"
+		# <"$list" >/dev/null
 )
 
 main() {
 	case ${1:-} in
-		--list|--copy-first|--copy-name|--copy-full|--otp|--view|--policy|--edit|--rekey|--remove|--new)
+		--list|--copy-first|--copy-name|--copy-full|--otp|--view|--preview|--policy|--edit|--rekey|--remove|--new)
 			cmd=$1
 			shift
 			_internal "$cmd" "$@"
