@@ -13,6 +13,7 @@ commands:
     init                         initialize the store
     put <name> [file]            store stdin or file as <name>
     get <name>                   decrypt <name> to stdout
+    get1 <name>                  decrypt first line of <name> to stdout
     edit <name>                  edit <name> without plaintext in the store
     ls [prefix]                  list secrets
     rm <name> [<name> ...]       remove secrets
@@ -349,6 +350,10 @@ _cmd_get() {
 
 	_debug "get [$(_normalize_name "$1")]"
 	_core_decrypt <"$_cg_path"
+}
+
+_cmd_get1() {
+	_cmd_get "$@" | head -n1 | tr -d '\n'
 }
 
 _editor() {
@@ -699,6 +704,7 @@ main() {
 		init)   _cmd_init "$@" ;;
 		put)    _cmd_put "$@" ;;
 		get)    _cmd_get "$@" ;;
+		get1)   _cmd_get1 "$@" ;;
 		edit)   _cmd_edit "$@" ;;
 		ls)     _cmd_ls "$@" ;;
 		rm)     _cmd_rm "$@" ;;
