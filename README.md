@@ -1,224 +1,223 @@
 # sec
 
-`sec` is a wrapper for the already easy-to-use age.  
+`sec` is a small wrapper around the already easy-to-use [age](https://github.com/FiloSottile/age).
 
-But, if age is already easy to use, then, why a *wrapper*?  
-For few additional ergonomics and a minimal git clean/smudge integration.  
-Moreover, `sec` and its companion `git-sec` are just tiny POSIX-ish shell scripts,
-very easy to hack on.
+Why wrap something simple? For a few extra ergonomics, automatic identity discovery, safer in-place operations, and tiny, composable Unix workflows. The core stays focused on encryption and decryption; companion scripts provide a Git filter, an encrypted personal/team store, and temporary secret injection into arbitrary commands.
 
-Usage:
+The tools are POSIX `sh` scripts: easy to read, easy to hack on, and no daemon or database required.
 
-```
-sec
-    a tiny wrapper for age
+## Install
 
-commands:
-    e                       encrypt stdin to stdout
-    e <path> [<path> ...]   encrypt files in place
-    d                       decrypt stdin to stdout
-    d <path> [<path> ...]   decrypt files in place
-    identity                print the selected identity
-    identity --all          print all discovered identities
-    recipient               print the self recipient(s), when derivable
+Install `age` (or `rage`), then put the executable scripts you want in your `PATH`. `sec` discovers companions by their executable names:
 
-identity discovery order:
-    1. SEC_IDENTITY
-    2. $SEC_CONFIG_DIR/identity
-    3. ~/.ssh/id_ed25519
-    4. ~/.ssh/id_rsa
-    5. paths listed in $SEC_CONFIG_DIR/identities
-
-recipient selection:
-    SEC_RECIPIENTS_FILE / SEC_RECIPIENTS are explicit and authoritative.
-    If neither is set, encryption falls back to self:
-      SEC_RECIPIENT, $SEC_CONFIG_DIR/recipient, or the selected identity.
-
-env vars:
-    SEC_CONFIG_DIR       config directory
-                         default: ${XDG_CONFIG_HOME:-~/.config}/sec
-    SEC_IDENTITY         preferred age/ssh/plugin identity file
-    SEC_RECIPIENT        explicit public self recipient
-    SEC_RECIPIENTS       comma-separated explicit recipients or recipient files;
-                         if the whole value is a file, use it directly
-    SEC_RECIPIENTS_FILE  explicit age recipients file
-    SEC_DEBUG            enable debug messages
-
-config files:
-    identity             preferred age/ssh/plugin identity file
-    identities           additional identity FILE PATHS, one per line
-    recipient            explicit public self recipient(s), one per line
-
-notes:
-    Explicit recipients never get self added implicitly.
-    Plugin identities are never discovered from PATH: list their identity
-    files explicitly in $SEC_CONFIG_DIR/identities or SEC_IDENTITY.
+```sh
+# For example, if ~/.local/bin is already in PATH:
+install -m 755 sec sec-git sec-store sec-run ~/.local/bin/
 ```
 
-# git-sec
+The resulting commands are `sec e`, `sec d`, `sec git`, `sec store`, and `sec run`. Install only the companions you need. `sec-run` requires `sec-store`, and Git integration additionally requires Git.
 
-`git-sec` provides the sec integration with git:  
-using git clean/smudge filters and the .gitattributes file inside your repo,
-it can encrypt/decrypt tracked files transparently.  
-This way you can work with decrypted files on your working copy and
-encrypted files on your remote.  
+## Basic usage
 
-After you link or place it in your PATH you can also use it as a git subcommand: `git sec <stuff>`
+```sh
+# Encrypt/decrypt a stream. Encryption uses native (binary) age by default.
+printf 'hi mom!\n' | sec e > greeting.age
+sec d < greeting.age
+# hi mom!
 
-Usage:
+# Ask for ASCII armor when a text-only transport requires it.
+SEC_ARMOR=1 sec e < greeting.txt > greeting-armored.age
 
-```
-git-sec
-    handles git configs to transparently use sec in your repo
-
-    on  - activates sec in your git repo
-    off  - deactivates sec from your git repo
-
-    l  - lists infos about recipients, tracked paths, etc.
-
-    a '<recipient>' [ '<recipient>'... ]  - adds recipients (you can also pipe them in)
-    r '<recipient>' [ '<recipient>'... ]  - removes recipients (you can also pipe them in)
-
-    t '<path>' [ '<path>'... ]  - tracks paths to .gitattributes (remember to quote globbings)
-    u '<path>' [ '<path>'... ]  - untracks paths from .gitattributes (remember to quote globbings)
-
-    f  - try to force git to (re-)encrypt your tracked files (works only on a clean git status)
-        useful if you have just changed recipients and want to re-encrypt files only for the current ones
-
-env vars:
-    SEC_IDENTITY  - path to an age or ssh identity file (needed for decrypt)
-
-files:
-    <repo-root>/.sec-recipients  - this file will store the recipient list for your repo.
-        Remember to add the recipient of your identity file.
-        You can track and encrypt this file too.
+# Encrypt/decrypt a file in place (the pathname stays the same).
+sec e ./secret.txt
+sec d ./secret.txt
 ```
 
-# Basic usage
+`sec e` rejects input already recognized as age-encrypted; `sec d` rejects plaintext. Decryption accepts both native and armored age files. Avoid writing binary ciphertext directly to your terminal: redirect it to a file or another command.
 
-```
-# setup
+### Identities and recipients
 
-# copy/link sec and git-sec in your PATH
+`sec` discovers decryption identities in this order:
 
-$ export SEC_IDENTITY=~/path/to/my_personal_age.key
-# or
-$ export SEC_IDENTITY=~/.ssh/id_my_personal_ssh.key
+1. `SEC_IDENTITY`
+2. `${SEC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/sec}/identity`
+3. `~/.ssh/id_ed25519`
+4. `~/.ssh/id_rsa`
+5. Additional identity **paths** listed in the config file `identities`, one per line (including explicitly configured plugin identities)
 
-$ export SEC_RECIPIENTS="~/.ssh/id_my_personal_ssh.pub,age1hx25sge85krrprcfa6vd2rr4t9u33s8lrkzz5khaxurjpddk5syqptgm3c"
-# or
-$ export SEC_RECIPIENTS="$( {echo "~/.ssh/id_my_personal_ssh.pub" ; cat ~/path/to/my_usual_age_recipients.pub } |paste -sd,)"
-
-$ echo 'hi mom!' | sec e
------BEGIN AGE ENCRYPTED FILE-----
-YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBnbU5JN3VyV3IxSDhzOXdL
-RSt4UWF5K3o1Z2VmeE9UYVJQMG1OQWE3ejJnCjUzV21kZStlMWllZ1FqWDVkY0tx
-VVoxbmk1WVJUQ09QVUxBam9xbkRPTTAKLT4gWDI1NTE5IGFYbHd5SGd5RStkaS9j
-WXhtbzF4MzM1VGdHa3M0WFhnRWZJQzhhUGQ0a0kKS1YxQjdEaVpkVkJUMHJuVXBr
-MDdMemdUNjFTcU95V0s2TjdvMlRYT0tmbwotPiBzc2gtZWQyNTUxOSAxZDVpdncg
-aldLakwwTW5ZUWxXUTdXRGN1NDNpeXBEZFJRWW5VTEhFM3QzU1l0b1d5WQpZZGFh
-K0RuYVlzeXUwNENocGNLcTdCQW1iK1VaN0ZmazJWWTNoU2E4UVJvCi0tLSBPcGc5
-NFBZV1huY1MxdUp5UEFqZ3I5Wi9MZWRkdUd0bDAwVFQvbVFxSUhNCjExthpBXQeM
-A5dfDwDLrB0aHCT7V/Uyvz6mJ3YxmetXMZrRScx20g==
------END AGE ENCRYPTED FILE-----
-
-$ echo 'hi mom!' | sec e | sec d
-hi mom!
-
-$ echo 'hi mom!' > /tmp/himom
-$ sec e /tmp/himom
-sec: [/tmp/himom] encrypted
-
-$ cat /tmp/himom
------BEGIN AGE ENCRYPTED FILE-----
-YWdlLWVuY3J5cHRpb24ub3JnL3YxCi0+IFgyNTUxOSBYSWF4UnpmKzIxT3czZE9q
-KzVNdFpPVkFudi9iUUlVcVMyZ2lVd05TL25ZCkNwV1dhZ0VwSVZtaDdDQ2Y5aklH
-bldIZlM4L29BaUJXSGU0T0JoQ0w3cUkKLT4gWDI1NTE5IEFtSHJDUHV1VHFtbVhZ
-a2ljazFnbyt0N1ZFYUE5SVJsYTRtZTZ2OFhlVmsKQnI1eWFGdWVzOVByelU3RWNP
-NDJtS2tWMnB1YzExWUQxMllmRkxyR0JuQQotPiBzc2gtZWQyNTUxOSAxZDVpdncg
-bHkwb0FkNFkva21JbENlOTNMNW5kNWJtc3p4cU1VYWxEWkk0dGtCUHVHVQorVU9N
-cDRqbVl5bDlCbG1veW9wZFpwdmNMMkpkMU9xdG52bUVoOUNRZUZvCi0tLSBvUUNi
-OU9ETWpGUnlZQ1F4V21CcXpUdW40V2lBbGtoaDlvU2VDaXNWK1JNCoBqK8plkLME
-wUtWdy0/AylhkMQSECWYoBS363aFza9OYMl4pegf9g==
------END AGE ENCRYPTED FILE-----
-
-$ sec d /tmp/himom
-sec: [/tmp/himom] decrypted
-$ cat /tmp/himom
-hi mom!
+```sh
+sec identity             # first discovered identity
+sec identity --all       # all discovered identities
+sec recipient            # your public self-recipient, if derivable
 ```
 
-## Git repo usage
+Without explicit recipients, encryption falls back to your own recipient. To encrypt for other people or machines, use `SEC_RECIPIENTS` or `SEC_RECIPIENTS_FILE`:
 
+```sh
+SEC_RECIPIENTS_FILE=./team.recipients sec e < secret.txt > secret.age
 ```
-# let's go to a git repo
-$ cd /path/to/git/repo
-$ git sec l
-2025-11-25T13:12:46 git-sec warn: sec git is not active!
-# r: recipient, t: tracking, f: file tracked -> grep as you wish
 
-2025-11-25T13:12:46 git-sec warn: no recipients yet!
+An explicit recipient list is authoritative: **your own recipient is not added automatically**. Keep private identities out of the repository; public recipient files may be committed. `SEC_ARMOR=1` requests ASCII-armored output; the default is binary.
 
-2025-11-25T13:12:46 git-sec warn: no trackings yet!
+## Git integration: sec-git
 
-2025-11-25T13:12:46 git-sec warn: no tracked files!
+`sec-git` uses Git clean/smudge filters and `.gitattributes` to keep *plaintext in the working tree* and *age ciphertext in Git's index and repository*. This is a different workflow from `sec-store`, which keeps ciphertext in its store even locally.
 
-# ok, there is nothing yet, let's add something to be encrypted on remote
-
-$ cat ~/.ssh/id_my_personal_ssh.pub | git sec a
-2025-11-25T13:22:18 git-sec: added recipient [ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORfYBrvJ40V6W4rvYJ4y9r4Ccwy48DBobjXwGUUYZR0 my_ssh_key]
-
-$ git status --short
- M .sec-recipients
-
-$ git sec t '.sec-recipients' '**/*.secret.yaml' '**/*.tfstate'
-025-11-25T13:24:27 git-sec: paths [.sec-recipients **/*.secret.yaml **/*.tfstate] tracked
-$ git status --short
- M .gitattributes
- M .sec-recipients
-
-$ git diff
-...
-+**/*.secret.yaml  filter=sec diff=sec
-+**/*.tfstate  filter=sec diff=sec
-...
-...
-+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORfYBrvJ40V6W4rvYJ4y9r4Ccwy48DBobjXwGUUYZR0 my_ssh_key
-...
-
-$ git sec on
-2025-11-25T13:25:14 git-sec: activated \o/
-
-$ git sec l
-# r: recipient, t: tracking, f: file tracked -> grep as you wish
-
-r: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORfYBrvJ40V6W4rvYJ4y9r4Ccwy48DBobjXwGUUYZR0 my_ssh_key
-
-t: **/*.tfstate
-t: **/secret.yaml
-t: .sec-recipients
-
-f: .sec-recipients
-f: homelab/my_very_secret.yaml
-f: cloud/terraform.tfstate
-f: work/terraform.tfstate
-f: work/work_secret.yaml
-
-$ git add . && git ci -m 'setup git sec'
-# let's force an encryption on tracked files
-$ git sec f
-$ git add . && git ci -m 'encrypt secret files!' && git push
-# from now on, file tracked are transparently encrypted when they are pushed to any remote
-# yay \o/!
+```sh
+cd /path/to/git/repo
+sec git on
+sec git recipient add 'ssh-ed25519 AAAA... alice@laptop'
+sec git track '.env' 'secrets/*.json'
+git add .gitattributes .sec-recipients .env secrets/
+git commit -m 'Add encrypted project secrets'
 ```
+
+The generated `.gitattributes` entries use `filter=sec diff=sec -text`, so the binary ciphertext is not subject to text normalization. A subsequent `git add` of unchanged plaintext reuses the indexed ciphertext, avoiding noisy changes caused by age's randomized encryption.
+
+```sh
+sec git status           # state, recipients and tracked paths
+sec git recipient list
+sec git recipient rm 'ssh-ed25519 AAAA... alice@laptop'
+sec git rekey            # re-encrypt filtered tracked files and stage new blobs
+sec git refresh          # restore a plaintext working tree after enabling filters
+sec git off
+```
+
+Aliases include `sec git l`, `a`, `r`, `t`, `u`, and `f`; see `sec git --help` for the full interface. Git's filter configuration is local to each checkout, so run `sec git on` after cloning. **Commit `.sec-recipients` in plaintext**: its recipient entries are public, and encrypting the policy complicates bootstrap and recovery. Removing a recipient and re-encrypting does not revoke access to older Git history or credentials they already knew; rotate underlying credentials when revoking access.
+
+## Encrypted store: sec-store
+
+`sec-store` keeps each secret as an encrypted `.age` entry, suitable for personal use or a Git-backed team store:
+
+```sh
+sec store init
+printf '%s\n' 'example-password' | sec store put personal/example
+sec store get personal/example
+sec store edit personal/example
+sec store ls
+```
+
+By default, the store is `${XDG_DATA_HOME:-$HOME/.local/share}/sec`; override it with `SEC_STORE_DIR` (for example, set it to your project's `.sec` directory). A nearby `.recipients` file defines the encryption policy for its directory and descendants; the closest policy wins. Without a policy, the core's self-recipient fallback applies.
+
+`sec store get` emits plaintext to stdout without writing it into the store. `sec store git ...` (or `sec store g ...`) runs Git inside `SEC_STORE_DIR` when using a version of `sec-store` that includes the Git subcommand. See `sec store --help` for the other store commands.
+
+## Developer workflows: sec-run
+
+`sec-run` launches an arbitrary command with secret environment variables and/or temporary files obtained from **sec-store**. No plaintext needs to be checked into your project, and the calling shell's environment is left unchanged.
+
+```sh
+sec run \
+    -e dev/app.env \
+    -e shared/monitoring.env \
+    -f dev/client.crt:TLS_CERT \
+    -f dev/client.key:TLS_KEY \
+    -f dev/credentials.json \
+    -- ./myapp --port 8080
+```
+
+In this example, `sec-run` loads both environment entries, decrypts the certificate, key, and JSON file into a private temporary directory, and starts `./myapp`. The child receives `TLS_CERT`, `TLS_KEY`, and `CREDENTIALS_JSON`, each holding an **absolute temporary file path**, not the file contents. `SEC_RUN_DIR` points to the directory containing the materialized files.
+
+### Environment entries: `-e`
+
+An environment entry is a secret in the store containing literal `NAME=VALUE` lines:
+
+```dotenv
+# dev/app.env (contents before encryption)
+DATABASE_HOST=localhost
+DATABASE_PASSWORD=example value with spaces
+API_TOKEN=example-token
+```
+
+```sh
+sec run -e dev/app.env -- ./myapp
+```
+
+Repeat `-e` to combine multiple entries; when the same variable appears in more than one, **the last definition wins**. The parser treats values literally: it does not `source` the entry, execute command substitutions, expand variables, or interpret shell quoting. Blank lines and lines beginning with `#` are ignored. Environment values must be single-line and cannot contain NUL bytes.
+
+### Temporary files: `-f`
+
+Each `-f` takes a store entry with an optional environment variable name:
+
+```text
+-f ENTRY
+-f ENTRY:ENV_VAR
+```
+
+If the variable is omitted, it is derived from the entry's basename: `dev/credentials.json` becomes `CREDENTIALS_JSON`. Paths within the temporary directory preserve the entry's relative directory structure, allowing multiple entries with the same basename under different directories.
+
+```sh
+sec run \
+    -f prod/frontend/credentials.json:FRONTEND_CREDENTIALS \
+    -f prod/backend/credentials.json:BACKEND_CREDENTIALS \
+    -- ./myapp
+```
+
+Duplicate file destinations, duplicate `-f` environment variable names, and collisions between `-e` variables and file-path variables are **errors**, detected before the command starts. `:` is reserved as the separator for an explicit variable name in `-f` arguments.
+
+### Inspect before running
+
+Omit the command to see what would be injected **without displaying secret values**:
+
+```sh
+sec run -e dev/app.env -f dev/client.key:TLS_KEY
+```
+
+Use `--print` to print the resolved environment, **including sensitive values**:
+
+```sh
+sec run --print -e dev/app.env -f dev/client.key:TLS_KEY
+```
+
+In this mode, file paths are **placeholders**, not reusable files; no application is started. Do not use `--print` in routine CI logs or paste its output into tickets or chat.
+
+Use `--env-only` to emit only resolved `NAME=VALUE` assignments (no `-f` allowed):
+
+```sh
+sec run --env-only -e dev/app.env -e shared/monitoring.env
+```
+
+This output is sensitive, too. It is data for programs that accept env-file syntax, **not a script to evaluate with `eval` or `source`**. `--print` and `--env-only` cannot be combined with `-- command`.
+
+### Lifetime, cleanup, and security
+
+`sec-run` prepares **all** required secrets before launching the command; an invalid entry, failed decryption, or variable collision prevents launch. It supervises the child and returns its exit status. Temporary files have mode `0600` under a private `0700` workspace and are removed when the supervised command terminates.
+
+The workspace's parent defaults to `$XDG_RUNTIME_DIR`. There is **no automatic `/tmp` fallback**: set `SEC_RUN_TMPDIR` if needed, to an existing, private directory owned by your user. Prefer a private tmpfs where available. Do not assume files remain available after the supervised command exits; subprocesses that outlive it may lose access. As with any environment injection, child processes can inherit secret variables, so scope `sec run` around the smallest practical command.
+
+`sec-run` uses `SEC_STORE_DIR` to select the store and supports `SEC_RUN_SEC`, `SEC_RUN_TMPDIR`, and `SEC_RUN_DEBUG`. All runner-specific variables use the `SEC_RUN_` prefix.
+
+### Make, Just, and direnv
+
+A Make target can give one command exactly the secrets it needs:
+
+```makefile
+.PHONY: run
+run:
+	@sec run -e dev/app.env -f dev/client.key:TLS_KEY -- ./myapp
+```
+
+Or put the same workflow in a `justfile`:
+
+```just
+run:
+    @sec run -e dev/app.env -f dev/client.key:TLS_KEY -- ./myapp
+```
+
+For a project-local store, direnv can set **only the store location** in `.envrc`:
+
+```sh
+export SEC_STORE_DIR="$PWD/.sec"
+```
+
+Then `just run` (or `make run`) resolves secrets from that project. Prefer injecting secret values through `sec-run` at command launch rather than loading them automatically into your interactive shell when entering a directory.
+
 ## References
 
-- [age](https://github.com/FiloSottile/age): the awesome encryption tool by Filippo Valsorda
-- [pa](https://github.com/biox/pa): an amazing password manager writter in a few lines of POSIX shell
-- [git-crypt](https://github.com/AGWA/git-crypt): a long standing tool, same concept as git-sec, but using GPG
-- [shroudage](https://github.com/nxsy/shroudage): the inspiration for git-sec, written in bash
-- [git-agecrypt](https://github.com/vlaci/git-agecrypt): another inspiration for git-sec, written in rust
+- [age](https://github.com/FiloSottile/age) — the encryption tool behind `sec`.
+- [pa](https://github.com/biox/pa) — a minimal password manager in shell.
+- [git-crypt](https://github.com/AGWA/git-crypt) — a related transparent Git-encryption workflow built around GPG.
+- [shroudage](https://github.com/nxsy/shroudage) and [git-agecrypt](https://github.com/vlaci/git-agecrypt) — inspirations for Git-filter-based encryption.
 
 ## Development
 
-The source is hosted on https://git.sr.ht/~mapperr/sec
+Source: <https://git.sr.ht/~mapperr/sec>
