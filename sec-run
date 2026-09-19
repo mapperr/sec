@@ -1,0 +1,355 @@
+#!/bin/sh
+# Run a command with secrets from sec-store. POSIX sh; no eval/source of secrets.
+
+umask 077
+set -f
+_CR=$(printf '\r')
+
+usage() {
+	cat <<'USAGE'
+sec-run
+    inject sec-store secrets into a command's environment and temporary files
+
+usage:
+    sec run [options] [-- command [args ...]]
+    sec-run [options] [-- command [args ...]]
+
+options:
+    -e, --env ENTRY              load literal NAME=VALUE lines from an entry (repeatable)
+    -f, --file ENTRY[:ENV_VAR]   materialize an entry and export its file path
+                                (repeatable; default ENV_VAR from basename)
+    --print                     display resolved variables, including secret values;
+                                file paths are placeholders, not usable runtime paths
+    --env-only                  output resolved NAME=VALUE lines (no -f allowed)
+    -h, --help                  show help
+
+No command: inspect the injection without printing secret values.
+Use -- to separate runner options from the command. --print and --env-only
+cannot be combined with a command. -e entries are merged in order (last wins).
+Duplicate -f variable names/paths, and collisions between -e and -f, are errors.
+
+The .env format is literal, one NAME=VALUE per line; empty lines and lines
+beginning with # are ignored. No quotes, interpolation or shell syntax.
+A file entry's relative path is preserved under SEC_RUN_DIR (mode 0700).
+A materialized file has mode 0600. SEC_RUN_DIR contains temporary paths,
+not the secret contents. These paths remain available only while the command
+is running. The runner returns the command's exit status.
+
+env vars:
+    SEC_STORE_DIR        sec-store location (handled by sec-store)
+    SEC_RUN_SEC          sec executable (default: sec)
+    SEC_RUN_TMPDIR       explicit private temporary parent (default: XDG_RUNTIME_DIR)
+    SEC_RUN_DEBUG        enable diagnostics; never prints secret contents
+
+SEC_RUN_TMPDIR must be a real directory owned by the current user and
+inaccessible to group/other users (typically mode 0700). No implicit /tmp
+fallback. Prefer a private tmpfs: XDG_RUNTIME_DIR may not always be tmpfs.
+USAGE
+}
+
+_error() { printf 'sec-run: error: %s\n' "$1" >&2; return 1; }
+_debug() { [ -z "${SEC_RUN_DEBUG:-}" ] || printf 'sec-run: debug: %s\n' "$1" >&2; return 0; }
+
+_tmp=
+_child=
+_cleanup() {
+	[ -z "$_tmp" ] || rm -rf -- "$_tmp"
+}
+_signal() {
+	_sig=$1
+	trap - HUP INT TERM
+	if [ -n "$_child" ]; then
+		kill -s "$_sig" "$_child" 2>/dev/null || :
+		wait "$_child" 2>/dev/null || :
+	fi
+	case $_sig in HUP) exit 129 ;; INT) exit 130 ;; TERM) exit 143 ;; esac
+}
+trap '_cleanup' 0
+trap '_signal HUP' HUP
+trap '_signal INT' INT
+trap '_signal TERM' TERM
+
+_require_runtime() {
+	_rt=${SEC_RUN_TMPDIR:-${XDG_RUNTIME_DIR:-}}
+	[ -n "$_rt" ] || { _error 'XDG_RUNTIME_DIR is not set; set SEC_RUN_TMPDIR to a private directory'; return 1; }
+	[ -d "$_rt" ] && [ ! -L "$_rt" ] && [ -w "$_rt" ] && [ -x "$_rt" ] || {
+		_error "temporary parent [$_rt] must be a writable, non-symlink directory"
+		return 1
+	}
+	_rt_owner=$(stat -c %u -- "$_rt") || return 1
+	_rt_mode=$(stat -c %a -- "$_rt") || return 1
+	_rt_uid=$(id -u) || return 1
+	[ "$_rt_owner" = "$_rt_uid" ] || { _error "temporary parent [$_rt] is not owned by you"; return 1; }
+	case $_rt_mode in ''|*[!0-7]*) _error 'cannot validate temporary-parent permissions'; return 1 ;; esac
+	[ "$((0$_rt_mode & 077))" -eq 0 ] || {
+		_error "temporary parent [$_rt] is accessible to group/other users"
+		return 1
+	}
+	case $_rt in *'
+'*) _error 'newline in temporary-parent path is not supported'; return 1 ;; esac
+	_tmp=$(mktemp -d "$_rt/sec-run.XXXXXXXX") || { _error 'cannot create temporary workspace'; return 1; }
+	mkdir -m 700 -- "$_tmp/envs" "$_tmp/files" || return 1
+	: >"$_tmp/env-entries" && : >"$_tmp/file-specs" &&
+	: >"$_tmp/file-vars" && : >"$_tmp/file-paths" &&
+	: >"$_tmp/env-keys" && : >"$_tmp/env-files"
+}
+
+_valid_var() {
+	case $1 in ''|[!A-Za-z_]*|*[!A-Za-z0-9_]*) return 1 ;; esac
+	[ "$1" != SEC_RUN_DIR ]
+}
+
+_valid_entry() {
+	case $1 in
+		''|/*|.|..|./*|../*|*/.|*/..|*/./*|*/../*|*//*|*:*|*'
+'*|*"$_CR"*) return 1 ;;
+	esac
+	return 0
+}
+
+_canonical_entry() {
+	_entry=$1
+	case $_entry in *.age) _entry=${_entry%.age} ;; esac
+	_valid_entry "$_entry" || { _error "invalid entry name [$_entry]"; return 1; }
+	printf '%s\n' "$_entry"
+}
+
+_derive_var() {
+	_base=${1##*/}
+	_derived=$(printf '%s' "$_base" | LC_ALL=C tr '[:lower:]' '[:upper:]' |
+		LC_ALL=C tr -c 'A-Z0-9_' '_') || return 1
+	case $_derived in [0-9]*) _derived=_$_derived ;; esac
+	_valid_var "$_derived" || { _error "cannot derive variable name from [$1]"; return 1; }
+	printf '%s\n' "$_derived"
+}
+
+_has_line() { grep -Fqx -e "$1" "$2"; }
+
+_add_env() {
+	_ae=$(_canonical_entry "$1") || return 1
+	printf '%s\n' "$_ae" >>"$_tmp/env-entries" || return 1
+}
+
+_add_file() {
+	_spec=$1
+	case $_spec in
+		*:*)
+			_entry=${_spec%%:*}
+			_var=${_spec#*:}
+			_valid_var "$_var" || { _error "invalid file variable name [$_var]"; return 1; }
+			;;
+		*) _entry=$_spec; _var= ;;
+	esac
+	_entry=$(_canonical_entry "$_entry") || return 1
+	[ -n "$_var" ] || _var=$(_derive_var "$_entry") || return 1
+	_has_line "$_var" "$_tmp/file-vars" && { _error "duplicate file variable [$_var]"; return 1; }
+	_has_line "$_entry" "$_tmp/file-paths" && { _error "duplicate file destination [$_entry]"; return 1; }
+	printf '%s\n' "$_var" >>"$_tmp/file-vars" || return 1
+	printf '%s\n' "$_entry" >>"$_tmp/file-paths" || return 1
+	printf '%s\n%s\n%s\n' "$_entry" "$_var" "$_entry" >>"$_tmp/file-specs" || return 1
+}
+
+_check_env_bytes() {
+	_ceb_file=$1
+	_ceb_orig=$(wc -c <"$_ceb_file") || return 1
+	_ceb_without_nul=$(LC_ALL=C tr -d '\000' <"$_ceb_file" | wc -c) || return 1
+	[ "$_ceb_orig" = "$_ceb_without_nul" ] || {
+		_error 'an environment entry contains NUL bytes (unsupported)'
+		return 1
+	}
+}
+
+# Validate before exporting anything. Paths in env-files are private, generated
+# by this runner; no decrypted input is executed as shell code.
+_validate_env_file() {
+	_ve_file=$1
+	_check_env_bytes "$_ve_file" || return 1
+	_ve_num=0
+	while IFS= read -r _ve_line || [ -n "$_ve_line" ]; do
+		_ve_num=$((_ve_num + 1))
+		case $_ve_line in
+			*[![:space:]]*) ;;
+			*) continue ;;
+		esac
+		case $_ve_line in \#*) continue ;; esac
+		case $_ve_line in
+			*=*) _ve_name=${_ve_line%%=*} ;;
+			*) _error "invalid NAME=VALUE assignment in environment entry, line $_ve_num"; return 1 ;;
+		esac
+		_valid_var "$_ve_name" || {
+			_error "invalid/reserved environment variable [$_ve_name] on line $_ve_num"
+			return 1
+		}
+		case $_ve_line in *"$_CR"*) _error "CR character in environment entry, line $_ve_num"; return 1 ;; esac
+		_has_line "$_ve_name" "$_tmp/file-vars" && {
+			_error "environment variable [$_ve_name] conflicts with a file variable"
+			return 1
+		}
+		_has_line "$_ve_name" "$_tmp/env-keys" ||
+			printf '%s\n' "$_ve_name" >>"$_tmp/env-keys" || return 1
+	done <"$_ve_file"
+}
+
+_store_get() { "$_sec_bin" store get "$1"; }
+
+_prepare_envs() {
+	_pe_count=0
+	while IFS= read -r _pe_entry || [ -n "$_pe_entry" ]; do
+		[ -n "$_pe_entry" ] || continue
+		_pe_count=$((_pe_count + 1))
+		_pe_file=$_tmp/envs/$_pe_count
+		_debug "loading environment entry [$_pe_entry]"
+		_store_get "$_pe_entry" >"$_pe_file" || { _error "cannot load environment entry [$_pe_entry]"; return 1; }
+		_validate_env_file "$_pe_file" || return 1
+		printf '%s\n' "$_pe_file" >>"$_tmp/env-files" || return 1
+	done <"$_tmp/env-entries"
+}
+
+_prepare_files() {
+	while IFS= read -r _pf_entry &&
+	      IFS= read -r _pf_var &&
+	      IFS= read -r _pf_rel; do
+		_pf_target=$_tmp/files/$_pf_rel
+		_debug "loading file entry [$_pf_entry]"
+		if [ "$_mode" = run ]; then
+			_pf_parent=$(dirname -- "$_pf_target") || return 1
+			mkdir -p -- "$_pf_parent" || { _error "cannot create directory for [$_pf_entry]"; return 1; }
+			[ ! -e "$_pf_target" ] && [ ! -L "$_pf_target" ] || {
+				_error "conflicting file destination [$_pf_rel]"
+				return 1
+			}
+			_store_get "$_pf_entry" >"$_pf_target" || { _error "cannot load file entry [$_pf_entry]"; return 1; }
+			chmod 600 -- "$_pf_target" || return 1
+		else
+			# Inspect/print verify decryptability without materializing file secrets.
+			_store_get "$_pf_entry" >/dev/null || { _error "cannot load file entry [$_pf_entry]"; return 1; }
+		fi
+	done <"$_tmp/file-specs"
+}
+
+# Executed only in a subshell, after every secret has been validated. The
+# parent/cleanup supervisor never exports the application environment.
+_apply_env() {
+	while IFS= read -r _ae_file || [ -n "$_ae_file" ]; do
+		while IFS= read -r _ae_line || [ -n "$_ae_line" ]; do
+			case $_ae_line in
+				*[![:space:]]*) ;;
+				*) continue ;;
+			esac
+			case $_ae_line in \#*) continue ;; esac
+			export "$_ae_line" || return 1
+		done <"$_ae_file"
+	done <"$_tmp/env-files"
+	while IFS= read -r _ae_entry &&
+	      IFS= read -r _ae_var &&
+	      IFS= read -r _ae_rel; do
+		export "$_ae_var=$_tmp/files/$_ae_rel" || return 1
+	done <"$_tmp/file-specs"
+	SEC_RUN_DIR=$_tmp/files
+	export SEC_RUN_DIR
+}
+
+_inspect() {
+	printf 'Environment:\n'
+	while IFS= read -r _pr_key || [ -n "$_pr_key" ]; do
+		printf '  %s=<secret>\n' "$_pr_key"
+	done <"$_tmp/env-keys"
+	printf '\nFiles:\n'
+	while IFS= read -r _pr_entry &&
+	      IFS= read -r _pr_var &&
+	      IFS= read -r _pr_rel; do
+		printf '  %s <- %s -> <SEC_RUN_DIR>/%s\n' "$_pr_var" "$_pr_entry" "$_pr_rel"
+	done <"$_tmp/file-specs"
+	printf '\nRuntime:\n  SEC_RUN_DIR=<temporary directory>\n'
+}
+
+_print_resolved() (
+	_apply_env || exit 1
+	while IFS= read -r _pr_key || [ -n "$_pr_key" ]; do
+		printf '%s=' "$_pr_key"
+		"$_printenv_bin" "$_pr_key" || exit 1
+	done <"$_tmp/env-keys"
+	if [ "$_mode" = print ]; then
+		while IFS= read -r _pr_entry &&
+		      IFS= read -r _pr_var &&
+		      IFS= read -r _pr_rel; do
+			printf '%s=<SEC_RUN_DIR>/%s\n' "$_pr_var" "$_pr_rel"
+		done <"$_tmp/file-specs"
+		printf 'SEC_RUN_DIR=<temporary directory>\n'
+	fi
+)
+
+_run_command() {
+	(
+		# Resolve cleanup utility before imported PATH can change it.
+		_run_rm=$(command -v rm) || exit 1
+		_apply_env || exit 1
+		# A decrypted environment source is needed only while preparing the child.
+		"$_run_rm" -rf -- "$_tmp/envs" || exit 1
+		exec "$@"
+	) &
+	_child=$!
+	wait "$_child"
+	_rc=$?
+	_child=
+	return "$_rc"
+}
+
+main() {
+	case ${1:-} in -h|--help|help) usage; return 0 ;; esac
+	_require_runtime || return 1
+	_sec_bin=$(command -v "${SEC_RUN_SEC:-sec}") || { _error 'sec executable not found'; return 1; }
+	_mode=inspect
+	_mode_set=0
+	_seen=0
+	_command=0
+	while [ "$#" -gt 0 ]; do
+		case $1 in
+			-e|--env)
+				[ "$#" -ge 2 ] || { _error "missing ENTRY after [$1]"; return 2; }
+				_add_env "$2" || return 2
+				_seen=1
+				shift 2
+				;;
+			-f|--file)
+				[ "$#" -ge 2 ] || { _error "missing ENTRY[:ENV_VAR] after [$1]"; return 2; }
+				_add_file "$2" || return 2
+				_seen=1
+				shift 2
+				;;
+			--print)
+				[ "$_mode_set" -eq 0 ] || { _error 'only one output mode can be selected'; return 2; }
+				_mode=print; _mode_set=1; shift
+				;;
+			--env-only)
+				[ "$_mode_set" -eq 0 ] || { _error 'only one output mode can be selected'; return 2; }
+				_mode=env-only; _mode_set=1; shift
+				;;
+			--)
+				shift
+				[ "$#" -gt 0 ] || { _error 'a command is required after --'; return 2; }
+				[ "$_mode_set" -eq 0 ] || { _error 'output modes cannot be combined with a command'; return 2; }
+				_mode=run; _command=1
+				break
+				;;
+			-h|--help) usage; return 0 ;;
+			*) _error "unknown option [$1]; use -- before the command"; return 2 ;;
+		esac
+	done
+	[ "$_seen" -eq 1 ] || { usage >&2; _error 'specify at least one -e or -f entry'; return 2; }
+	if [ "$_mode" = env-only ] && [ -s "$_tmp/file-specs" ]; then
+		_error '--env-only does not accept -f file entries'
+		return 2
+	fi
+	if [ "$_mode" = print ] || [ "$_mode" = env-only ]; then
+		_printenv_bin=$(command -v printenv) || { _error 'printenv is required for output modes'; return 1; }
+	fi
+	_prepare_envs && _prepare_files || return 1
+	case $_mode in
+		inspect) _inspect ;;
+		print|env-only) _print_resolved ;;
+		run) _run_command "$@" ;;
+	esac
+}
+
+main "$@"
