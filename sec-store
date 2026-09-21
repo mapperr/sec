@@ -13,7 +13,6 @@ commands:
     init                         initialize the store
     put <name> [file]            store stdin or file as <name>
     get <name>                   decrypt <name> to stdout
-    get1 <name>                  decrypt first line of <name> to stdout
     edit <name>                  edit <name> without plaintext in the store
     ls [prefix]                  list secrets
     rm <name> [<name> ...]       remove secrets
@@ -381,7 +380,12 @@ _cmd_edit() (
 		_error "cannot create temporary ciphertext next to [$_ce_path]"
 		exit 1
 	}
-	trap 'rm -rf -- "$_ce_dir"; rm -f -- "$_ce_cipher"' 0 HUP INT TERM
+	# Cleanup on exit only. A signal trap that merely removes these paths and
+	# returns can leave the shell running after the editor with no plaintext.
+	trap 'rm -rf -- "$_ce_dir"; rm -f -- "$_ce_cipher"' 0
+	trap 'exit 129' HUP
+	trap 'exit 130' INT
+	trap 'exit 143' TERM
 
 	if [ -f "$_ce_path" ]; then
 		_validate_secret_file "$_ce_path" || exit 1
@@ -407,13 +411,26 @@ _cmd_edit() (
 		exit "$_ce_erc"
 	}
 
-	_ce_after=$(cksum <"$_ce_plain") || exit 1
+	# Detect editors that have moved/removed the temporary file instead of
+	# letting a shell redirection fail with a misleading diagnostic.
+	[ -f "$_ce_plain" ] && [ ! -L "$_ce_plain" ] || {
+		_error "edited temporary file disappeared [$_ce_name]; secret was not updated"
+		exit 1
+	}
+	_ce_after=$(cksum <"$_ce_plain") || {
+		_error "cannot read edited temporary file [$_ce_name]"
+		exit 1
+	}
 	if [ "$_ce_before" = "$_ce_after" ]; then
 		_info "[$_ce_name] unchanged"
 		exit 0
 	fi
 
 	_ce_policy=$(_policy_for_file "$_ce_path") || exit 1
+	[ -f "$_ce_plain" ] && [ ! -L "$_ce_plain" ] || {
+		_error "edited temporary file disappeared before encryption [$_ce_name]; secret was not updated"
+		exit 1
+	}
 	_encrypt_with_policy "$_ce_policy" <"$_ce_plain" >"$_ce_cipher" || {
 		_error "cannot encrypt [$_ce_name]"
 		exit 1

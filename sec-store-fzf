@@ -316,11 +316,20 @@ _remove_entry() {
 	_store rm "$name"
 }
 
+# fzf redraws its interface as soon as execute(...) returns. If an edit
+# fails, leave its diagnostic visible until the user acknowledges it.
+_edit_entry() {
+	_store edit "$1" && return 0
+	_error "editing [$1] failed; see sec-store error above"
+	_pause
+	return 1
+}
+
 _new_entry() {
 	printf 'new entry name: ' >/dev/tty
 	IFS= read -r name </dev/tty || return 1
 	[ -n "$name" ] || return 0
-	_store edit "$name"
+	_edit_entry "$name"
 }
 
 _self_path() {
@@ -362,7 +371,7 @@ _internal() {
 		--view)       [ "$#" -eq 1 ] && _view_entry "$1" ;;
 		--preview)    [ "$#" -eq 1 ] && _preview_entry "$1" ;;
 		--policy)     [ "$#" -eq 1 ] && _show_policy "$1" ;;
-		--edit)       [ "$#" -eq 1 ] && _store edit "$1" ;;
+		--edit)       [ "$#" -eq 1 ] && _edit_entry "$1" ;;
 		--rekey)      [ "$#" -eq 1 ] && _store rekey "$1" ;;
 		--remove)     [ "$#" -eq 1 ] && _remove_entry "$1" ;;
 		--new)        [ "$#" -eq 0 ] && _new_entry ;;
