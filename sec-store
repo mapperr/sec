@@ -10,7 +10,8 @@ $s
     encrypted personal/team secret store for sec
 
 commands:
-    init                         initialize the store
+    init [--project]             initialize personal/current or project store
+    dir [--source]              print selected store path or source
     put <name> [file]            store stdin or file as <name>
     get <name>                   decrypt <name> to stdout
     edit <name>                  edit <name> without plaintext in the store
@@ -42,6 +43,7 @@ recipient policies:
 notes:
     Secret names are store-relative paths and are stored as <name>.age.
     Plaintext is never written inside SEC_STORE_DIR.
+    init --project creates .sec/store in the current directory.
 EOF
 }
 
@@ -58,25 +60,89 @@ _sec() {
 	printf '%s\n' "${SEC_STORE_SEC:-sec}"
 }
 
+# Search from the physical working directory upwards. Never accept a symlinked
+# .sec directory/store: a malicious checkout must not redirect writes elsewhere.
+_find_project_store() {
+    _fps_dir=$(pwd -P) || return 2
+    while :; do
+        if [ -L "$_fps_dir/.sec" ] || [ -L "$_fps_dir/.sec/store" ]; then
+            _error "symlink in project store path [$_fps_dir/.sec/store]"
+            return 2
+        fi
+        if [ -e "$_fps_dir/.sec/store" ]; then
+            [ -d "$_fps_dir/.sec/store" ] || {
+                _error "project store path [$_fps_dir/.sec/store] is not a directory"
+                return 2
+            }
+            printf '%s\n' "$_fps_dir/.sec/store"
+            return 0
+        fi
+        [ "$_fps_dir" = / ] && break
+        _fps_dir=$(dirname -- "$_fps_dir") || return 2
+    done
+    return 1
+}
+
+# Do not silently override an explicitly set (even empty) SEC_STORE_DIR.
 _root_raw() {
-	printf '%s\n' "${SEC_STORE_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/sec}"
+    if [ "${SEC_STORE_DIR+x}" = x ]; then
+        [ -n "$SEC_STORE_DIR" ] || { _error 'SEC_STORE_DIR is empty'; return 1; }
+        printf '%s\n' "$SEC_STORE_DIR"
+        return 0
+    fi
+    if _rr_project=$(_find_project_store); then
+        printf '%s\n' "$_rr_project"
+        return 0
+    else
+        _rr_rc=$?
+        [ "$_rr_rc" -eq 1 ] || return 1
+    fi
+    if [ "${SEC_STORE_REQUIRE_PROJECT:-0}" = 1 ]; then
+        _error 'no .sec/store found; SEC_STORE_REQUIRE_PROJECT=1 forbids personal fallback'
+        return 1
+    fi
+    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/sec"
 }
 
 _root() {
-	_sr=$(_root_raw) || return 1
-	case $_sr in
-		/) ;;
-		*/) _sr=${_sr%/} ;;
-	esac
+    _sr=$(_root_raw) || return 1
+    case $_sr in
+        /) ;;
+        */) _sr=${_sr%/} ;;
+    esac
+    if [ -d "$_sr" ]; then
+        (cd "$_sr" 2>/dev/null && pwd -P)
+    else
+        case $_sr in
+            /*) printf '%s\n' "$_sr" ;;
+            *) printf '%s/%s\n' "$(pwd -P)" "$_sr" ;;
+        esac
+    fi
+}
 
-	if [ -d "$_sr" ]; then
-		(cd "$_sr" 2>/dev/null && pwd -P)
-	else
-		case $_sr in
-			/*) printf '%s\n' "$_sr" ;;
-			*) printf '%s/%s\n' "$PWD" "$_sr" ;;
-		esac
-	fi
+_store_source() {
+    if [ "${SEC_STORE_DIR+x}" = x ]; then
+        printf 'explicit\n'
+    elif _ss_project=$(_find_project_store); then
+        printf 'project\n'
+    else
+        _ss_rc=$?
+        [ "$_ss_rc" -eq 1 ] || return 1
+        [ "${SEC_STORE_REQUIRE_PROJECT:-0}" != 1 ] || {
+            _error 'no .sec/store found; project store required'
+            return 1
+        }
+        printf 'personal\n'
+    fi
+}
+
+_cmd_dir() {
+    case $# in
+        0) _root ;;
+        1) [ "$1" = --source ] || { _error 'usage: sec store dir [--source]'; return 1; }
+           _root >/dev/null && _store_source ;;
+        *) _error 'usage: sec store dir [--source]'; return 1 ;;
+    esac
 }
 
 _require_store() {
@@ -267,24 +333,34 @@ _replace_cipher() {
 }
 
 _cmd_init() {
-	[ "$#" -eq 0 ] || { _error 'usage: sec store init'; return 1; }
-
-	_ci_raw=$(_root_raw) || return 1
-	if [ -e "$_ci_raw" ] && [ ! -d "$_ci_raw" ]; then
-		_error "cannot initialize store: [$_ci_raw] is not a directory"
-		return 1
-	fi
-
-	_ci_new=0
-	[ -d "$_ci_raw" ] || _ci_new=1
-	mkdir -p -- "$_ci_raw" || {
-		_error "cannot create store [$_ci_raw]"
-		return 1
-	}
-	[ "$_ci_new" -eq 0 ] || chmod 700 "$_ci_raw" 2>/dev/null || :
-
-	_ci_root=$(_root) || return 1
-	_info "store initialized at [$_ci_root]"
+    [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = --project ]; } || {
+        _error 'usage: sec store init [--project]'
+        return 1
+    }
+    if [ "${1:-}" = --project ]; then
+        _ci_cwd=$(pwd -P) || return 1
+        [ ! -L "$_ci_cwd/.sec" ] && [ ! -L "$_ci_cwd/.sec/store" ] || {
+            _error 'refusing symlinked .sec project store'
+            return 1
+        }
+        [ ! -e "$_ci_cwd/.sec" ] || [ -d "$_ci_cwd/.sec" ] || {
+            _error 'project .sec exists but is not a directory'
+            return 1
+        }
+        _ci_raw=$_ci_cwd/.sec/store
+    else
+        _ci_raw=$(_root_raw) || return 1
+    fi
+    if [ -L "$_ci_raw" ] || { [ -e "$_ci_raw" ] && [ ! -d "$_ci_raw" ]; }; then
+        _error "cannot initialize store: [$_ci_raw] is not a regular directory"
+        return 1
+    fi
+    _ci_new=0
+    [ -d "$_ci_raw" ] || _ci_new=1
+    mkdir -p -- "$_ci_raw" || { _error "cannot create store [$_ci_raw]"; return 1; }
+    [ "$_ci_new" -eq 0 ] || chmod 700 "$_ci_raw" || return 1
+    _ci_root=$(cd "$_ci_raw" && pwd -P) || return 1
+    _info "store initialized at [$_ci_root]"
 }
 
 _cmd_put() (
@@ -719,6 +795,7 @@ main() {
 
 	case $_m_cmd in
 		init)   _cmd_init "$@" ;;
+		dir)    _cmd_dir "$@" ;;
 		put)    _cmd_put "$@" ;;
 		get)    _cmd_get "$@" ;;
 		get1)   _cmd_get1 "$@" ;;

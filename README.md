@@ -97,13 +97,40 @@ sec store edit personal/example
 sec store ls
 ```
 
-By default, the store is `${XDG_DATA_HOME:-$HOME/.local/share}/sec`; override it with `SEC_STORE_DIR` (for example, set it to your project's `.sec` directory). A nearby `.recipients` file defines the encryption policy for its directory and descendants; the closest policy wins. Without a policy, the core's self-recipient fallback applies.
+### Personal and project stores
 
-`sec store get` emits plaintext to stdout without writing it into the store. `sec store git ...` (or `sec store g ...`) runs Git inside `SEC_STORE_DIR` when using a version of `sec-store` that includes the Git subcommand. See `sec store --help` for the other store commands.
+`sec-store` selects its store in this order:
+
+1. An explicitly set `SEC_STORE_DIR` (always wins; an empty value is an error).
+2. The **nearest** `.sec/store` directory, searching upwards from the current directory (no Git repository required).
+3. The personal default `${XDG_DATA_HOME:-$HOME/.local/share}/sec`.
+
+The search is read-only and does not create directories. `sec store dir` prints the resolved absolute store path; `sec store dir --source` prints `explicit`, `project`, or `personal`. If you need to guarantee that a team command does **not** silently fall back to the personal store, set `SEC_STORE_REQUIRE_PROJECT=1` (an explicitly supplied `SEC_STORE_DIR` is still honored).
+
+```sh
+# In a new project (creates .sec/store here, not in an ancestor):
+cd /path/to/myproject
+sec store init --project
+sec store dir                    # /path/to/myproject/.sec/store
+sec store dir --source           # project
+sec store put dev/database.env < ./database.env
+
+# Anywhere below that project, the same store is discovered:
+cd src/api
+sec store ls
+sec store get dev/database.env
+
+# For a personal store, outside a project:
+sec store init
+```
+
+A `.recipients` file defines the encryption policy for its directory and descendants; the closest policy wins. Without a policy, the core's self-recipient fallback applies. For team stores, **commit an explicit `.sec/store/.recipients`**: otherwise each developer might encrypt a new entry only for themselves. Never commit plaintext input files or private identities.
+
+`sec store get` emits plaintext to stdout without writing it into the store. `sec store git ...` (or `sec store g ...`) runs Git from the resolved store directory; when `.sec/store` lives inside a project repository, Git finds the enclosing repository. See `sec store --help` for all store commands. Use `SEC_STORE_DIR=/some/path` when you deliberately want to override project discovery.
 
 ## Developer workflows: sec-run
 
-`sec-run` launches an arbitrary command with secret environment variables and/or temporary files obtained from **sec-store**. No plaintext needs to be checked into your project, and the calling shell's environment is left unchanged.
+`sec-run` launches an arbitrary command with secret environment variables and/or temporary files obtained from **sec-store**. It uses the same automatic store discovery, so running it from a project subdirectory requires no `SEC_STORE_DIR` setup. No plaintext needs to be checked into your project, and the calling shell's environment is left unchanged.
 
 ```sh
 sec run \
@@ -116,6 +143,47 @@ sec run \
 ```
 
 In this example, `sec-run` loads both environment entries, decrypts the certificate, key, and JSON file into a private temporary directory, and starts `./myapp`. The child receives `TLS_CERT`, `TLS_KEY`, and `CREDENTIALS_JSON`, each holding an **absolute temporary file path**, not the file contents. `SEC_RUN_DIR` points to the directory containing the materialized files.
+
+### Project manifests: `-m` / `--manifest`
+
+For projects that need several environment files and certificates, keep **references**, not secret values, in `.sec/run/` beside the project store:
+
+```text
+myproject/
+├── .sec/
+│   ├── store/
+│   │   ├── .recipients
+│   │   └── dev/
+│   │       ├── app.env.age
+│   │       ├── client.crt.age
+│   │       └── client.key.age
+│   └── run/
+│       └── dev
+├── justfile
+└── src/
+```
+
+Example `.sec/run/dev` (one directive and one entry per line, blank lines and `#` comments allowed):
+
+```text
+# Project development environment
+env dev/app.env
+file dev/client.crt:TLS_CERT
+file dev/client.key:TLS_KEY
+```
+
+From **any directory inside the project**:
+
+```sh
+sec run -m dev                         # inspect without showing secret values
+sec run -m dev -- ./myapp              # run with variables and temporary files
+sec run -m dev --print                 # print sensitive values: do not log
+sec run -m dev -e shared/extra.env -- ./myapp
+```
+
+A bare manifest name such as `dev` resolves to `.sec/run/dev` **beside the selected `.sec/store`**; `sec-run` does not independently search for manifests in parent directories. Explicit manifest paths (`./config/run`, `../config/run`, `/absolute/run`) work with any store. You can repeat `-m` and mix manifests with `-e`/`-f` options; they are processed in command-line order. Manifests contain only literal `env ENTRY` and `file ENTRY[:ENV_VAR]` directives (the aliases `-e ENTRY` and `-f ENTRY[:ENV_VAR]` also work). No `source`, `eval`, interpolation, shell quoting, or inline comments are executed. Entries in a manifest are whitespace-free; use direct CLI flags for names containing spaces.
+
+For a team repository, commit `.sec/run/` and the **ciphertext** under `.sec/store/`. If the project store is missing, a named manifest fails instead of silently using an unrelated personal manifest; use `SEC_STORE_REQUIRE_PROJECT=1` to make ordinary `sec store`/`sec run` commands fail on personal fallback as well.
 
 ### Environment entries: `-e`
 
@@ -184,7 +252,7 @@ This output is sensitive, too. It is data for programs that accept env-file synt
 
 The workspace's parent defaults to `$XDG_RUNTIME_DIR`. There is **no automatic `/tmp` fallback**: set `SEC_RUN_TMPDIR` if needed, to an existing, private directory owned by your user. Prefer a private tmpfs where available. Do not assume files remain available after the supervised command exits; subprocesses that outlive it may lose access. As with any environment injection, child processes can inherit secret variables, so scope `sec run` around the smallest practical command.
 
-`sec-run` uses `SEC_STORE_DIR` to select the store and supports `SEC_RUN_SEC`, `SEC_RUN_TMPDIR`, and `SEC_RUN_DEBUG`. All runner-specific variables use the `SEC_RUN_` prefix.
+`sec-run` relies on `sec store dir` for store selection; `SEC_STORE_DIR` is optional, and `SEC_STORE_REQUIRE_PROJECT=1` prevents unintended personal fallback. Runner-specific settings remain `SEC_RUN_SEC`, `SEC_RUN_TMPDIR`, and `SEC_RUN_DEBUG`, all with the `SEC_RUN_` prefix.
 
 ### Make, Just, and direnv
 
@@ -203,13 +271,17 @@ run:
     @sec run -e dev/app.env -f dev/client.key:TLS_KEY -- ./myapp
 ```
 
-For a project-local store, direnv can set **only the store location** in `.envrc`:
+With a project-local `.sec/store`, **direnv is optional**: `sec-store` and `sec-run` discover it from any project subdirectory. A `justfile` can use a versioned manifest without repeating secret arguments:
 
-```sh
-export SEC_STORE_DIR="$PWD/.sec"
+```just
+run:
+    @sec run -m dev -- ./myapp
+
+inspect:
+    @sec run -m dev
 ```
 
-Then `just run` (or `make run`) resolves secrets from that project. Prefer injecting secret values through `sec-run` at command launch rather than loading them automatically into your interactive shell when entering a directory.
+If you use direnv, you can keep `.envrc` free of secrets and use it for unrelated project settings. Prefer injecting secret values through `sec-run` at command launch rather than loading them automatically into your interactive shell when entering a directory.
 
 ## References
 

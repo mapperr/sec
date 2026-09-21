@@ -18,6 +18,8 @@ options:
     -e, --env ENTRY              load literal NAME=VALUE lines from an entry (repeatable)
     -f, --file ENTRY[:ENV_VAR]   materialize an entry and export its file path
                                 (repeatable; default ENV_VAR from basename)
+    -m, --manifest NAME|PATH    load env/file entries from a declarative manifest
+                                (repeatable; NAME resolves in project .sec/run/)
     --print                     display resolved variables, including secret values;
                                 file paths are placeholders, not usable runtime paths
     --env-only                  output resolved NAME=VALUE lines (no -f allowed)
@@ -28,6 +30,11 @@ Use -- to separate runner options from the command. --print and --env-only
 cannot be combined with a command. -e entries are merged in order (last wins).
 Duplicate -f variable names/paths, and collisions between -e and -f, are errors.
 
+A manifest contains one directive per line: env ENTRY or file ENTRY[:ENV_VAR].
+Blank lines and # comments are ignored. Manifest content is data, never shell
+code. Named manifests resolve beside the selected project store in .sec/run/;
+explicit paths (./file, ../file or /absolute/file) work with any store.
+
 The .env format is literal, one NAME=VALUE per line; empty lines and lines
 beginning with # are ignored. No quotes, interpolation or shell syntax.
 A file entry's relative path is preserved under SEC_RUN_DIR (mode 0700).
@@ -36,7 +43,8 @@ not the secret contents. These paths remain available only while the command
 is running. The runner returns the command's exit status.
 
 env vars:
-    SEC_STORE_DIR        sec-store location (handled by sec-store)
+    SEC_STORE_DIR        optional explicit store location (handled by sec-store)
+    SEC_STORE_REQUIRE_PROJECT    if 1, disallow personal-store fallback
     SEC_RUN_SEC          sec executable (default: sec)
     SEC_RUN_TMPDIR       explicit private temporary parent (default: XDG_RUNTIME_DIR)
     SEC_RUN_DEBUG        enable diagnostics; never prints secret contents
@@ -147,6 +155,85 @@ _add_file() {
 	printf '%s\n' "$_var" >>"$_tmp/file-vars" || return 1
 	printf '%s\n' "$_entry" >>"$_tmp/file-paths" || return 1
 	printf '%s\n%s\n%s\n' "$_entry" "$_var" "$_entry" >>"$_tmp/file-specs" || return 1
+}
+
+# Pin the store once so every entry in this run uses the same store, even if
+# the command was invoked from a nested directory or used a named manifest.
+_pin_store() {
+    [ -n "${_store_dir:-}" ] && return 0
+    _store_dir=$("$_sec_bin" store dir) || {
+        _error 'cannot resolve store directory'
+        return 1
+    }
+    SEC_STORE_DIR=$_store_dir
+    export SEC_STORE_DIR
+}
+
+_manifest_path() {
+    _mp_name=$1
+    case $_mp_name in
+        /*|./*|../*) printf '%s\n' "$_mp_name"; return 0 ;;
+    esac
+    # A bare name means a project manifest; never silently take one from
+    # an ancestor unrelated to the store resolved by sec-store.
+    _pin_store || return 1
+    case $_store_dir in
+        */.sec/store)
+            _mp_sec=${_store_dir%/store}
+            ;;
+        *)
+            _error "named manifest [$_mp_name] requires a project .sec/store; use ./path for an explicit manifest"
+            return 1
+            ;;
+    esac
+    _valid_entry "$_mp_name" || { _error "invalid manifest name [$_mp_name]"; return 1; }
+    _mp_rest=$_mp_name
+    _mp_cur=$_mp_sec/run
+    [ ! -L "$_mp_cur" ] || { _error "symlinked manifest directory [$_mp_cur]"; return 1; }
+    while :; do
+        case $_mp_rest in
+            */*) _mp_part=${_mp_rest%%/*}; _mp_rest=${_mp_rest#*/} ;;
+            *) _mp_part=$_mp_rest; _mp_rest= ;;
+        esac
+        _mp_cur=$_mp_cur/$_mp_part
+        [ ! -L "$_mp_cur" ] || { _error "symlinked manifest path [$_mp_cur]"; return 1; }
+        [ -n "$_mp_rest" ] || break
+    done
+    printf '%s\n' "$_mp_cur"
+}
+
+_load_manifest() {
+    _lm_path=$(_manifest_path "$1") || return 1
+    [ -f "$_lm_path" ] && [ -r "$_lm_path" ] && [ ! -L "$_lm_path" ] || {
+        _error "manifest [$_lm_path] is not a readable regular file"
+        return 1
+    }
+    _lm_num=0
+    while IFS= read -r _lm_line || [ -n "$_lm_line" ]; do
+        _lm_num=$((_lm_num + 1))
+        # Trim only manifest whitespace; no eval or shell interpolation.
+        _lm_line=$(printf '%s' "$_lm_line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//') || return 1
+        case $_lm_line in ''|\#*) continue ;; esac
+        # The format deliberately permits no whitespace inside an ENTRY token.
+        case $_lm_line in
+            *[[:space:]]*)
+                _lm_kind=${_lm_line%%[[:space:]]*}
+                _lm_arg=${_lm_line#"$_lm_kind"}
+                _lm_arg=$(printf '%s' "$_lm_arg" | sed 's/^[[:space:]]*//') || return 1
+                ;;
+            *) _error "invalid manifest directive at [$_lm_path:$_lm_num]"; return 1 ;;
+        esac
+        case $_lm_arg in ''|*[[:space:]]*)
+            _error "invalid manifest argument at [$_lm_path:$_lm_num]"
+            return 1 ;;
+        esac
+        case $_lm_kind in
+            env|-e) _add_env "$_lm_arg" || return 1 ;;
+            file|-f) _add_file "$_lm_arg" || return 1 ;;
+            *) _error "unknown manifest directive [$_lm_kind] at [$_lm_path:$_lm_num]"; return 1 ;;
+        esac
+        _seen=1
+    done <"$_lm_path"
 }
 
 _check_env_bytes() {
@@ -317,6 +404,11 @@ main() {
 				_seen=1
 				shift 2
 				;;
+			-m|--manifest)
+				[ "$#" -ge 2 ] || { _error "missing NAME|PATH after [$1]"; return 2; }
+				_load_manifest "$2" || return 2
+				shift 2
+				;;
 			--print)
 				[ "$_mode_set" -eq 0 ] || { _error 'only one output mode can be selected'; return 2; }
 				_mode=print; _mode_set=1; shift
@@ -344,6 +436,7 @@ main() {
 	if [ "$_mode" = print ] || [ "$_mode" = env-only ]; then
 		_printenv_bin=$(command -v printenv) || { _error 'printenv is required for output modes'; return 1; }
 	fi
+	_pin_store || return 1
 	_prepare_envs && _prepare_files || return 1
 	case $_mode in
 		inspect) _inspect ;;
