@@ -105,7 +105,7 @@ sec store ls
 2. The **nearest** `.sec/store` directory, searching upwards from the current directory (no Git repository required).
 3. The personal default `${XDG_DATA_HOME:-$HOME/.local/share}/sec`.
 
-The search is read-only and does not create directories. `sec store dir` prints the resolved absolute store path; `sec store dir --source` prints `explicit`, `project`, or `personal`. If you need to guarantee that a team command does **not** silently fall back to the personal store, set `SEC_STORE_REQUIRE_PROJECT=1` (an explicitly supplied `SEC_STORE_DIR` is still honored).
+The search is read-only and does not create directories. `sec store dir` prints the resolved absolute store path; `sec store dir --source` prints `explicit`, `project`, or `personal`. **Valid symlinks are supported** for `.sec`, `.sec/store`, an explicit `SEC_STORE_DIR`, and the personal default store: `sec store dir` prints the canonical destination. Broken links and inaccessible/non-directory destinations fail without silently selecting another store. Secret entry paths and `.recipients` inside a store must not be symlinks. If you need to guarantee that a team command does **not** silently fall back to the personal store, set `SEC_STORE_REQUIRE_PROJECT=1` (an explicitly supplied `SEC_STORE_DIR` is still honored).
 
 ```sh
 # In a new project (creates .sec/store here, not in an ancestor):
@@ -124,9 +124,11 @@ sec store get dev/database.env
 sec store init
 ```
 
-A `.recipients` file defines the encryption policy for its directory and descendants; the closest policy wins. Without a policy, the core's self-recipient fallback applies. For team stores, **commit an explicit `.sec/store/.recipients`**: otherwise each developer might encrypt a new entry only for themselves. Never commit plaintext input files or private identities.
+A `.recipients` file defines the encryption policy for its directory and descendants; the closest policy wins. Without a policy, the core's self-recipient fallback applies. For a separate secrets repository, you can link either `project/.sec` to a directory containing `store/` and `run/`, or link only `project/.sec/store` to an external store while keeping `project/.sec/run/` alongside it. `sec store dir --project-sec` prints the canonical project `.sec` directory used for named run manifests, only when the selected store is the discovered project store. `sec store init --project` accepts existing valid directory symlinks but refuses broken ones.
 
-`sec store get` emits plaintext to stdout without writing it into the store. `sec store git ...` (or `sec store g ...`) runs Git from the resolved store directory; when `.sec/store` lives inside a project repository, Git finds the enclosing repository. See `sec store --help` for all store commands. Use `SEC_STORE_DIR=/some/path` when you deliberately want to override project discovery.
+For team stores, **commit an explicit `.sec/store/.recipients`**: otherwise each developer might encrypt a new entry only for themselves. Never commit plaintext input files or private identities.
+
+`sec store get` emits plaintext to stdout without writing it into the store. `sec store git ...` (or `sec store g ...`) runs Git from the **resolved physical store directory**: if a store symlink points outside the project checkout, Git operates in the destination repository (if any), not in the project checkout. See `sec store --help` for all store commands. Use `SEC_STORE_DIR=/some/path` when you deliberately want to override project discovery.
 
 ## Developer workflows: sec-run
 
@@ -146,7 +148,7 @@ In this example, `sec-run` loads both environment entries, decrypts the certific
 
 ### Project manifests: `-m` / `--manifest`
 
-For projects that need several environment files and certificates, keep **references**, not secret values, in `.sec/run/` beside the project store:
+For projects that need several environment files and certificates, keep **references**, not secret values, in `.sec/run/` beside the project store: The manifest is resolved relative to the matching project `.sec` even when `.sec` or `.sec/store` is symlinked elsewhere; `SEC_STORE_DIR` overrides that point to an unrelated store cannot borrow a project manifest.
 
 ```text
 myproject/

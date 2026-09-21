@@ -11,7 +11,7 @@ $s
 
 commands:
     init [--project]             initialize personal/current or project store
-    dir [--source]              print selected store path or source
+    dir [--source|--project-sec] print store path, source or associated project .sec
     put <name> [file]            store stdin or file as <name>
     get <name>                   decrypt <name> to stdout
     edit <name>                  edit <name> without plaintext in the store
@@ -44,6 +44,8 @@ notes:
     Secret names are store-relative paths and are stored as <name>.age.
     Plaintext is never written inside SEC_STORE_DIR.
     init --project creates .sec/store in the current directory.
+    Valid symlinks for .sec, .sec/store and the personal store are supported.
+    Symlinks within a store (secrets/policies) remain forbidden.
 EOF
 }
 
@@ -60,22 +62,28 @@ _sec() {
 	printf '%s\n' "${SEC_STORE_SEC:-sec}"
 }
 
-# Search from the physical working directory upwards. Never accept a symlinked
-# .sec directory/store: a malicious checkout must not redirect writes elsewhere.
+# Search upwards from the physical working directory. A project may link
+# either .sec or .sec/store to an existing directory, including one outside
+# the checkout. A dangling link or a non-directory is an error, not a reason
+# to fall through to another project or the personal store.
 _find_project_store() {
     _fps_dir=$(pwd -P) || return 2
     while :; do
-        if [ -L "$_fps_dir/.sec" ] || [ -L "$_fps_dir/.sec/store" ]; then
-            _error "symlink in project store path [$_fps_dir/.sec/store]"
-            return 2
-        fi
-        if [ -e "$_fps_dir/.sec/store" ]; then
-            [ -d "$_fps_dir/.sec/store" ] || {
-                _error "project store path [$_fps_dir/.sec/store] is not a directory"
+        _fps_sec=$_fps_dir/.sec
+        _fps_store=$_fps_sec/store
+        if [ -L "$_fps_sec" ] || [ -e "$_fps_sec" ]; then
+            [ -d "$_fps_sec" ] && [ -r "$_fps_sec" ] && [ -x "$_fps_sec" ] || {
+                _error "project .sec [$_fps_sec] is not an accessible directory (possibly a dangling symlink)"
                 return 2
             }
-            printf '%s\n' "$_fps_dir/.sec/store"
-            return 0
+            if [ -L "$_fps_store" ] || [ -e "$_fps_store" ]; then
+                [ -d "$_fps_store" ] && [ -r "$_fps_store" ] && [ -x "$_fps_store" ] || {
+                    _error "project store [$_fps_store] is not an accessible directory (possibly a dangling symlink)"
+                    return 2
+                }
+                printf '%s\n' "$_fps_store"
+                return 0
+            fi
         fi
         [ "$_fps_dir" = / ] && break
         _fps_dir=$(dirname -- "$_fps_dir") || return 2
@@ -110,13 +118,48 @@ _root() {
         /) ;;
         */) _sr=${_sr%/} ;;
     esac
+    # Resolve any existing store through symlinks, including the personal
+    # default and an explicitly configured SEC_STORE_DIR. Never silently
+    # reinterpret a dangling symlink as an uninitialized store.
+    if [ -L "$_sr" ] && [ ! -d "$_sr" ]; then
+        _error "store [$_sr] is a dangling or invalid symlink"
+        return 1
+    fi
     if [ -d "$_sr" ]; then
-        (cd "$_sr" 2>/dev/null && pwd -P)
+        (cd "$_sr" 2>/dev/null && pwd -P) || {
+            _error "store [$_sr] is not accessible"
+            return 1
+        }
     else
         case $_sr in
             /*) printf '%s\n' "$_sr" ;;
             *) printf '%s/%s\n' "$(pwd -P)" "$_sr" ;;
         esac
+    fi
+}
+
+# The logical project .sec owns the run manifests even if its store is
+# symlinked to an arbitrary physical path. Match the discovered store to the
+# selected canonical store before returning the project's .sec directory:
+# an explicit override must never pair another store with this project's run.
+_project_sec_dir() {
+    _ps_selected=$(_root) || return 1
+    if _ps_store=$(_find_project_store); then
+        _ps_resolved=$(cd "$_ps_store" 2>/dev/null && pwd -P) || return 1
+        [ "$_ps_resolved" = "$_ps_selected" ] || {
+            _error "selected store [$_ps_selected] is not the current project's store"
+            return 1
+        }
+        _ps_sec=${_ps_store%/store}
+        (cd "$_ps_sec" 2>/dev/null && pwd -P) || {
+            _error "project .sec [$_ps_sec] is not accessible"
+            return 1
+        }
+    else
+        _ps_rc=$?
+        [ "$_ps_rc" -eq 1 ] || return 1
+        _error "selected store [$_ps_selected] has no associated project .sec/store"
+        return 1
     fi
 }
 
@@ -139,9 +182,12 @@ _store_source() {
 _cmd_dir() {
     case $# in
         0) _root ;;
-        1) [ "$1" = --source ] || { _error 'usage: sec store dir [--source]'; return 1; }
-           _root >/dev/null && _store_source ;;
-        *) _error 'usage: sec store dir [--source]'; return 1 ;;
+        1) case $1 in
+               --source) _root >/dev/null && _store_source ;;
+               --project-sec) _project_sec_dir ;;
+               *) _error 'usage: sec store dir [--source|--project-sec]'; return 1 ;;
+           esac ;;
+        *) _error 'usage: sec store dir [--source|--project-sec]'; return 1 ;;
     esac
 }
 
@@ -339,20 +385,25 @@ _cmd_init() {
     }
     if [ "${1:-}" = --project ]; then
         _ci_cwd=$(pwd -P) || return 1
-        [ ! -L "$_ci_cwd/.sec" ] && [ ! -L "$_ci_cwd/.sec/store" ] || {
-            _error 'refusing symlinked .sec project store'
-            return 1
-        }
-        [ ! -e "$_ci_cwd/.sec" ] || [ -d "$_ci_cwd/.sec" ] || {
-            _error 'project .sec exists but is not a directory'
-            return 1
-        }
-        _ci_raw=$_ci_cwd/.sec/store
+        _ci_sec=$_ci_cwd/.sec
+        if [ -L "$_ci_sec" ] || [ -e "$_ci_sec" ]; then
+            [ -d "$_ci_sec" ] || {
+                _error "project .sec [$_ci_sec] is not a directory (possibly a dangling symlink)"
+                return 1
+            }
+        fi
+        _ci_raw=$_ci_sec/store
     else
         _ci_raw=$(_root_raw) || return 1
     fi
-    if [ -L "$_ci_raw" ] || { [ -e "$_ci_raw" ] && [ ! -d "$_ci_raw" ]; }; then
-        _error "cannot initialize store: [$_ci_raw] is not a regular directory"
+    # Following a valid link during an explicit init is intentional; never
+    # create directories behind a dangling link, however.
+    if [ -L "$_ci_raw" ] && [ ! -d "$_ci_raw" ]; then
+        _error "cannot initialize store: [$_ci_raw] is a dangling or invalid symlink"
+        return 1
+    fi
+    if [ -e "$_ci_raw" ] && [ ! -d "$_ci_raw" ]; then
+        _error "cannot initialize store: [$_ci_raw] is not a directory"
         return 1
     fi
     _ci_new=0

@@ -34,6 +34,7 @@ A manifest contains one directive per line: env ENTRY or file ENTRY[:ENV_VAR].
 Blank lines and # comments are ignored. Manifest content is data, never shell
 code. Named manifests resolve beside the selected project store in .sec/run/;
 explicit paths (./file, ../file or /absolute/file) work with any store.
+The project .sec or .sec/store may be a symlink to an existing directory.
 
 The .env format is literal, one NAME=VALUE per line; empty lines and lines
 beginning with # are ignored. No quotes, interpolation or shell syntax.
@@ -174,18 +175,13 @@ _manifest_path() {
     case $_mp_name in
         /*|./*|../*) printf '%s\n' "$_mp_name"; return 0 ;;
     esac
-    # A bare name means a project manifest; never silently take one from
-    # an ancestor unrelated to the store resolved by sec-store.
+    # Resolve the manifest from the logical .sec associated with the exact
+    # selected store. The physical store path may be anywhere when symlinked.
     _pin_store || return 1
-    case $_store_dir in
-        */.sec/store)
-            _mp_sec=${_store_dir%/store}
-            ;;
-        *)
-            _error "named manifest [$_mp_name] requires a project .sec/store; use ./path for an explicit manifest"
-            return 1
-            ;;
-    esac
+    _mp_sec=$("$_sec_bin" store dir --project-sec) || {
+        _error "named manifest [$_mp_name] requires the selected project .sec/store; use ./path for an explicit manifest"
+        return 1
+    }
     _valid_entry "$_mp_name" || { _error "invalid manifest name [$_mp_name]"; return 1; }
     _mp_rest=$_mp_name
     _mp_cur=$_mp_sec/run
