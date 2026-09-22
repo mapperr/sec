@@ -10,6 +10,7 @@ link bindir='$HOME/bin':
         echo "bindir does not exists" &&
         exit 1
     for f in {{core_name}}*; do
+    	chmod u+x "$f"
         [ -x "$f" ] || continue
         [ -h "$bindir/$f" ] &&
             echo "[$f] is already a symlink" &&
