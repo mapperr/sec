@@ -19,7 +19,7 @@ options:
     -f, --file ENTRY[:ENV_VAR]   materialize an entry and export its file path
                                 (repeatable; default ENV_VAR from basename)
     -m, --manifest NAME|PATH    load env/file entries from a declarative manifest
-                                (repeatable; NAME resolves in project .sec/run/)
+                                (repeatable; NAME resolves in selected sec/run/)
     --print                     display resolved variables, including secret values;
                                 file paths are placeholders, not usable runtime paths
     --env-only                  output resolved NAME=VALUE lines (no -f allowed)
@@ -32,9 +32,10 @@ Duplicate -f variable names/paths, and collisions between -e and -f, are errors.
 
 A manifest contains one directive per line: env ENTRY or file ENTRY[:ENV_VAR].
 Blank lines and # comments are ignored. Manifest content is data, never shell
-code. Named manifests resolve beside the selected project store in .sec/run/;
-explicit paths (./file, ../file or /absolute/file) work with any store.
-The project .sec or .sec/store may be a symlink to an existing directory.
+code. Named manifests resolve in the selected container's run/ directory
+(project .sec/run or personal ~/ .local/share/sec/run); explicit paths work
+with any store. ENTRY may be alias::name for read-only remote store access;
+aliases are declared in the selected container's stores file.
 
 The .env format is literal, one NAME=VALUE per line; empty lines and lines
 beginning with # are ignored. No quotes, interpolation or shell syntax.
@@ -117,14 +118,25 @@ _valid_entry() {
 }
 
 _canonical_entry() {
-	_entry=$1
-	case $_entry in *.age) _entry=${_entry%.age} ;; esac
-	_valid_entry "$_entry" || { _error "invalid entry name [$_entry]"; return 1; }
-	printf '%s\n' "$_entry"
+    _entry=$1
+    case $_entry in *.age) _entry=${_entry%.age} ;; esac
+    case $_entry in
+        *::*)
+            _ce_alias=${_entry%%::*}
+            _ce_path=${_entry#*::}
+            case $_ce_alias in ''|[!a-z]*|*[!a-z0-9_-]*) _error "invalid store alias [$_ce_alias]"; return 1 ;; esac
+            _valid_entry "$_ce_path" || { _error "invalid entry name [$_entry]"; return 1; }
+            printf '%s::%s\n' "$_ce_alias" "$_ce_path"
+            ;;
+        *) _valid_entry "$_entry" || { _error "invalid entry name [$_entry]"; return 1; }
+           printf '%s\n' "$_entry" ;;
+    esac
 }
 
 _derive_var() {
-	_base=${1##*/}
+    _dv_entry=$1
+    case $_dv_entry in *::*) _dv_entry=${_dv_entry#*::} ;; esac
+	_base=${_dv_entry##*/}
 	_derived=$(printf '%s' "$_base" | LC_ALL=C tr '[:lower:]' '[:upper:]' |
 		LC_ALL=C tr -c 'A-Z0-9_' '_') || return 1
 	case $_derived in [0-9]*) _derived=_$_derived ;; esac
@@ -140,34 +152,52 @@ _add_env() {
 }
 
 _add_file() {
-	_spec=$1
-	case $_spec in
-		*:*)
-			_entry=${_spec%%:*}
-			_var=${_spec#*:}
-			_valid_var "$_var" || { _error "invalid file variable name [$_var]"; return 1; }
-			;;
-		*) _entry=$_spec; _var= ;;
-	esac
-	_entry=$(_canonical_entry "$_entry") || return 1
-	[ -n "$_var" ] || _var=$(_derive_var "$_entry") || return 1
-	_has_line "$_var" "$_tmp/file-vars" && { _error "duplicate file variable [$_var]"; return 1; }
-	_has_line "$_entry" "$_tmp/file-paths" && { _error "duplicate file destination [$_entry]"; return 1; }
-	printf '%s\n' "$_var" >>"$_tmp/file-vars" || return 1
-	printf '%s\n' "$_entry" >>"$_tmp/file-paths" || return 1
-	printf '%s\n%s\n%s\n' "$_entry" "$_var" "$_entry" >>"$_tmp/file-specs" || return 1
+    _spec=$1
+    _af_explicit=0
+    # Parse an optional ENV_VAR after the qualified alias delimiter, not the
+    # colon inside alias::entry itself.
+    case $_spec in
+        *::*)
+            _af_alias=${_spec%%::*}
+            _af_tail=${_spec#*::}
+            case $_af_tail in
+                *:*) _entry=$_af_alias::${_af_tail%:*}; _var=${_af_tail##*:}; _af_explicit=1 ;;
+                *) _entry=$_spec; _var= ;;
+            esac
+            ;;
+        *:*) _entry=${_spec%:*}; _var=${_spec##*:}; _af_explicit=1 ;;
+        *) _entry=$_spec; _var= ;;
+    esac
+    if [ "$_af_explicit" -eq 1 ]; then
+        _valid_var "$_var" || { _error "invalid file variable name [$_var]"; return 1; }
+    fi
+    _entry=$(_canonical_entry "$_entry") || return 1
+    [ -n "$_var" ] || _var=$(_derive_var "$_entry") || return 1
+    _af_rel=$_entry
+    case $_entry in *::*) _af_rel=${_entry%%::*}/${_entry#*::} ;; esac
+    _has_line "$_var" "$_tmp/file-vars" && { _error "duplicate file variable [$_var]"; return 1; }
+    _has_line "$_af_rel" "$_tmp/file-paths" && { _error "duplicate file destination [$_af_rel]"; return 1; }
+    printf '%s\n' "$_var" >>"$_tmp/file-vars" || return 1
+    printf '%s\n' "$_af_rel" >>"$_tmp/file-paths" || return 1
+    printf '%s\n%s\n%s\n' "$_entry" "$_var" "$_af_rel" >>"$_tmp/file-specs" || return 1
 }
 
 # Pin the store once so every entry in this run uses the same store, even if
 # the command was invoked from a nested directory or used a named manifest.
 _pin_store() {
     [ -n "${_store_dir:-}" ] && return 0
-    _store_dir=$("$_sec_bin" store dir) || {
-        _error 'cannot resolve store directory'
-        return 1
+    # Capture the logical container before SEC_STORE_DIR becomes an explicit
+    # physical path. This preserves project stores whose store/ is a symlink,
+    # and also supports named manifests in the personal sec/run directory.
+    _container_root=$("$_sec_bin" store root) || {
+        _error 'cannot resolve sec container'; return 1;
     }
+    _store_dir=$("$_sec_bin" store dir) || {
+        _error 'cannot resolve store directory'; return 1;
+    }
+    SEC_STORE_CONTEXT_ROOT=$_container_root
     SEC_STORE_DIR=$_store_dir
-    export SEC_STORE_DIR
+    export SEC_STORE_CONTEXT_ROOT SEC_STORE_DIR
 }
 
 _manifest_path() {
@@ -175,16 +205,10 @@ _manifest_path() {
     case $_mp_name in
         /*|./*|../*) printf '%s\n' "$_mp_name"; return 0 ;;
     esac
-    # Resolve the manifest from the logical .sec associated with the exact
-    # selected store. The physical store path may be anywhere when symlinked.
     _pin_store || return 1
-    _mp_sec=$("$_sec_bin" store dir --project-sec) || {
-        _error "named manifest [$_mp_name] requires the selected project .sec/store; use ./path for an explicit manifest"
-        return 1
-    }
     _valid_entry "$_mp_name" || { _error "invalid manifest name [$_mp_name]"; return 1; }
     _mp_rest=$_mp_name
-    _mp_cur=$_mp_sec/run
+    _mp_cur=$_container_root/run
     [ ! -L "$_mp_cur" ] || { _error "symlinked manifest directory [$_mp_cur]"; return 1; }
     while :; do
         case $_mp_rest in
@@ -195,11 +219,23 @@ _manifest_path() {
         [ ! -L "$_mp_cur" ] || { _error "symlinked manifest path [$_mp_cur]"; return 1; }
         [ -n "$_mp_rest" ] || break
     done
+    # A versioned project manifest must not depend on developer-local aliases.
+    _mp_project=$("$_sec_bin" store dir --project-sec 2>/dev/null) || _mp_project=
+    [ -z "$_mp_project" ] || { SEC_STORE_PROJECT_ONLY=1; export SEC_STORE_PROJECT_ONLY; }
     printf '%s\n' "$_mp_cur"
 }
 
 _load_manifest() {
     _lm_path=$(_manifest_path "$1") || return 1
+    case $1 in
+        /*|./*|../*) ;;
+        *)
+            if "$_sec_bin" store dir --project-sec >/dev/null 2>&1; then
+                SEC_STORE_PROJECT_ONLY=1
+                export SEC_STORE_PROJECT_ONLY
+            fi
+            ;;
+    esac
     [ -f "$_lm_path" ] && [ -r "$_lm_path" ] && [ ! -L "$_lm_path" ] || {
         _error "manifest [$_lm_path] is not a readable regular file"
         return 1

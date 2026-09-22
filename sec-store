@@ -11,25 +11,32 @@ $s
 
 commands:
     init [--project]             initialize personal/current or project store
-    dir [--source|--project-sec] print store path, source or associated project .sec
-    put <name> [file]            store stdin or file as <name>
-    get <name>                   decrypt <name> to stdout
-    edit <name>                  edit <name> without plaintext in the store
-    ls [prefix]                  list secrets
-    rm <name> [<name> ...]       remove secrets
+    dir [--source|--project-sec] print selected store, source or project root
+    root                         print the selected sec container (stores/store/run)
+    stores edit|path             edit or locate the current container's stores file
+    sources                      list available store aliases and sources
+    update <alias>|--all         refresh remote stores explicitly
+    put <name> [file]            encrypt stdin or file (local store only)
+    get <name>                   decrypt an entry; alias::name selects another store
+    edit <name>                  edit a local secret
+    ls [prefix|alias::[prefix]]  list local entries or an aliased store
+    rm <name> [<name> ...]       remove local secrets
     policy <name>                show the effective recipient policy
-    rekey [prefix]               re-encrypt secrets using current policies
-    check                        validate store structure and ciphertexts
-    git|g [args ...]             run git in SEC_STORE_DIR (default: status)
+    rekey [prefix]               re-encrypt local secrets using current policies
+    check                        validate local store structure and ciphertexts
+    git|g [args ...]             run git in selected local store (default: status)
 
 env vars:
     SEC_STORE_DIR                store directory
-                                 default: \${XDG_DATA_HOME:-~/.local/share}/sec
+                                 default: \${XDG_DATA_HOME:-~/.local/share}/sec/store
     SEC_STORE_SEC                sec executable
                                  default: sec
     SEC_STORE_EDITOR             editor executable
                                  default: \$VISUAL, \$EDITOR, vi
     SEC_STORE_CHECK_DECRYPT      if non-empty, try decrypting secrets during check
+    SEC_STORE_CACHE_DIR          remote cache (default: ${XDG_CACHE_HOME:-~/.cache}/sec/stores)
+    SEC_STORE_OFFLINE            if 1, do not fetch missing remote stores
+    SEC_STORE_PROJECT_ONLY       if 1, do not use personal aliases as fallback
     SEC_STORE_DEBUG              enable debug messages
 
 recipient policies:
@@ -46,6 +53,8 @@ notes:
     init --project creates .sec/store in the current directory.
     Valid symlinks for .sec, .sec/store and the personal store are supported.
     Symlinks within a store (secrets/policies) remain forbidden.
+    Store containers contain store/, optional stores, and optional run/.
+    Remote aliases are read-only; their repository is fetched on first use.
 EOF
 }
 
@@ -109,7 +118,7 @@ _root_raw() {
         _error 'no .sec/store found; SEC_STORE_REQUIRE_PROJECT=1 forbids personal fallback'
         return 1
     fi
-    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/sec"
+    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/sec/store"
 }
 
 _root() {
@@ -161,6 +170,60 @@ _project_sec_dir() {
         _error "selected store [$_ps_selected] has no associated project .sec/store"
         return 1
     fi
+}
+
+
+# The container is the logical parent of store/, not necessarily the parent of
+# its physical destination (when store/ itself is a symlink).
+_personal_container() {
+    printf '%s\n' "${XDG_DATA_HOME:-$HOME/.local/share}/sec"
+}
+
+_container() {
+    _ct_store=$(_root) || return 1
+    # sec-run pins the physical store but preserves its logical container.
+    if [ -n "${SEC_STORE_CONTEXT_ROOT:-}" ]; then
+        _ct_candidate=$SEC_STORE_CONTEXT_ROOT
+        [ -d "$_ct_candidate" ] && [ -d "$_ct_candidate/store" ] || {
+            _error "invalid store context [$_ct_candidate]"; return 1;
+        }
+        _ct_actual=$(cd "$_ct_candidate/store" && pwd -P) || return 1
+        [ "$_ct_actual" = "$_ct_store" ] || {
+            _error 'store context does not match selected store'; return 1;
+        }
+        (cd "$_ct_candidate" && pwd -P)
+        return
+    fi
+    if [ "${SEC_STORE_DIR+x}" = x ]; then
+        # In the new layout an explicit store must be selected through its
+        # logical store/ pathname; physical symlinks are fine.
+        case ${SEC_STORE_DIR%/} in
+            */store) _ct_candidate=${SEC_STORE_DIR%/store} ;;
+            *) _error 'SEC_STORE_DIR must point to a container/store directory'; return 1 ;;
+        esac
+        [ -d "$_ct_candidate" ] || { _error "missing store container [$_ct_candidate]"; return 1; }
+        (cd "$_ct_candidate" && pwd -P)
+        return
+    fi
+    if _ct_project=$(_find_project_store); then
+        _ct_candidate=${_ct_project%/store}
+        (cd "$_ct_candidate" && pwd -P)
+    else
+        _ct_rc=$?
+        [ "$_ct_rc" -eq 1 ] || return 1
+        _ct_candidate=$(_personal_container) || return 1
+        # A personal container/store symlink is permitted, as for projects.
+        [ -d "$_ct_candidate" ] || {
+            _error "personal store container [$_ct_candidate] does not exist; run 'sec store init'"
+            return 1
+        }
+        (cd "$_ct_candidate" && pwd -P)
+    fi
+}
+
+_cmd_root() {
+    [ "$#" -eq 0 ] || { _error 'usage: sec store root'; return 1; }
+    _container
 }
 
 _store_source() {
@@ -239,7 +302,7 @@ _normalize_name() {
 			_error "invalid secret name [$1]"
 			return 1
 			;;
-		.recipients|*/.recipients|.git|.git/*)
+		.recipients|*/.recipients|.git|.git/*|*:* )
 			_error "reserved secret name [$1]"
 			return 1
 			;;
@@ -414,6 +477,237 @@ _cmd_init() {
     _info "store initialized at [$_ci_root]"
 }
 
+
+# Public sources are declarative, one "alias source" per line. Never source/eval.
+# Validate the entire file, not just the requested alias. A malformed project
+# file must not silently fall back to a personal alias.
+_sources_file() {
+    _sf_root=$(_container) || return 1
+    printf '%s/stores\n' "$_sf_root"
+}
+
+_read_alias() {
+    _ra_file=$1 _ra_key=${2:-}
+    [ ! -L "$_ra_file" ] || { _error "refusing symlink stores file [$_ra_file]"; return 1; }
+    [ ! -e "$_ra_file" ] && return 3
+    [ -f "$_ra_file" ] && [ -r "$_ra_file" ] || {
+        _error "stores file [$_ra_file] is not readable"; return 1;
+    }
+    LC_ALL=C awk -v key="$_ra_key" '
+        /^[[:space:]]*(#|$)/ { next }
+        {
+            if (NF != 2 || $1 !~ /^[a-z][a-z0-9_-]*$/ ||
+                $2 !~ /^git\+(ssh|https):\/\// || seen[$1]++) {
+                printf "sec-store: error: invalid/duplicate store declaration at %s:%d\n", FILENAME, FNR > "/dev/stderr"
+                bad=1; next
+            }
+            if (key == "" || key == $1) print $1 " " $2
+            if (key == $1) found=1
+        }
+        END { if (bad) exit 2; if (key != "" && !found) exit 3 }
+    ' "$_ra_file"
+}
+
+_alias_source() {
+    _as_alias=$1
+    _as_file=$(_sources_file) || return 1
+    _as_result=$(_read_alias "$_as_file" "$_as_alias")
+    _as_rc=$?
+    if [ "$_as_rc" -eq 0 ]; then
+        printf '%s\n' "${_as_result#* }"
+        return 0
+    fi
+    [ "$_as_rc" -eq 3 ] || return 1
+    if [ "${SEC_STORE_PROJECT_ONLY:-0}" != 1 ]; then
+        _as_personal=$(_personal_container) || return 1
+        if [ -d "$_as_personal" ]; then
+            _as_file=$(cd "$_as_personal" 2>/dev/null && pwd -P)/stores || return 1
+            _as_result=$(_read_alias "$_as_file" "$_as_alias")
+            _as_rc=$?
+            if [ "$_as_rc" -eq 0 ]; then
+                printf '%s\n' "${_as_result#* }"
+                return 0
+            fi
+            [ "$_as_rc" -eq 3 ] || return 1
+        fi
+    fi
+    _error "unknown store alias [$_as_alias]"
+    return 1
+}
+
+_cmd_sources() {
+    [ "$#" -eq 0 ] || { _error 'usage: sec store sources'; return 1; }
+    _so_file=$(_sources_file) || return 1
+    _so_primary=$(_read_alias "$_so_file" '')
+    _so_rc=$?
+    [ "$_so_rc" -eq 0 ] || [ "$_so_rc" -eq 3 ] || return 1
+    [ -z "$_so_primary" ] || printf '%s\n' "$_so_primary"
+    if [ "${SEC_STORE_PROJECT_ONLY:-0}" != 1 ]; then
+        _so_personal=$(_personal_container) || return 1
+        _so_here=$(_container) || return 1
+        _so_personal=$(cd "$_so_personal" 2>/dev/null && pwd -P) || return 0
+        if [ "$_so_personal" != "$_so_here" ]; then
+            _so_other=$(_read_alias "$_so_personal/stores" '')
+            _so_rc=$?
+            [ "$_so_rc" -eq 0 ] || [ "$_so_rc" -eq 3 ] || return 1
+            if [ -n "$_so_other" ]; then
+                printf '%s\n' "$_so_other" | while IFS=' ' read -r _so_alias _so_url; do
+                    printf '%s\n' "$_so_primary" | grep -Eq "^$_so_alias " || printf '%s %s\n' "$_so_alias" "$_so_url"
+                done
+            fi
+        fi
+    fi
+}
+
+_cmd_stores() {
+    case ${1:-} in
+        edit)
+            [ "$#" -eq 1 ] || { _error 'usage: sec store stores edit|path'; return 1; }
+            _ss_file=$(_sources_file) || return 1
+            [ ! -L "$_ss_file" ] || { _error 'refusing symlink stores file'; return 1; }
+            [ ! -e "$_ss_file" ] || [ -f "$_ss_file" ] || { _error 'stores path is not a file'; return 1; }
+            [ -e "$_ss_file" ] || : >"$_ss_file" || return 1
+            _ss_editor=$(_editor) || return 1
+            "$_ss_editor" "$_ss_file"
+            ;;
+        path)
+            [ "$#" -eq 1 ] || { _error 'usage: sec store stores edit|path'; return 1; }
+            _sources_file
+            ;;
+        *) _error 'usage: sec store stores edit|path'; return 1 ;;
+    esac
+}
+
+_remote_cache_root() {
+    _rc_root=${SEC_STORE_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/sec/stores}
+    [ ! -L "$_rc_root" ] || { _error "refusing symlink cache root [$_rc_root]"; return 1; }
+    if [ ! -d "$_rc_root" ]; then
+        mkdir -p -m 700 -- "$_rc_root" || return 1
+    fi
+    [ -d "$_rc_root" ] && [ -r "$_rc_root" ] && [ -w "$_rc_root" ] && [ -x "$_rc_root" ] || return 1
+    _rc_physical=$(cd "$_rc_root" && pwd -P) || return 1
+    # Refuse a pre-existing group/world-accessible root, even though cached
+    # objects are ciphertext: store metadata and URLs may be confidential.
+    _rc_perm=$(stat -c %a "$_rc_physical") || return 1
+    _rc_owner=$(stat -c %u "$_rc_physical") || return 1
+    [ "$_rc_owner" = "$(id -u)" ] || { _error 'remote cache root must be owned by current user'; return 1; }
+    [ "$((0$_rc_perm & 077))" -eq 0 ] || { _error 'remote cache root must not be accessible by group/others'; return 1; }
+    printf '%s\n' "$_rc_physical"
+}
+
+_remote_backend() {
+    case $1 in
+        git+ssh://*|git+https://*)
+            command -v sec-store-remote-git || { _error 'install sec-store-remote-git'; return 1; } ;;
+        *) _error "unsupported remote source [$1]"; return 1 ;;
+    esac
+}
+
+# Snapshots are immutable after publication. Updates publish a new snapshot
+# by atomically switching a small 'current' file. Existing readers retain a
+# usable path even while another process updates the same alias.
+_remote_resolve() (
+    _rs_source=$1 _rs_update=$2
+    _rs_backend=$(_remote_backend "$_rs_source") || exit 1
+    _rs_base=$(_remote_cache_root) || exit 1
+    _rs_id=$(printf '%s' "$_rs_source" | git hash-object --stdin) || exit 1
+    _rs_parent=$_rs_base/$_rs_id
+    [ ! -L "$_rs_parent" ] || { _error 'remote cache entry is a symlink'; exit 1; }
+    mkdir -p -m 700 -- "$_rs_parent" || exit 1
+    _rs_lock=$_rs_parent/lock
+    [ ! -L "$_rs_lock" ] || { _error 'remote cache lock is a symlink'; exit 1; }
+    command -v flock >/dev/null 2>&1 || { _error 'remote stores require flock'; exit 1; }
+    exec 9>"$_rs_lock" || exit 1
+    flock -x 9 || exit 1
+    _rs_current=$_rs_parent/current
+    [ ! -L "$_rs_current" ] || { _error 'remote cache current is a symlink'; exit 1; }
+    _rs_version=
+    if [ -f "$_rs_current" ]; then
+        IFS= read -r _rs_version <"$_rs_current" || :
+        case $_rs_version in
+            snap.*) case ${_rs_version#snap.} in ''|*[!A-Za-z0-9]*) _error 'invalid remote cache pointer'; exit 1 ;; esac ;;
+            *) _error 'invalid remote cache pointer'; exit 1 ;;
+        esac
+        [ -d "$_rs_parent/$_rs_version/store" ] && [ ! -L "$_rs_parent/$_rs_version" ] || {
+            _error 'invalid remote cache snapshot'; exit 1;
+        }
+        "$_rs_backend" check "$_rs_source" "$_rs_parent/$_rs_version" || exit 1
+    fi
+    if [ -z "$_rs_version" ] || [ "$_rs_update" = 1 ]; then
+        if [ "${SEC_STORE_OFFLINE:-0}" = 1 ]; then
+            _error 'remote store unavailable/outdated in offline mode'; exit 1
+        fi
+        _rs_tmp=$(mktemp -d "$_rs_parent/.fetch.XXXXXXXX") || exit 1
+        trap 'rm -rf -- "$_rs_tmp"' 0
+        _rs_action=fetch
+        [ "$_rs_update" != 1 ] || _rs_action=update
+        "$_rs_backend" "$_rs_action" "$_rs_source" "$_rs_tmp" || exit 1
+        [ -d "$_rs_tmp/store" ] && [ ! -L "$_rs_tmp/store" ] || {
+            _error 'remote repository has no regular store/ directory'; exit 1;
+        }
+        _rs_token=${_rs_tmp##*.fetch.}
+        _rs_version=snap.$_rs_token
+        mv -- "$_rs_tmp" "$_rs_parent/$_rs_version" || exit 1
+        _rs_tmp=
+        _rs_pointer=$(mktemp "$_rs_parent/.current.XXXXXX") || exit 1
+        trap 'rm -f -- "$_rs_pointer"' 0
+        printf '%s\n' "$_rs_version" >"$_rs_pointer" || exit 1
+        mv -f -- "$_rs_pointer" "$_rs_current" || exit 1
+        _rs_pointer=
+    fi
+    printf '%s/store\n' "$_rs_parent/$_rs_version"
+)
+
+# A qualified entry is alias::path. Only read-only commands resolve aliases;
+# the remaining commands always target the selected local/project store.
+_split_entry() {
+    _se_input=$1
+    _se_alias= _se_entry=$_se_input
+    case $_se_input in
+        *::*)
+            _se_alias=${_se_input%%::*}
+            _se_entry=${_se_input#*::}
+            case $_se_alias in ''|*[!a-z0-9_-]*|[!a-z]*) _error 'invalid store alias'; return 1 ;; esac
+            [ -n "$_se_entry" ] || { _error 'missing qualified entry'; return 1; }
+            ;;
+        *:*) _error 'invalid entry name (use alias::entry)'; return 1 ;;
+    esac
+}
+
+# Set SEC_STORE_DIR for a single read-only operation. It is deliberately
+# scoped to a subshell: the caller's selected local store remains unchanged.
+_with_entry_store() (
+    _we_command=$1 _we_name=$2
+    _split_entry "$_we_name" || exit 1
+    if [ -n "$_se_alias" ]; then
+        _we_source=$(_alias_source "$_se_alias") || exit 1
+        SEC_STORE_DIR=$(_remote_resolve "$_we_source" 0) || exit 1
+        unset SEC_STORE_CONTEXT_ROOT
+        export SEC_STORE_DIR
+    fi
+    "$_we_command" "$_se_entry"
+)
+
+_cmd_update() {
+    [ "$#" -eq 1 ] || { _error 'usage: sec store update <alias>|--all'; return 1; }
+    if [ "$1" = --all ]; then
+        _cu_file=$(_sources_file) || return 1
+        _cu_lines=$(_read_alias "$_cu_file" '') || {
+            _cu_rc=$?; [ "$_cu_rc" -eq 3 ] || return 1;
+        }
+        [ -n "$_cu_lines" ] || return 0
+        _cu_status=0
+        printf '%s\n' "$_cu_lines" | while IFS=' ' read -r _cu_alias _cu_source; do
+            _remote_resolve "$_cu_source" 1 >/dev/null || exit 1
+            _info "updated remote store [$_cu_alias]"
+        done
+        return $?
+    fi
+    _cu_source=$(_alias_source "$1") || return 1
+    _remote_resolve "$_cu_source" 1 >/dev/null || return 1
+    _info "updated remote store [$1]"
+}
+
 _cmd_put() (
 	[ "$#" -ge 1 ] && [ "$#" -le 2 ] ||
 		{ _error 'usage: sec store put <name> [file]'; exit 1; }
@@ -465,6 +759,7 @@ _cmd_put() (
 
 _cmd_get() {
 	[ "$#" -eq 1 ] || { _error 'usage: sec store get <name>'; return 1; }
+    case $1 in *::*) _with_entry_store _cmd_get "$1"; return $? ;; esac
 	_require_store || return 1
 
 	_cg_path=$(_secret_path "$1") || return 1
@@ -587,7 +882,22 @@ _list_under() {
 }
 
 _cmd_ls() {
-	[ "$#" -le 1 ] || { _error 'usage: sec store ls [prefix]'; return 1; }
+	[ "$#" -le 1 ] || { _error 'usage: sec store ls [prefix|alias::[prefix]]'; return 1; }
+    case ${1:-} in
+        *::*)
+            _cl_alias=${1%%::*} _cl_rem=${1#*::}
+            _cl_source=$(_alias_source "$_cl_alias") || return 1
+            _cl_remote=$(_remote_resolve "$_cl_source" 0) || return 1
+            if [ -n "$_cl_rem" ]; then
+                _cl_list=$(SEC_STORE_DIR=$_cl_remote SEC_STORE_CONTEXT_ROOT= "$0" ls "$_cl_rem") || return 1
+                [ -z "$_cl_list" ] || printf '%s\n' "$_cl_list" | sed "s|^|$_cl_alias::|"
+            else
+                _cl_list=$(SEC_STORE_DIR=$_cl_remote SEC_STORE_CONTEXT_ROOT= "$0" ls) || return 1
+                [ -z "$_cl_list" ] || printf '%s\n' "$_cl_list" | sed "s|^|$_cl_alias::|"
+            fi
+            return $?
+            ;;
+    esac
 	_require_store || return 1
 
 	_cl_root=$(_root) || return 1
@@ -632,6 +942,7 @@ _cmd_rm() {
 
 _cmd_policy() {
 	[ "$#" -eq 1 ] || { _error 'usage: sec store policy <name>'; return 1; }
+    case $1 in *::*) _with_entry_store _cmd_policy "$1"; return $? ;; esac
 	_require_store || return 1
 
 	_cpo_path=$(_secret_path "$1") || return 1
@@ -847,6 +1158,10 @@ main() {
 	case $_m_cmd in
 		init)   _cmd_init "$@" ;;
 		dir)    _cmd_dir "$@" ;;
+        root)   _cmd_root "$@" ;;
+        stores) _cmd_stores "$@" ;;
+        sources) _cmd_sources "$@" ;;
+        update) _cmd_update "$@" ;;
 		put)    _cmd_put "$@" ;;
 		get)    _cmd_get "$@" ;;
 		get1)   _cmd_get1 "$@" ;;

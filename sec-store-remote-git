@@ -1,0 +1,111 @@
+#!/bin/sh
+# Git transport for sec-store. Only git+ssh:// and git+https:// are accepted.
+# Called by sec-store as: fetch|update|check SOURCE DESTINATION.
+umask 077
+set -f
+
+_error() { printf 'sec-store-remote-git: error: %s\n' "$1" >&2; return 1; }
+_usage() {
+    printf 'usage: sec-store-remote-git fetch|update|check git+ssh://URL|git+https://URL[#COMMIT] DESTINATION\n' >&2
+    return 2
+}
+_parse_source() {
+    _src=$1
+    case $_src in
+        git+ssh://*)   _url=${_src#git+} ;;
+        git+https://*) _url=${_src#git+} ;;
+        *) _error "unsupported source [$_src]"; return 1 ;;
+    esac
+    _commit=
+    case $_url in
+        *'#'*) _commit=${_url##*'#'}; _url=${_url%#*}
+            case $_commit in ''|*[!0-9a-fA-F]*) _error 'invalid commit fragment'; return 1 ;; esac
+            case ${#_commit} in 40|64) ;; *) _error 'pin a full Git commit hash (40 or 64 hexadecimal characters)'; return 1 ;; esac
+            ;;
+    esac
+    case $_url in
+        ssh://*|https://*) ;;
+        *) _error 'invalid Git URL'; return 1 ;;
+    esac
+    case $_url in
+        *[[:space:]]*|*'\'*|*'?'*|*'#'*) _error 'invalid Git URL characters'; return 1 ;;
+    esac
+    # No fragments other than an exact commit. Reject embedded HTTP passwords:
+    # a remote URL appears in Git metadata, logs and potentially process lists.
+    case $_url in https://*@*) _error 'do not embed credentials in HTTPS store URLs'; return 1 ;; esac
+}
+
+_check() {
+    _parse_source "$1" || return 1
+    _dst=$2
+    [ -d "$_dst" ] && [ ! -L "$_dst" ] &&
+    [ -d "$_dst/store" ] && [ ! -L "$_dst/store" ] &&
+    [ -d "$_dst/.sec-remote-git" ] && [ ! -L "$_dst/.sec-remote-git" ] || {
+        _error "invalid cached Git store [$_dst]"; return 1;
+    }
+    _origin=$(git -C "$_dst/.sec-remote-git" config --get remote.origin.url) || return 1
+    [ "$_origin" = "$_url" ] || { _error 'cached Git source mismatch'; return 1; }
+    [ -f "$_dst/.sec-remote-commit" ] && [ ! -L "$_dst/.sec-remote-commit" ] || return 1
+    IFS= read -r _got <"$_dst/.sec-remote-commit" || return 1
+    case $_got in ''|*[!0-9a-fA-F]*) _error 'invalid cached commit'; return 1 ;; esac
+    [ -z "$_commit" ] || [ "$_got" = "$_commit" ] || {
+        _error 'cached commit does not match pinned revision'; return 1;
+    }
+    git -C "$_dst/.sec-remote-git" cat-file -e "$_got^{commit}" 2>/dev/null || return 1
+    # A store must never follow symlinks hidden in a fetched repository.
+    [ -z "$(find "$_dst" -type l -print -quit)" ] || { _error 'symlink in remote cache'; return 1; }
+}
+
+_fetch() {
+    _parse_source "$1" || return 1
+    _dst=$2
+    [ -d "$_dst" ] && [ ! -L "$_dst" ] || { _error 'destination must be an existing real directory'; return 1; }
+    [ -z "$(find "$_dst" -mindepth 1 -print -quit)" ] || { _error 'destination must be empty'; return 1; }
+    command -v git >/dev/null 2>&1 || { _error 'git is required'; return 1; }
+    command -v tar >/dev/null 2>&1 || { _error 'tar is required'; return 1; }
+    # --no-checkout prevents .gitattributes filters and checkout hooks from
+    # processing secrets. The repository is archived as raw Git blobs below.
+    git -c core.hooksPath=/dev/null -c protocol.file.allow=never -c protocol.ext.allow=never \
+        clone -q --no-checkout -- "$_url" "$_dst/.sec-remote-git" || {
+            _error 'git clone failed'; return 1;
+        }
+    if [ -n "$_commit" ]; then
+        if ! git -C "$_dst/.sec-remote-git" cat-file -e "$_commit^{commit}" 2>/dev/null; then
+            git -C "$_dst/.sec-remote-git" -c protocol.file.allow=never -c protocol.ext.allow=never \
+                fetch -q --no-tags origin "$_commit" || return 1
+        fi
+        _selected=$(git -C "$_dst/.sec-remote-git" rev-parse "$_commit^{commit}") || return 1
+        [ "$_selected" = "$_commit" ] || { _error 'commit pin mismatch'; return 1; }
+    else
+        _selected=$(git -C "$_dst/.sec-remote-git" rev-parse 'HEAD^{commit}') || return 1
+    fi
+    # Internal transport metadata is reserved; untrusted repositories must
+    # never overwrite the clone's config or its recorded source/commit.
+    [ -z "$(git -C "$_dst/.sec-remote-git" ls-tree "$_selected" -- .sec-remote-git .sec-remote-commit)" ] || {
+        _error 'remote repository uses reserved sec-store metadata names'; return 1;
+    }
+    # Git tracks regular files, symlinks and gitlinks. Reject links/submodules
+    # before extracting an archive so tar cannot follow an attacker-chosen link.
+    git -C "$_dst/.sec-remote-git" ls-tree -r "$_selected" |
+        grep -Eq '^(120000|160000) ' && {
+            _error 'remote store must not contain symlinks or submodules'; return 1;
+        }
+    git -C "$_dst/.sec-remote-git" archive --format=tar "$_selected" |
+        tar -xf - -C "$_dst" || { _error 'cannot extract store content'; return 1; }
+    [ -d "$_dst/store" ] && [ ! -L "$_dst/store" ] || {
+        _error 'remote repository does not contain a regular store/ directory'; return 1;
+    }
+    [ -z "$(find "$_dst" -type l -print -quit)" ] || {
+        _error 'remote repository contains symlinks'; return 1;
+    }
+    printf '%s\n' "$_selected" >"$_dst/.sec-remote-commit" || return 1
+    _check "$1" "$_dst"
+}
+
+[ "$#" -eq 3 ] || { _usage; exit $?; }
+_action=$1 _source=$2 _destination=$3
+case $_action in
+    fetch|update) _fetch "$_source" "$_destination" ;;
+    check) _check "$_source" "$_destination" ;;
+    *) _usage ;;
+esac
