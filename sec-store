@@ -25,6 +25,7 @@ commands:
     rekey [prefix]               re-encrypt local secrets using current policies
     check                        validate local store structure and ciphertexts
     git|g [args ...]             run git in selected local store (default: status)
+    y [message ...]               git sync: add/commit sec container, pull --rebase, push
 
 env vars:
     SEC_STORE_DIR                store directory
@@ -1150,6 +1151,133 @@ _cmd_git() {
 	git -C "$_cgit_root" "$@"
 }
 
+
+# Sync the selected sec container using the same workflow as tsk/trk:
+# stage the managed data, commit it when needed, pull --rebase, then push.
+# A project container can live inside a larger repository, so stage/commit only
+# the sec container and leave unrelated staged changes untouched.
+_cmd_y() (
+	_require_store || exit 1
+	command -v git >/dev/null 2>&1 || {
+		_error 'git not found'
+		exit 1
+	}
+
+	_cy_store=$(_root) || exit 1
+	_cy_container=$(_container) || exit 1
+	_cy_scope=
+	_cy_top=
+
+	# Prefer the repository that contains the physical selected store. This is
+	# important when container/store is a symlink to a separately versioned
+	# secrets repository. If store and logical container belong to the same
+	# repository, sync the whole container so stores and run/ are included too.
+	if _cy_store_top=$(git -C "$_cy_store" rev-parse --show-toplevel 2>/dev/null); then
+		_cy_top=$_cy_store_top
+		if _cy_container_top=$(git -C "$_cy_container" rev-parse --show-toplevel 2>/dev/null) &&
+		   [ "$_cy_container_top" = "$_cy_store_top" ]; then
+			_cy_scope=$_cy_container
+		else
+			# A physical .../store directory normally belongs to a complete sec
+			# container in its parent (store/, stores, run/). In that case sync
+			# the container rather than only the encrypted entry directory.
+			_cy_parent=$(dirname -- "$_cy_store") || exit 1
+			if [ "${_cy_store##*/}" = store ] &&
+			   _cy_parent_top=$(git -C "$_cy_parent" rev-parse --show-toplevel 2>/dev/null) &&
+			   [ "$_cy_parent_top" = "$_cy_store_top" ]; then
+				_cy_scope=$_cy_parent
+			else
+				_cy_scope=$_cy_store
+			fi
+		fi
+	elif _cy_container_top=$(git -C "$_cy_container" rev-parse --show-toplevel 2>/dev/null); then
+		# No repository at the physical store: fall back to the logical sec
+		# container, preserving the normal project layout behaviour.
+		_cy_top=$_cy_container_top
+		_cy_scope=$_cy_container
+	else
+		_error "selected store [$_cy_store] and sec container [$_cy_container] are not inside a Git repository"
+		exit 1
+	fi
+
+	_cy_message=${*:-sync}
+
+	# tsk/trk own their Git repositories. A sec container may instead live in a
+	# larger application repository: never stage/commit unrelated files, and
+	# refuse to start a sync that pull --rebase could not safely run.
+	_cy_prefix=$(git -C "$_cy_scope" rev-parse --show-prefix) || exit 1
+	if [ -n "$_cy_prefix" ]; then
+		_cy_prefix=${_cy_prefix%/}
+		_cy_outside=$(git -C "$_cy_top" status --porcelain -- . \
+			":(exclude,top)$_cy_prefix" \
+			":(exclude,top)$_cy_prefix/**") || exit 1
+		[ -z "$_cy_outside" ] || {
+			_error 'Git repository has changes outside the sec sync scope; commit or stash them before sync'
+			exit 1
+		}
+	fi
+
+	_debug "git sync scope [$_cy_scope] (repository [$_cy_top])"
+
+	git -C "$_cy_scope" add -A -- . || {
+		_error 'git add failed'
+		exit 1
+	}
+
+	if ! git -C "$_cy_scope" diff --cached --quiet -- .; then
+		git -C "$_cy_scope" commit --only -m "$_cy_message" -- . || {
+			_error 'git commit failed'
+			exit 1
+		}
+	else
+		_info 'nothing to commit'
+	fi
+
+	if git -C "$_cy_scope" rev-parse --abbrev-ref --symbolic-full-name '@{upstream}' >/dev/null 2>&1; then
+		git -C "$_cy_scope" pull --rebase || {
+			_error 'git pull --rebase failed'
+			exit 1
+		}
+		git -C "$_cy_scope" push || {
+			_error 'git push failed'
+			exit 1
+		}
+		exit 0
+	fi
+
+	# First push of a new branch/repository: mirror tsk's convenience by
+	# selecting origin when present, otherwise the only configured remote.
+	_cy_branch=$(git -C "$_cy_scope" symbolic-ref --quiet --short HEAD) || {
+		_error 'current Git HEAD is detached and has no upstream'
+		exit 1
+	}
+
+	_cy_remote=$(git -C "$_cy_scope" config --get "branch.$_cy_branch.remote" 2>/dev/null || :)
+	[ "$_cy_remote" != . ] || _cy_remote=
+
+	if [ -z "$_cy_remote" ]; then
+		if git -C "$_cy_scope" remote | grep -Fx origin >/dev/null 2>&1; then
+			_cy_remote=origin
+		else
+			_cy_remotes=$(git -C "$_cy_scope" remote)
+			_cy_count=$(printf '%s\n' "$_cy_remotes" | awk 'NF { n++ } END { print n+0 }')
+			if [ "$_cy_count" -eq 1 ]; then
+				_cy_remote=$_cy_remotes
+			fi
+		fi
+	fi
+
+	[ -n "$_cy_remote" ] || {
+		_error "branch [$_cy_branch] has no upstream and no unambiguous Git remote"
+		exit 1
+	}
+
+	git -C "$_cy_scope" push -u "$_cy_remote" HEAD || {
+		_error 'initial git push failed'
+		exit 1
+	}
+)
+
 main() {
 	[ "$#" -gt 0 ] || { usage; exit 0; }
 	_m_cmd=$1
@@ -1172,6 +1300,7 @@ main() {
 		rekey)  _cmd_rekey "$@" ;;
 		check)  _cmd_check "$@" ;;
 		git|g)  _cmd_git "$@" ;;
+		y)      _cmd_y "$@" ;;
 		help|-h|--help) usage ;;
 		*)
 			if command -v "sec-store-$_m_cmd" >/dev/null 2>&1; then

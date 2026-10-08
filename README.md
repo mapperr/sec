@@ -95,6 +95,7 @@ printf '%s\n' 'example-password' | sec store put personal/example
 sec store get personal/example
 sec store edit personal/example
 sec store ls
+sec store y                              # sync the selected sec data with Git
 ```
 
 ### One format for personal, project and remote stores
@@ -158,6 +159,31 @@ sec store root                       # ~/.local/share/sec
 `.recipients` applies to its directory and descendants; the closest policy wins. Without a policy, the core's self-recipient fallback applies. **Commit an explicit `.sec/store/.recipients` for team stores** so each developer encrypts for the intended recipients rather than just themselves. Never commit plaintext secrets or private identities.
 
 `sec store get` emits plaintext to stdout. `sec store git ...` / `sec store g ...` runs Git from the resolved physical store directory; if `store/` is symlinked outside the project checkout, Git operates in that destination repository. `sec store dir --project-sec` remains available for finding the associated project `.sec` directory.
+
+### Git sync: `y`
+
+`sec store y [message ...]` synchronizes the selected sec data with Git using the same convenient workflow as `tsk y` and `trk y`:
+
+```sh
+sec store y
+sec store y 'rotate development credentials'
+```
+
+The command stages the sec sync scope, creates a commit when there are changes, runs `git pull --rebase`, and then pushes. The default commit message is `sync`; any remaining arguments are joined and used as the commit message. If the current branch has no upstream, `y` prefers `origin`, otherwise it uses the only configured remote when that choice is unambiguous, and performs the initial `git push -u <remote> HEAD`.
+
+The sync target follows the **resolved physical store**, which matters when symlinks are used:
+
+- If `store/` and its sec container belong to the same Git repository, the whole sec container is synchronized so that `store/`, `stores`, and `run/` are kept together.
+- If `store/` is a symlink into a separately versioned secrets repository, `y` synchronizes that physical repository instead of the logical container containing the symlink.
+- If the physical path is a canonical remote-style container whose `store/` directory lives beside `stores` and `run/`, the whole physical container is synchronized.
+
+A sec container may live inside a larger application repository. In that case `y` stages and commits only the sec sync scope; it never stages unrelated application files. Before starting the sync it also refuses to proceed when the surrounding repository has changes outside that scope, because `git pull --rebase` would not be safe or predictable:
+
+```text
+sec-store: error: Git repository has changes outside the sec sync scope; commit or stash them before sync
+```
+
+`y` is intended for a writable Git-backed personal or project store. Aliased remote stores fetched through `sec-store-remote-git` remain read-only snapshots; update those with `sec store update <alias>` instead.
 
 ### Shared stores via aliases and Git remotes
 
