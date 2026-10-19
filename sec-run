@@ -16,6 +16,8 @@ usage:
 
 options:
     -e, --env ENTRY              load literal NAME=VALUE lines from an entry (repeatable)
+    -v, --var ENV_VAR:ENTRY      export ENV_VAR with the literal contents of one entry
+                                (repeatable)
     -f, --file ENTRY[:ENV_VAR]   materialize an entry and export its file path
                                 (repeatable; default ENV_VAR from basename)
     -m, --manifest NAME|PATH    load env/file entries from a declarative manifest
@@ -28,7 +30,9 @@ options:
 No command: inspect the injection without printing secret values.
 Use -- to separate runner options from the command. --print and --env-only
 cannot be combined with a command. -e entries are merged in order (last wins).
-Duplicate -f variable names/paths, and collisions between -e and -f, are errors.
+Duplicate -v/-f variable names or file paths, and collisions between -e, -v
+and -f variables, are errors. A -v value is the exact entry contents; NUL bytes
+are rejected because Unix environment variables cannot contain them.
 
 A manifest contains one directive per line: env ENTRY or file ENTRY[:ENV_VAR].
 Blank lines and # comments are ignored. Manifest content is data, never shell
@@ -98,10 +102,12 @@ _require_runtime() {
 	case $_rt in *'
 '*) _error 'newline in temporary-parent path is not supported'; return 1 ;; esac
 	_tmp=$(mktemp -d "$_rt/sec-run.XXXXXXXX") || { _error 'cannot create temporary workspace'; return 1; }
-	mkdir -m 700 -- "$_tmp/envs" "$_tmp/files" || return 1
-	: >"$_tmp/env-entries" && : >"$_tmp/file-specs" &&
-	: >"$_tmp/file-vars" && : >"$_tmp/file-paths" &&
-	: >"$_tmp/env-keys" && : >"$_tmp/env-files"
+	mkdir -m 700 -- "$_tmp/envs" "$_tmp/values" "$_tmp/files" || return 1
+	: >"$_tmp/env-entries" && : >"$_tmp/value-specs" &&
+	: >"$_tmp/value-vars" && : >"$_tmp/value-files" &&
+	: >"$_tmp/file-specs" && : >"$_tmp/file-vars" &&
+	: >"$_tmp/file-paths" && : >"$_tmp/env-keys" &&
+	: >"$_tmp/env-files"
 }
 
 _valid_var() {
@@ -151,6 +157,21 @@ _add_env() {
 	printf '%s\n' "$_ae" >>"$_tmp/env-entries" || return 1
 }
 
+_add_value() {
+	_av_spec=$1
+	case $_av_spec in
+		*:* ) _av_var=${_av_spec%%:*}; _av_entry=${_av_spec#*:} ;;
+		* ) _error "invalid variable specification [$_av_spec]; expected ENV_VAR:ENTRY"; return 1 ;;
+	esac
+	_valid_var "$_av_var" || { _error "invalid variable name [$_av_var]"; return 1; }
+	[ -n "$_av_entry" ] || { _error "missing store entry in variable specification [$_av_spec]"; return 1; }
+	_av_entry=$(_canonical_entry "$_av_entry") || return 1
+	_has_line "$_av_var" "$_tmp/value-vars" && { _error "duplicate value variable [$_av_var]"; return 1; }
+	_has_line "$_av_var" "$_tmp/file-vars" && { _error "variable [$_av_var] conflicts with a file variable"; return 1; }
+	printf '%s\n' "$_av_var" >>"$_tmp/value-vars" || return 1
+	printf '%s\n%s\n' "$_av_entry" "$_av_var" >>"$_tmp/value-specs" || return 1
+}
+
 _add_file() {
     _spec=$1
     _af_explicit=0
@@ -176,6 +197,7 @@ _add_file() {
     _af_rel=$_entry
     case $_entry in *::*) _af_rel=${_entry%%::*}/${_entry#*::} ;; esac
     _has_line "$_var" "$_tmp/file-vars" && { _error "duplicate file variable [$_var]"; return 1; }
+    _has_line "$_var" "$_tmp/value-vars" && { _error "file variable [$_var] conflicts with a value variable"; return 1; }
     _has_line "$_af_rel" "$_tmp/file-paths" && { _error "duplicate file destination [$_af_rel]"; return 1; }
     printf '%s\n' "$_var" >>"$_tmp/file-vars" || return 1
     printf '%s\n' "$_af_rel" >>"$_tmp/file-paths" || return 1
@@ -304,6 +326,10 @@ _validate_env_file() {
 			_error "environment variable [$_ve_name] conflicts with a file variable"
 			return 1
 		}
+		_has_line "$_ve_name" "$_tmp/value-vars" && {
+			_error "environment variable [$_ve_name] conflicts with a value variable"
+			return 1
+		}
 		_has_line "$_ve_name" "$_tmp/env-keys" ||
 			printf '%s\n' "$_ve_name" >>"$_tmp/env-keys" || return 1
 	done <"$_ve_file"
@@ -322,6 +348,18 @@ _prepare_envs() {
 		_validate_env_file "$_pe_file" || return 1
 		printf '%s\n' "$_pe_file" >>"$_tmp/env-files" || return 1
 	done <"$_tmp/env-entries"
+}
+
+_prepare_values() {
+	_pv_count=0
+	while IFS= read -r _pv_entry && IFS= read -r _pv_var; do
+		_pv_count=$((_pv_count + 1))
+		_pv_file=$_tmp/values/$_pv_count
+		_debug "loading value entry [$_pv_entry] for [$_pv_var]"
+		_store_get "$_pv_entry" >"$_pv_file" || { _error "cannot load value entry [$_pv_entry]"; return 1; }
+		_check_env_bytes "$_pv_file" || return 1
+		printf '%s\n%s\n' "$_pv_var" "$_pv_file" >>"$_tmp/value-files" || return 1
+	done <"$_tmp/value-specs"
 }
 
 _prepare_files() {
@@ -359,6 +397,13 @@ _apply_env() {
 			export "$_ae_line" || return 1
 		done <"$_ae_file"
 	done <"$_tmp/env-files"
+	while IFS= read -r _ae_var && IFS= read -r _ae_file; do
+		# Appending a sentinel prevents command substitution from stripping the
+		# secret's trailing newlines; NUL bytes were rejected during preparation.
+		_ae_value=$(cat -- "$_ae_file"; printf '.') || return 1
+		_ae_value=${_ae_value%.}
+		export "$_ae_var=$_ae_value" || return 1
+	done <"$_tmp/value-files"
 	while IFS= read -r _ae_entry &&
 	      IFS= read -r _ae_var &&
 	      IFS= read -r _ae_rel; do
@@ -373,6 +418,9 @@ _inspect() {
 	while IFS= read -r _pr_key || [ -n "$_pr_key" ]; do
 		printf '  %s=<secret>\n' "$_pr_key"
 	done <"$_tmp/env-keys"
+	while IFS= read -r _pr_var || [ -n "$_pr_var" ]; do
+		printf '  %s=<secret>\n' "$_pr_var"
+	done <"$_tmp/value-vars"
 	printf '\nFiles:\n'
 	while IFS= read -r _pr_entry &&
 	      IFS= read -r _pr_var &&
@@ -388,6 +436,10 @@ _print_resolved() (
 		printf '%s=' "$_pr_key"
 		"$_printenv_bin" "$_pr_key" || exit 1
 	done <"$_tmp/env-keys"
+	while IFS= read -r _pr_var || [ -n "$_pr_var" ]; do
+		printf '%s=' "$_pr_var"
+		"$_printenv_bin" "$_pr_var" || exit 1
+	done <"$_tmp/value-vars"
 	if [ "$_mode" = print ]; then
 		while IFS= read -r _pr_entry &&
 		      IFS= read -r _pr_var &&
@@ -404,7 +456,7 @@ _run_command() {
 		_run_rm=$(command -v rm) || exit 1
 		_apply_env || exit 1
 		# A decrypted environment source is needed only while preparing the child.
-		"$_run_rm" -rf -- "$_tmp/envs" || exit 1
+		"$_run_rm" -rf -- "$_tmp/envs" "$_tmp/values" || exit 1
 		exec "$@"
 	) &
 	_child=$!
@@ -427,6 +479,12 @@ main() {
 			-e|--env)
 				[ "$#" -ge 2 ] || { _error "missing ENTRY after [$1]"; return 2; }
 				_add_env "$2" || return 2
+				_seen=1
+				shift 2
+				;;
+			-v|--var)
+				[ "$#" -ge 2 ] || { _error "missing ENV_VAR:ENTRY after [$1]"; return 2; }
+				_add_value "$2" || return 2
 				_seen=1
 				shift 2
 				;;
@@ -460,7 +518,7 @@ main() {
 			*) _error "unknown option [$1]; use -- before the command"; return 2 ;;
 		esac
 	done
-	[ "$_seen" -eq 1 ] || { usage >&2; _error 'specify at least one -e or -f entry'; return 2; }
+	[ "$_seen" -eq 1 ] || { usage >&2; _error 'specify at least one -e, -v or -f entry'; return 2; }
 	if [ "$_mode" = env-only ] && [ -s "$_tmp/file-specs" ]; then
 		_error '--env-only does not accept -f file entries'
 		return 2
@@ -469,7 +527,7 @@ main() {
 		_printenv_bin=$(command -v printenv) || { _error 'printenv is required for output modes'; return 1; }
 	fi
 	_pin_store || return 1
-	_prepare_envs && _prepare_files || return 1
+	_prepare_envs && _prepare_values && _prepare_files || return 1
 	case $_mode in
 		inspect) _inspect ;;
 		print|env-only) _print_resolved ;;
