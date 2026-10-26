@@ -20,6 +20,7 @@ commands:
     get <name>                   decrypt an entry; alias::name selects another store
     edit <name>                  edit a local secret
     ls [prefix|alias::[prefix]]  list local entries or an aliased store
+    search|s <pattern> [scope]   grep entry names; scope is prefix or alias::[prefix]
     rm <name> [<name> ...]       remove local secrets
     policy <name>                show the effective recipient policy
     rekey [prefix]               re-encrypt local secrets using current policies
@@ -55,6 +56,7 @@ notes:
     Valid symlinks for .sec, .sec/store and the personal store are supported.
     Symlinks within a store (secrets/policies) remain forbidden.
     Store containers contain store/, optional stores, and optional run/.
+    stores format: one "<alias> <git+ssh://...|git+https://...>" per line; # comments allowed.
     Remote aliases are read-only; their repository is fetched on first use.
 EOF
 }
@@ -924,6 +926,23 @@ _cmd_ls() {
 	_list_under "$_cl_dir"
 }
 
+_cmd_search() {
+    [ "$#" -ge 1 ] && [ "$#" -le 2 ] || {
+        _error 'usage: sec store search <grep-pattern> [prefix|alias::[prefix]]'
+        return 1
+    }
+
+    _cs_pattern=$1
+    if [ "$#" -eq 2 ]; then
+        _cs_entries=$(_cmd_ls "$2") || return 1
+    else
+        _cs_entries=$(_cmd_ls) || return 1
+    fi
+
+    [ -n "$_cs_entries" ] || return 1
+    printf '%s\n' "$_cs_entries" | grep -e "$_cs_pattern"
+}
+
 _cmd_rm() {
 	[ "$#" -gt 0 ] || { _error 'usage: sec store rm <name> [<name> ...]'; return 1; }
 	_require_store || return 1
@@ -1295,6 +1314,7 @@ main() {
 		get1)   _cmd_get1 "$@" ;;
 		edit)   _cmd_edit "$@" ;;
 		ls)     _cmd_ls "$@" ;;
+        search|s) _cmd_search "$@" ;;
 		rm)     _cmd_rm "$@" ;;
 		policy) _cmd_policy "$@" ;;
 		rekey)  _cmd_rekey "$@" ;;
