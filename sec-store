@@ -56,8 +56,9 @@ notes:
     Valid symlinks for .sec, .sec/store and the personal store are supported.
     Symlinks within a store (secrets/policies) remain forbidden.
     Store containers contain store/, optional stores, and optional run/.
-    stores format: one "<alias> <git+ssh://...|git+https://...>" per line; # comments allowed.
-    Remote aliases are read-only; their repository is fetched on first use.
+    stores format: one "<alias> <source>" per line; # comments allowed.
+    sources: file:///absolute/sec/root, git+ssh://..., git+https://...
+    Aliased stores are read-only; Git repositories are fetched on first use.
 EOF
 }
 
@@ -500,7 +501,7 @@ _read_alias() {
         /^[[:space:]]*(#|$)/ { next }
         {
             if (NF != 2 || $1 !~ /^[a-z][a-z0-9_-]*$/ ||
-                $2 !~ /^git\+(ssh|https):\/\// || seen[$1]++) {
+                $2 !~ /^(file:\/\/\/[^[:space:]]+|git\+(ssh|https):\/\/)/ || seen[$1]++) {
                 printf "sec-store: error: invalid/duplicate store declaration at %s:%d\n", FILENAME, FNR > "/dev/stderr"
                 bad=1; next
             }
@@ -606,6 +607,53 @@ _remote_backend() {
     esac
 }
 
+_local_source_resolve() (
+    _lsr_source=$1
+    case $_lsr_source in
+        file:///*) _lsr_root=${_lsr_source#file://} ;;
+        *) _error "unsupported local source [$_lsr_source]"; exit 1 ;;
+    esac
+
+    [ -d "$_lsr_root" ] && [ -r "$_lsr_root" ] && [ -x "$_lsr_root" ] || {
+        _error "local store container [$_lsr_root] is not an accessible directory"
+        exit 1
+    }
+    _lsr_root=$(cd "$_lsr_root" 2>/dev/null && pwd -P) || {
+        _error "local store container [$_lsr_root] is not accessible"
+        exit 1
+    }
+
+    [ -d "$_lsr_root/store" ] && [ -r "$_lsr_root/store" ] && [ -x "$_lsr_root/store" ] || {
+        _error "local store container [$_lsr_root] has no accessible store/ directory"
+        exit 1
+    }
+    if [ -L "$_lsr_root/store" ] && [ ! -d "$_lsr_root/store" ]; then
+        _error "local store [$_lsr_root/store] is a dangling or invalid symlink"
+        exit 1
+    fi
+
+    # Return the logical store/ pathname under the resolved container rather
+    # than its symlink target. This preserves the canonical sec-container
+    # association if a future read-only operation needs stores/ or run/.
+    printf '%s/store\n' "$_lsr_root"
+)
+
+_source_resolve() {
+    _sr_source=$1 _sr_update=${2:-0}
+    case $_sr_source in
+        file:///*)
+            _local_source_resolve "$_sr_source"
+            ;;
+        git+ssh://*|git+https://*)
+            _remote_resolve "$_sr_source" "$_sr_update"
+            ;;
+        *)
+            _error "unsupported store source [$_sr_source]"
+            return 1
+            ;;
+    esac
+}
+
 # Snapshots are immutable after publication. Updates publish a new snapshot
 # by atomically switching a small 'current' file. Existing readers retain a
 # usable path even while another process updates the same alias.
@@ -684,7 +732,7 @@ _with_entry_store() (
     _split_entry "$_we_name" || exit 1
     if [ -n "$_se_alias" ]; then
         _we_source=$(_alias_source "$_se_alias") || exit 1
-        SEC_STORE_DIR=$(_remote_resolve "$_we_source" 0) || exit 1
+        SEC_STORE_DIR=$(_source_resolve "$_we_source" 0) || exit 1
         unset SEC_STORE_CONTEXT_ROOT
         export SEC_STORE_DIR
     fi
@@ -699,15 +747,24 @@ _cmd_update() {
             _cu_rc=$?; [ "$_cu_rc" -eq 3 ] || return 1;
         }
         [ -n "$_cu_lines" ] || return 0
-        _cu_status=0
         printf '%s\n' "$_cu_lines" | while IFS=' ' read -r _cu_alias _cu_source; do
-            _remote_resolve "$_cu_source" 1 >/dev/null || exit 1
+            case $_cu_source in
+                file:///*) continue ;;
+            esac
+            _source_resolve "$_cu_source" 1 >/dev/null || exit 1
             _info "updated remote store [$_cu_alias]"
         done
         return $?
     fi
     _cu_source=$(_alias_source "$1") || return 1
-    _remote_resolve "$_cu_source" 1 >/dev/null || return 1
+    case $_cu_source in
+        file:///*)
+            _source_resolve "$_cu_source" 0 >/dev/null || return 1
+            _info "local store [$1] does not require update"
+            return 0
+            ;;
+    esac
+    _source_resolve "$_cu_source" 1 >/dev/null || return 1
     _info "updated remote store [$1]"
 }
 
@@ -890,7 +947,7 @@ _cmd_ls() {
         *::*)
             _cl_alias=${1%%::*} _cl_rem=${1#*::}
             _cl_source=$(_alias_source "$_cl_alias") || return 1
-            _cl_remote=$(_remote_resolve "$_cl_source" 0) || return 1
+            _cl_remote=$(_source_resolve "$_cl_source" 0) || return 1
             if [ -n "$_cl_rem" ]; then
                 _cl_list=$(SEC_STORE_DIR=$_cl_remote SEC_STORE_CONTEXT_ROOT= "$0" ls "$_cl_rem") || return 1
                 [ -z "$_cl_list" ] || printf '%s\n' "$_cl_list" | sed "s|^|$_cl_alias::|"
