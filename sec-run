@@ -42,7 +42,8 @@ options:
 
 No command: inspect the injection without printing secret values. Inspect output
 shows the selected store, loaded manifests, source entries and directive origin.
-Use -- to separate runner options from the command. --print and --env-only
+For var entries it also warns about a trailing LF or CRLF without modifying the
+secret value. Use -- to separate runner options from the command. --print and --env-only
 cannot be combined with a command. -e entries are merged in order (last wins).
 Duplicate --val/-v/-f variable names or file paths, and collisions between
 -e, --val, -v and -f variables, are errors. A -v value is the exact entry
@@ -695,6 +696,27 @@ _apply_env() {
 	export SEC_RUN_DIR
 }
 
+_value_trailing_eol() {
+	_vte_var=$1
+	_vte_file=
+	while IFS= read -r _vte_name && IFS= read -r _vte_path; do
+		if [ "$_vte_name" = "$_vte_var" ]; then
+			_vte_file=$_vte_path
+			break
+		fi
+	done <"$_tmp/value-files"
+	[ -n "$_vte_file" ] && [ -s "$_vte_file" ] || return 1
+
+	# Inspect at most the final two bytes. This is diagnostic only: var values
+	# are still exported byte-for-byte (except NUL, which is rejected earlier).
+	_vte_hex=$(tail -c 2 -- "$_vte_file" 2>/dev/null | od -An -t x1 | tr -d ' \n') || return 1
+	case $_vte_hex in
+		*0d0a) printf '%s\n' 'CRLF'; return 0 ;;
+		*0a)   printf '%s\n' 'LF'; return 0 ;;
+		*)     return 1 ;;
+	esac
+}
+
 _inspect_env_key() {
 	_iek_key=$1
 	_iek_entry=
@@ -739,7 +761,10 @@ _inspect() {
 	while IFS= read -r _im_var &&
 	      IFS= read -r _im_entry &&
 	      IFS= read -r _im_origin; do
-		printf '  %s=<secret>  var:%s  <- %s\n' "$_im_var" "$_im_entry" "$_im_origin"
+		printf '  %s=<secret>  var:%s  <- %s' "$_im_var" "$_im_entry" "$_im_origin"
+		_im_eol=$(_value_trailing_eol "$_im_var") || _im_eol=
+		[ -z "$_im_eol" ] || printf '  [trailing %s]' "$_im_eol"
+		printf '\n'
 	done <"$_tmp/value-meta"
 
 	while IFS= read -r _im_var &&
