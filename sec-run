@@ -20,8 +20,8 @@ usage:
 
 manifest commands:
     manifest ls|l                  list named manifests in selected sec/run/
-    manifest edit|e NAME           edit/create a named manifest
-    manifest rm|r NAME [...]       remove named manifests
+    manifest edit|e NAME           edit/create a local named manifest
+    manifest rm|r NAME [...]       remove local named manifests
 
 options:
     -e, --env ENTRY              load literal NAME=VALUE lines from an entry (repeatable)
@@ -30,8 +30,8 @@ options:
     --val ENV_VAR=VALUE          export a literal non-secret value (repeatable)
     -f, --file ENTRY[:ENV_VAR]   materialize an entry and export its file path
                                 (repeatable; default ENV_VAR from basename)
-    -m, --manifest NAME|PATH    load env/var/val/file entries from a declarative manifest
-                                (repeatable; NAME resolves in selected sec/run/)
+    -m, --manifest REF          load env/var/val/file entries from a declarative manifest
+                                REF is NAME, ALIAS::NAME, or an explicit PATH
     --print                     display resolved variables, including secret values;
                                 file paths are placeholders, not usable runtime paths
     --env-only                  output resolved NAME=VALUE lines (no -f allowed)
@@ -54,11 +54,14 @@ A manifest contains one directive per line:
 The aliases -e, -v and -f are accepted for env/var/file. Blank lines and #
 comments are ignored. A val VALUE may contain spaces and additional '='
 characters; it is literal data and is not expanded. Manifest content is data,
-never shell code. Named manifests resolve
-in the selected container's run/ directory
-(project .sec/run or personal ~/.local/share/sec/run); explicit paths work
-with any store. ENTRY may be alias::name for read-only remote store access;
-aliases are declared in the selected container's stores file.
+never shell code. A bare NAME resolves in the selected container's run/
+directory (project .sec/run or personal ~/.local/share/sec/run).
+ALIAS::NAME resolves NAME in that aliased container's run/ directory;
+unqualified env/var/file entries inside it inherit ALIAS automatically.
+Already-qualified entries are left unchanged. Explicit manifest paths work
+with any store and do not inherit an alias. Aliased manifests are read-only;
+manifest edit/rm operate on the selected local container. Aliases are declared
+in the selected container's stores file.
 
 The .env format is literal, one NAME=VALUE per line; empty lines and lines
 beginning with # are ignored. No quotes, interpolation or shell syntax.
@@ -269,14 +272,44 @@ _pin_store() {
 }
 
 _manifest_path() {
-    _mp_name=$1
-    case $_mp_name in
-        /*|./*|../*) printf '%s\n' "$_mp_name"; return 0 ;;
+    _mp_ref=$1
+    case $_mp_ref in
+        /*|./*|../*) printf '%s\n' "$_mp_ref"; return 0 ;;
     esac
+
     _pin_store || return 1
+
+    # A versioned project manifest must not depend on developer-local aliases.
+    _mp_project=$("$_sec_bin" store dir --project-sec 2>/dev/null) || _mp_project=
+    [ -z "$_mp_project" ] || { SEC_STORE_PROJECT_ONLY=1; export SEC_STORE_PROJECT_ONLY; }
+
+    _mp_container=$_container_root
+    _mp_name=$_mp_ref
+    case $_mp_ref in
+        *::*)
+            _mp_alias=${_mp_ref%%::*}
+            _mp_name=${_mp_ref#*::}
+            case $_mp_alias in
+                ''|[!a-z]*|*[!a-z0-9_-]*)
+                    _error "invalid store alias [$_mp_alias]"
+                    return 1
+                    ;;
+            esac
+            [ -n "$_mp_name" ] || { _error "missing manifest name in [$_mp_ref]"; return 1; }
+            _mp_container=$("$_sec_bin" store root "$_mp_alias") || {
+                _error "cannot resolve manifest store alias [$_mp_alias]"
+                return 1
+            }
+            ;;
+        *:*)
+            _error "invalid manifest reference [$_mp_ref]; use ALIAS::NAME"
+            return 1
+            ;;
+    esac
+
     _valid_entry "$_mp_name" || { _error "invalid manifest name [$_mp_name]"; return 1; }
     _mp_rest=$_mp_name
-    _mp_cur=$_container_root/run
+    _mp_cur=$_mp_container/run
     [ ! -L "$_mp_cur" ] || { _error "symlinked manifest directory [$_mp_cur]"; return 1; }
     while :; do
         case $_mp_rest in
@@ -287,15 +320,58 @@ _manifest_path() {
         [ ! -L "$_mp_cur" ] || { _error "symlinked manifest path [$_mp_cur]"; return 1; }
         [ -n "$_mp_rest" ] || break
     done
-    # A versioned project manifest must not depend on developer-local aliases.
-    _mp_project=$("$_sec_bin" store dir --project-sec 2>/dev/null) || _mp_project=
-    [ -z "$_mp_project" ] || { SEC_STORE_PROJECT_ONLY=1; export SEC_STORE_PROJECT_ONLY; }
     printf '%s\n' "$_mp_cur"
 }
 
+_manifest_entry_arg() {
+    _mea_alias=$1
+    _mea_arg=$2
+    if [ -z "$_mea_alias" ]; then
+        printf '%s\n' "$_mea_arg"
+        return 0
+    fi
+    case $_mea_arg in
+        *::*) printf '%s\n' "$_mea_arg" ;;
+        *) printf '%s::%s\n' "$_mea_alias" "$_mea_arg" ;;
+    esac
+}
+
+_manifest_value_arg() {
+    _mva_alias=$1
+    _mva_arg=$2
+    [ -n "$_mva_alias" ] || { printf '%s\n' "$_mva_arg"; return 0; }
+    case $_mva_arg in
+        *:*)
+            _mva_var=${_mva_arg%%:*}
+            _mva_entry=${_mva_arg#*:}
+            case $_mva_entry in
+                *::*) printf '%s\n' "$_mva_arg" ;;
+                *) printf '%s:%s::%s\n' "$_mva_var" "$_mva_alias" "$_mva_entry" ;;
+            esac
+            ;;
+        *) printf '%s\n' "$_mva_arg" ;;
+    esac
+}
+
+_manifest_file_arg() {
+    _mfa_alias=$1
+    _mfa_arg=$2
+    [ -n "$_mfa_alias" ] || { printf '%s\n' "$_mfa_arg"; return 0; }
+    case $_mfa_arg in
+        *::*) printf '%s\n' "$_mfa_arg" ;;
+        *) printf '%s::%s\n' "$_mfa_alias" "$_mfa_arg" ;;
+    esac
+}
+
 _load_manifest() {
-    _lm_path=$(_manifest_path "$1") || return 1
-    case $1 in
+    _lm_ref=$1
+    _lm_default_alias=
+    case $_lm_ref in
+        /*|./*|../*) ;;
+        *::*) _lm_default_alias=${_lm_ref%%::*} ;;
+    esac
+    _lm_path=$(_manifest_path "$_lm_ref") || return 1
+    case $_lm_ref in
         /*|./*|../*) ;;
         *)
             if "$_sec_bin" store dir --project-sec >/dev/null 2>&1; then
@@ -334,9 +410,18 @@ _load_manifest() {
                     return 1 ;;
                 esac
                 case $_lm_kind in
-                    env|-e) _add_env "$_lm_arg" || return 1 ;;
-                    var|-v) _add_value "$_lm_arg" || return 1 ;;
-                    file|-f) _add_file "$_lm_arg" || return 1 ;;
+                    env|-e)
+                        _lm_effective=$(_manifest_entry_arg "$_lm_default_alias" "$_lm_arg") || return 1
+                        _add_env "$_lm_effective" || return 1
+                        ;;
+                    var|-v)
+                        _lm_effective=$(_manifest_value_arg "$_lm_default_alias" "$_lm_arg") || return 1
+                        _add_value "$_lm_effective" || return 1
+                        ;;
+                    file|-f)
+                        _lm_effective=$(_manifest_file_arg "$_lm_default_alias" "$_lm_arg") || return 1
+                        _add_file "$_lm_effective" || return 1
+                        ;;
                 esac
                 ;;
             *) _error "unknown manifest directive [$_lm_kind] at [$_lm_path:$_lm_num]"; return 1 ;;
@@ -405,6 +490,9 @@ _manifest_list() {
 
 _manifest_edit() {
     [ "$#" -eq 1 ] || { _error 'usage: sec run manifest edit NAME'; return 2; }
+    case $1 in
+        *::*) _error "aliased manifest [$1] is read-only"; return 1 ;;
+    esac
     _me_path=$(_manifest_edit_path "$1") || return 1
     _me_editor=$(_manifest_editor) || return 1
     "$_me_editor" "$_me_path"
@@ -414,6 +502,13 @@ _manifest_rm() {
     [ "$#" -gt 0 ] || { _error 'usage: sec run manifest rm NAME [...]'; return 2; }
     _mrm_rc=0
     for _mrm_name do
+        case $_mrm_name in
+            *::*)
+                _error "aliased manifest [$_mrm_name] is read-only"
+                _mrm_rc=1
+                continue
+                ;;
+        esac
         _mrm_path=$(_manifest_path "$_mrm_name") || { _mrm_rc=1; continue; }
         if [ ! -f "$_mrm_path" ] || [ -L "$_mrm_path" ]; then
             _error "manifest [$_mrm_name] does not exist"
@@ -441,8 +536,10 @@ usage:
 
 commands:
     ls|l            list named manifests in the selected sec/run/ directory
-    edit|e NAME     edit or create NAME; creates run/ and parent dirs as needed
-    rm|r NAME ...   remove named manifests
+    edit|e NAME     edit or create local NAME; creates run/ and parent dirs as needed
+    rm|r NAME ...   remove local named manifests
+
+Aliased manifests (ALIAS::NAME) are loaded with -m/--manifest and are read-only.
 USAGE
             ;;
         *) _error "unknown manifest command [$_mc]"; return 2 ;;
@@ -684,7 +781,7 @@ main() {
 				shift 2
 				;;
 			-m|--manifest)
-				[ "$#" -ge 2 ] || { _error "missing NAME|PATH after [$1]"; return 2; }
+				[ "$#" -ge 2 ] || { _error "missing NAME|ALIAS::NAME|PATH after [$1]"; return 2; }
 				_load_manifest "$2" || return 2
 				shift 2
 				;;

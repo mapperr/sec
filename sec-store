@@ -12,7 +12,7 @@ $s
 commands:
     init [--project]             initialize personal/current or project store
     dir [--source|--project-sec] print selected store, source or project root
-    root                         print the selected sec container (stores/store/run)
+    root [alias]                 print selected or aliased sec container (stores/store/run)
     stores edit|path             edit or locate the current container's stores file
     sources                      list available store aliases and sources
     update <alias>|--all         refresh remote stores explicitly
@@ -226,8 +226,23 @@ _container() {
 }
 
 _cmd_root() {
-    [ "$#" -eq 0 ] || { _error 'usage: sec store root'; return 1; }
-    _container
+    case $# in
+        0)
+            _container
+            ;;
+        1)
+            _cr_source=$(_alias_source "$1") || return 1
+            _cr_store=$(_source_resolve "$_cr_source" 0) || return 1
+            case $_cr_store in
+                */store) printf '%s\n' "${_cr_store%/store}" ;;
+                *) _error "resolved alias [$1] is not a canonical sec store"; return 1 ;;
+            esac
+            ;;
+        *)
+            _error 'usage: sec store root [alias]'
+            return 1
+            ;;
+    esac
 }
 
 _store_source() {
