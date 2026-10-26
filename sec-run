@@ -12,7 +12,16 @@ sec-run
 
 usage:
     sec run [options] [-- command [args ...]]
+    sec run manifest ls
+    sec run manifest edit NAME
+    sec run manifest rm NAME [...]
     sec-run [options] [-- command [args ...]]
+    sec-run manifest ls|edit|rm ...
+
+manifest commands:
+    manifest ls|l                  list named manifests in selected sec/run/
+    manifest edit|e NAME           edit/create a named manifest
+    manifest rm|r NAME [...]       remove named manifests
 
 options:
     -e, --env ENTRY              load literal NAME=VALUE lines from an entry (repeatable)
@@ -20,7 +29,7 @@ options:
                                 (repeatable)
     -f, --file ENTRY[:ENV_VAR]   materialize an entry and export its file path
                                 (repeatable; default ENV_VAR from basename)
-    -m, --manifest NAME|PATH    load env/file entries from a declarative manifest
+    -m, --manifest NAME|PATH    load env/var/file entries from a declarative manifest
                                 (repeatable; NAME resolves in selected sec/run/)
     --print                     display resolved variables, including secret values;
                                 file paths are placeholders, not usable runtime paths
@@ -34,10 +43,14 @@ Duplicate -v/-f variable names or file paths, and collisions between -e, -v
 and -f variables, are errors. A -v value is the exact entry contents; NUL bytes
 are rejected because Unix environment variables cannot contain them.
 
-A manifest contains one directive per line: env ENTRY or file ENTRY[:ENV_VAR].
-Blank lines and # comments are ignored. Manifest content is data, never shell
-code. Named manifests resolve in the selected container's run/ directory
-(project .sec/run or personal ~/ .local/share/sec/run); explicit paths work
+A manifest contains one directive per line:
+    env ENTRY
+    var ENV_VAR:ENTRY
+    file ENTRY[:ENV_VAR]
+The aliases -e, -v and -f are accepted too. Blank lines and # comments are
+ignored. Manifest content is data, never shell code. Named manifests resolve
+in the selected container's run/ directory
+(project .sec/run or personal ~/.local/share/sec/run); explicit paths work
 with any store. ENTRY may be alias::name for read-only remote store access;
 aliases are declared in the selected container's stores file.
 
@@ -53,6 +66,8 @@ env vars:
     SEC_STORE_REQUIRE_PROJECT    if 1, disallow personal-store fallback
     SEC_RUN_SEC          sec executable (default: sec)
     SEC_RUN_TMPDIR       explicit private temporary parent (default: XDG_RUNTIME_DIR)
+    SEC_RUN_EDITOR       editor executable for `manifest edit`
+                         default: $VISUAL, $EDITOR, vi
     SEC_RUN_DEBUG        enable diagnostics; never prints secret contents
 
 SEC_RUN_TMPDIR must be a real directory owned by the current user and
@@ -283,11 +298,116 @@ _load_manifest() {
         esac
         case $_lm_kind in
             env|-e) _add_env "$_lm_arg" || return 1 ;;
+            var|-v) _add_value "$_lm_arg" || return 1 ;;
             file|-f) _add_file "$_lm_arg" || return 1 ;;
             *) _error "unknown manifest directive [$_lm_kind] at [$_lm_path:$_lm_num]"; return 1 ;;
         esac
         _seen=1
     done <"$_lm_path"
+}
+
+_manifest_editor() {
+    printf '%s\n' "${SEC_RUN_EDITOR:-${VISUAL:-${EDITOR:-vi}}}"
+}
+
+_manifest_run_dir() {
+    _pin_store || return 1
+    _mr_dir=$_container_root/run
+    [ ! -L "$_mr_dir" ] || { _error "symlinked manifest directory [$_mr_dir]"; return 1; }
+    if [ -e "$_mr_dir" ] && [ ! -d "$_mr_dir" ]; then
+        _error "manifest path [$_mr_dir] is not a directory"
+        return 1
+    fi
+}
+
+_manifest_edit_path() {
+    _me_name=$1
+    _valid_entry "$_me_name" || { _error "invalid manifest name [$_me_name]"; return 1; }
+    _manifest_run_dir || return 1
+    if [ ! -d "$_mr_dir" ]; then
+        mkdir -p -- "$_mr_dir" || { _error "cannot create manifest directory [$_mr_dir]"; return 1; }
+    fi
+    _me_rest=$_me_name
+    _me_cur=$_mr_dir
+    while :; do
+        case $_me_rest in
+            */*) _me_part=${_me_rest%%/*}; _me_rest=${_me_rest#*/} ;;
+            *) _me_part=$_me_rest; _me_rest= ;;
+        esac
+        _me_cur=$_me_cur/$_me_part
+        [ ! -L "$_me_cur" ] || { _error "symlinked manifest path [$_me_cur]"; return 1; }
+        if [ -n "$_me_rest" ]; then
+            if [ -e "$_me_cur" ]; then
+                [ -d "$_me_cur" ] || { _error "manifest path component [$_me_cur] is not a directory"; return 1; }
+            else
+                mkdir -- "$_me_cur" || { _error "cannot create manifest directory [$_me_cur]"; return 1; }
+            fi
+        else
+            if [ -e "$_me_cur" ] && [ ! -f "$_me_cur" ]; then
+                _error "manifest [$_me_cur] is not a regular file"
+                return 1
+            fi
+            printf '%s\n' "$_me_cur"
+            return 0
+        fi
+    done
+}
+
+_manifest_list() {
+    [ "$#" -eq 0 ] || { _error 'usage: sec run manifest ls'; return 2; }
+    _manifest_run_dir || return 1
+    [ -d "$_mr_dir" ] || return 0
+    find "$_mr_dir" -type f -print | while IFS= read -r _ml_path; do
+        _ml_name=${_ml_path#"$_mr_dir"/}
+        _valid_entry "$_ml_name" || continue
+        printf '%s\n' "$_ml_name"
+    done | LC_ALL=C sort
+}
+
+_manifest_edit() {
+    [ "$#" -eq 1 ] || { _error 'usage: sec run manifest edit NAME'; return 2; }
+    _me_path=$(_manifest_edit_path "$1") || return 1
+    _me_editor=$(_manifest_editor) || return 1
+    "$_me_editor" "$_me_path"
+}
+
+_manifest_rm() {
+    [ "$#" -gt 0 ] || { _error 'usage: sec run manifest rm NAME [...]'; return 2; }
+    _mrm_rc=0
+    for _mrm_name do
+        _mrm_path=$(_manifest_path "$_mrm_name") || { _mrm_rc=1; continue; }
+        if [ ! -f "$_mrm_path" ] || [ -L "$_mrm_path" ]; then
+            _error "manifest [$_mrm_name] does not exist"
+            _mrm_rc=1
+            continue
+        fi
+        rm -- "$_mrm_path" || _mrm_rc=1
+    done
+    return "$_mrm_rc"
+}
+
+_manifest_cmd() {
+    _mc=${1:-}
+    [ "$#" -gt 0 ] && shift
+    case $_mc in
+        ls|l) _manifest_list "$@" ;;
+        edit|e) _manifest_edit "$@" ;;
+        rm|r) _manifest_rm "$@" ;;
+        -h|--help|help|'')
+            cat <<'USAGE'
+usage:
+    sec run manifest ls
+    sec run manifest edit NAME
+    sec run manifest rm NAME [...]
+
+commands:
+    ls|l            list named manifests in the selected sec/run/ directory
+    edit|e NAME     edit or create NAME; creates run/ and parent dirs as needed
+    rm|r NAME ...   remove named manifests
+USAGE
+            ;;
+        *) _error "unknown manifest command [$_mc]"; return 2 ;;
+    esac
 }
 
 _check_env_bytes() {
@@ -467,7 +587,15 @@ _run_command() {
 }
 
 main() {
-	case ${1:-} in -h|--help|help) usage; return 0 ;; esac
+	case ${1:-} in
+		-h|--help|help) usage; return 0 ;;
+		manifest)
+			shift
+			_sec_bin=$(command -v "${SEC_RUN_SEC:-sec}") || { _error 'sec executable not found'; return 1; }
+			_manifest_cmd "$@"
+			return $?
+			;;
+	esac
 	_require_runtime || return 1
 	_sec_bin=$(command -v "${SEC_RUN_SEC:-sec}") || { _error 'sec executable not found'; return 1; }
 	_mode=inspect
