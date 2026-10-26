@@ -1,11 +1,13 @@
 #!/bin/sh
 
+VERSION=0.9.0
+
 umask 077
 set -f
 
 usage() {
+	printf 'sec-store-fzf %s\n' "$VERSION"
 	cat <<'EOF'
-sec-store-fzf
     interactive fzf interface for sec-store
 
 usage:
@@ -428,6 +430,11 @@ main() {
 			shift
 			_internal "$cmd" "$@"
 			exit $?
+			;;
+		-V|--version|version)
+			[ "$#" -eq 1 ] || { _error 'usage: sec-store-fzf --version'; exit 1; }
+			printf 'sec-store-fzf %s\n' "$VERSION"
+			exit 0
 			;;
 		-h|--help|help)
 			usage

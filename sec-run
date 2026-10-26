@@ -1,13 +1,15 @@
 #!/bin/sh
 # Run a command with secrets from sec-store. POSIX sh; no eval/source of secrets.
 
+VERSION=0.9.0
+
 umask 077
 set -f
 _CR=$(printf '\r')
 
 usage() {
+	printf 'sec-run %s\n' "$VERSION"
 	cat <<'USAGE'
-sec-run
     inject sec-store secrets into a command's environment and temporary files
 
 usage:
@@ -35,6 +37,7 @@ options:
     --print                     display resolved variables, including secret values;
                                 file paths are placeholders, not usable runtime paths
     --env-only                  output resolved NAME=VALUE lines (no -f allowed)
+    -V, --version               show version
     -h, --help                  show help
 
 No command: inspect the injection without printing secret values.
@@ -740,6 +743,7 @@ _run_command() {
 
 main() {
 	case ${1:-} in
+		-V|--version|version) printf 'sec-run %s\n' "$VERSION"; return 0 ;;
 		-h|--help|help) usage; return 0 ;;
 		manifest)
 			shift
@@ -800,6 +804,7 @@ main() {
 				_mode=run; _command=1
 				break
 				;;
+			-V|--version) printf 'sec-run %s\n' "$VERSION"; return 0 ;;
 			-h|--help) usage; return 0 ;;
 			*) _error "unknown option [$1]; use -- before the command"; return 2 ;;
 		esac

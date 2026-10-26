@@ -1,13 +1,14 @@
 #!/bin/sh
 
+VERSION=0.9.0
+
 AGE_ARMOR_HEADER='-----BEGIN AGE ENCRYPTED FILE-----'
 AGE_BINARY_HEADER='age-encryption.org/v1'
 umask 077
 
 usage() {
-	s=$(basename "$0")
 	cat <<EOF_USAGE
-$s
+sec $VERSION
     a tiny wrapper for age
 
 commands:
@@ -515,6 +516,11 @@ main() {
 	shift
 
 	case $cmd in
+		version|-V|--version)
+			[ "$#" -eq 0 ] || { _error 'usage: sec --version'; return 1; }
+			printf 'sec %s\n' "$VERSION"
+			return 0
+			;;
 		e|d) age=$(command -v age || command -v rage) || _die 'age not found, install per https://age-encryption.org' ;;
 	esac
 
@@ -530,6 +536,9 @@ main() {
 			;;
 		recipient)
 			_cmd_recipient "$@"
+			;;
+		help|-h|--help)
+			usage
 			;;
 		*)
 			if command -v "sec-$cmd" >/dev/null 2>&1; then

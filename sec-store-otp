@@ -1,11 +1,13 @@
 #!/bin/sh
 
+VERSION=0.9.0
+
 umask 077
 set -f
 
 usage() {
+	printf 'sec-store-otp %s\n' "$VERSION"
 	cat <<'EOF'
-sec-store-otp
     generate a TOTP from a sec-store entry
 
 usage:
@@ -144,6 +146,11 @@ main() (
 )
 
 case ${1:-} in
+	-V|--version|version)
+		[ "$#" -eq 1 ] || { _error 'usage: sec-store-otp --version'; exit 1; }
+		printf 'sec-store-otp %s\n' "$VERSION"
+		exit 0
+		;;
 	-h|--help|help)
 		usage
 		exit 0

@@ -1,11 +1,27 @@
 #!/bin/sh
 # Git transport for sec-store. Only git+ssh:// and git+https:// are accepted.
 # Called by sec-store as: fetch|update|check SOURCE DESTINATION.
+VERSION=0.9.0
 umask 077
 set -f
 
 _error() { printf 'sec-store-remote-git: error: %s\n' "$1" >&2; return 1; }
+_help() {
+    printf 'sec-store-remote-git %s\n' "$VERSION"
+    cat <<'EOF'
+    Git transport backend for sec-store
+
+usage:
+    sec-store-remote-git fetch|update|check git+ssh://URL|git+https://URL[#COMMIT] DESTINATION
+
+commands:
+    fetch     fetch a Git-backed sec container into an empty destination
+    update    fetch a fresh Git-backed sec container snapshot
+    check     validate a cached Git store against its source
+EOF
+}
 _usage() {
+    printf 'sec-store-remote-git %s\n' "$VERSION" >&2
     printf 'usage: sec-store-remote-git fetch|update|check git+ssh://URL|git+https://URL[#COMMIT] DESTINATION\n' >&2
     return 2
 }
@@ -101,6 +117,18 @@ _fetch() {
     printf '%s\n' "$_selected" >"$_dst/.sec-remote-commit" || return 1
     _check "$1" "$_dst"
 }
+
+case ${1:-} in
+    -V|--version|version)
+        [ "$#" -eq 1 ] || { _usage; exit $?; }
+        printf 'sec-store-remote-git %s\n' "$VERSION"
+        exit 0
+        ;;
+    -h|--help|help)
+        _help
+        exit 0
+        ;;
+esac
 
 [ "$#" -eq 3 ] || { _usage; exit $?; }
 _action=$1 _source=$2 _destination=$3

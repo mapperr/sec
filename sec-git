@@ -1,11 +1,13 @@
 #!/bin/sh
 
+VERSION=0.9.0
+
 umask 077
 set -f
 
 usage() {
+	printf 'sec-git %s\n' "$VERSION"
 	cat <<'EOF'
-sec-git
     transparent age encryption for selected paths in a Git repository
 
 usage:
@@ -739,6 +741,10 @@ main() {
 		smudge)   _cmd_smudge "$@" ;;
 		textconv) _cmd_textconv "$@" ;;
 
+		version|-V|--version)
+			[ "$#" -eq 0 ] || { _error 'usage: sec git --version'; exit 1; }
+			printf 'sec-git %s\n' "$VERSION"
+			;;
 		help|-h|--help) usage ;;
 		*) _error "unknown command [$cmd]"; usage >&2; exit 1 ;;
 	esac

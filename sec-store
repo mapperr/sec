@@ -1,12 +1,13 @@
 #!/bin/sh
 
+VERSION=0.9.0
+
 umask 077
 set -f
 
 usage() {
-	s=$(basename "$0")
-	cat <<EOF
-$s
+	printf 'sec-store %s\n' "$VERSION"
+	cat <<'EOF'
     encrypted personal/team secret store for sec
 
 commands:
@@ -26,7 +27,8 @@ commands:
     rekey [prefix]               re-encrypt local secrets using current policies
     check                        validate local store structure and ciphertexts
     git|g [args ...]             run git in selected local store (default: status)
-    y [message ...]               git sync: add/commit sec container, pull --rebase, push
+    y [message ...]              git sync: add/commit sec container, pull --rebase, push
+    version|-V|--version          show version
 
 env vars:
     SEC_STORE_DIR                store directory
@@ -1391,6 +1393,7 @@ main() {
 		policy) _cmd_policy "$@" ;;
 		rekey)  _cmd_rekey "$@" ;;
 		check)  _cmd_check "$@" ;;
+		version|-V|--version) printf 'sec-store %s\n' "$VERSION" ;;
 		git|g)  _cmd_git "$@" ;;
 		y)      _cmd_y "$@" ;;
 		help|-h|--help) usage ;;
