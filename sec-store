@@ -14,8 +14,7 @@ commands:
     init [--project]             initialize personal/current or project store
     dir [--source|--project-sec] print selected store, source or project root
     root [alias]                 print selected or aliased sec container (stores/store/run)
-    stores edit|path             edit or locate the current container's stores file
-    sources                      list available store aliases and sources
+    stores ls|edit|path          list, edit or locate store aliases and sources
     update <alias>|--all         refresh remote stores explicitly
     put <name> [file]            encrypt stdin or file (local store only)
     get <name>                   decrypt an entry; alias::name selects another store
@@ -59,6 +58,7 @@ notes:
     Symlinks within a store (secrets/policies) remain forbidden.
     Store containers contain store/, optional stores, and optional run/.
     stores format: one "<alias> <source>" per line; # comments allowed.
+    stores ls prints effective aliases (project entries override personal ones).
     sources: file:///absolute/sec/root, git+ssh://..., git+https://...
     Aliased stores are read-only; Git repositories are fetched on first use.
 EOF
@@ -556,8 +556,8 @@ _alias_source() {
     return 1
 }
 
-_cmd_sources() {
-    [ "$#" -eq 0 ] || { _error 'usage: sec store sources'; return 1; }
+_stores_list() {
+    [ "$#" -eq 0 ] || { _error 'usage: sec store stores ls'; return 1; }
     _so_file=$(_sources_file) || return 1
     _so_primary=$(_read_alias "$_so_file" '')
     _so_rc=$?
@@ -582,8 +582,12 @@ _cmd_sources() {
 
 _cmd_stores() {
     case ${1:-} in
+        ls|l)
+            [ "$#" -eq 1 ] || { _error 'usage: sec store stores ls|edit|path'; return 1; }
+            _stores_list
+            ;;
         edit)
-            [ "$#" -eq 1 ] || { _error 'usage: sec store stores edit|path'; return 1; }
+            [ "$#" -eq 1 ] || { _error 'usage: sec store stores ls|edit|path'; return 1; }
             _ss_file=$(_sources_file) || return 1
             [ ! -L "$_ss_file" ] || { _error 'refusing symlink stores file'; return 1; }
             [ ! -e "$_ss_file" ] || [ -f "$_ss_file" ] || { _error 'stores path is not a file'; return 1; }
@@ -592,10 +596,10 @@ _cmd_stores() {
             "$_ss_editor" "$_ss_file"
             ;;
         path)
-            [ "$#" -eq 1 ] || { _error 'usage: sec store stores edit|path'; return 1; }
+            [ "$#" -eq 1 ] || { _error 'usage: sec store stores ls|edit|path'; return 1; }
             _sources_file
             ;;
-        *) _error 'usage: sec store stores edit|path'; return 1 ;;
+        *) _error 'usage: sec store stores ls|edit|path'; return 1 ;;
     esac
 }
 
@@ -1381,7 +1385,6 @@ main() {
 		dir)    _cmd_dir "$@" ;;
         root)   _cmd_root "$@" ;;
         stores) _cmd_stores "$@" ;;
-        sources) _cmd_sources "$@" ;;
         update) _cmd_update "$@" ;;
 		put)    _cmd_put "$@" ;;
 		get)    _cmd_get "$@" ;;
