@@ -17,13 +17,14 @@ usage:
     sec run manifest ls
     sec run manifest edit NAME
     sec run manifest rm NAME [...]
+    sec run m ls
     sec-run [options] [-- command [args ...]]
-    sec-run manifest ls|edit|rm ...
+    sec-run manifest|m ls|edit|rm ...
 
-manifest commands:
-    manifest ls|l                  list named manifests in selected sec/run/
-    manifest edit|e NAME           edit/create a local named manifest
-    manifest rm|r NAME [...]       remove local named manifests
+manifest commands (manifest|m):
+    manifest|m ls|l                list named manifests in selected sec/run/
+    manifest|m edit|e NAME         edit/create a local named manifest
+    manifest|m rm|r NAME [...]     remove local named manifests
 
 options:
     -e, --env ENTRY              load literal NAME=VALUE lines from an entry (repeatable)
@@ -547,6 +548,9 @@ usage:
     sec run manifest ls
     sec run manifest edit NAME
     sec run manifest rm NAME [...]
+    sec run m ls|edit|rm ...
+
+`m` is a short alias for `manifest`.
 
 commands:
     ls|l            list named manifests in the selected sec/run/ directory
@@ -829,7 +833,7 @@ main() {
 	case ${1:-} in
 		-V|--version|version) printf 'sec-run %s\n' "$VERSION"; return 0 ;;
 		-h|--help|help) usage; return 0 ;;
-		manifest)
+		manifest|m)
 			shift
 			_sec_bin=$(command -v "${SEC_RUN_SEC:-sec}") || { _error 'sec executable not found'; return 1; }
 			_manifest_cmd "$@"
