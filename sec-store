@@ -22,7 +22,13 @@ commands:
     ls [prefix|alias::[prefix]]  list local entries or an aliased store
     search|s <pattern> [scope]   grep entry names; scope is prefix or alias::[prefix]
     rm <name> [<name> ...]       remove local secrets
-    policy <name>                show the effective recipient policy
+    policy <entry|.>             show effective policy path (legacy shortcut)
+    policy show <entry|.>        show effective recipients; . means store root
+    policy path <entry|.>        show effective .recipients path or self
+    policy edit [entry|prefix|.] edit exact policy scope (default: store root)
+    policy add <scope> <recipient> add recipient to exact policy scope
+    policy rm <scope> <recipient>  remove recipient from exact policy scope
+    policy delete|del|d <scope>  delete exact .recipients and restore inheritance
     rekey [prefix]               re-encrypt local secrets using current policies
     check                        validate local store structure and ciphertexts
     git|g [args ...]             run git in selected local store (default: status)
@@ -43,12 +49,25 @@ env vars:
     SEC_STORE_DEBUG              enable debug messages
 
 recipient policies:
-    A .recipients file applies to secrets in its directory and descendants.
-    The nearest .recipients file wins. If none exists, sec's self-recipient
-    discovery is used.
+    A .recipients file contains one age/SSH recipient per non-empty line.
+    Blank lines and lines beginning with # are ignored. Example:
 
-    Explicit store policies are authoritative: sec-store never adds self to a
-    .recipients policy.
+        # Development team
+        age1...
+        ssh-ed25519 AAAA... alice@example
+
+    A .recipients file applies to secrets in its directory and descendants.
+    The nearest .recipients file wins; policies are not merged. If none exists,
+    sec's self-recipient discovery is used. Explicit store policies are
+    authoritative: sec-store never adds self automatically.
+
+    policy add/rm accept the special recipient "self", resolved immediately
+    through `sec recipient`; the literal word "self" is never stored. `.` means
+    the root store policy for show, path, edit, add, rm and delete. Deleting a
+    policy removes that exact .recipients file, so the scope resumes inheriting
+    the nearest parent policy (or sec's self-recipient fallback at store root).
+    For mutation targets, an existing entry selects its containing directory;
+    use prefix/ or entry.age to resolve an otherwise ambiguous entry/prefix name.
 
 notes:
     Secret names are store-relative paths and are stored as <name>.age.
@@ -1038,18 +1057,316 @@ _cmd_rm() {
 	return "$_cr_rc"
 }
 
-_cmd_policy() {
-	[ "$#" -eq 1 ] || { _error 'usage: sec store policy <name>'; return 1; }
-    case $1 in *::*) _with_entry_store _cmd_policy "$1"; return $? ;; esac
-	_require_store || return 1
+# Resolve an ENTRY for read-only policy inspection. Aliased stores are allowed
+# here because show/path do not modify their cached/local source.
+_policy_effective_path() {
+    _pep_entry=$1
+    if [ "$_pep_entry" = . ]; then
+        _pep_root=$(_root) || return 1
+        _pep_policy=$_pep_root/.recipients
+        if [ -L "$_pep_policy" ]; then
+            _error "refusing symlink recipient policy [$_pep_policy]"
+            return 1
+        fi
+        if [ -e "$_pep_policy" ]; then
+            [ -f "$_pep_policy" ] && [ -r "$_pep_policy" ] || {
+                _error "recipient policy [$_pep_policy] is not readable"
+                return 1
+            }
+            printf '%s\n' "$_pep_policy"
+        fi
+        return 0
+    fi
+    _pep_path=$(_secret_path "$_pep_entry") || return 1
+    _policy_for_file "$_pep_path"
+}
 
-	_cpo_path=$(_secret_path "$1") || return 1
-	_cpo_policy=$(_policy_for_file "$_cpo_path") || return 1
-	if [ -n "$_cpo_policy" ]; then
-		printf '%s\n' "$_cpo_policy"
-	else
-		printf '%s\n' self
-	fi
+_policy_print_recipients() {
+    _ppr_policy=$1
+    if [ -n "$_ppr_policy" ]; then
+        awk 'NF && $0 !~ /^[[:space:]]*#/ { print }' "$_ppr_policy"
+    else
+        "$(_sec)" recipient
+    fi
+}
+
+_cmd_policy_path() {
+    [ "$#" -eq 1 ] || { _error 'usage: sec store policy path <entry|.>'; return 1; }
+    case $1 in *::*) _with_entry_store _cmd_policy_path "$1"; return $? ;; esac
+    _require_store || return 1
+    _cpp_policy=$(_policy_effective_path "$1") || return 1
+    if [ -n "$_cpp_policy" ]; then
+        printf '%s\n' "$_cpp_policy"
+    else
+        printf '%s\n' self
+    fi
+}
+
+_cmd_policy_show() {
+    [ "$#" -eq 1 ] || { _error 'usage: sec store policy show <entry|.>'; return 1; }
+    case $1 in *::*) _with_entry_store _cmd_policy_show "$1"; return $? ;; esac
+    _require_store || return 1
+    _cps_policy=$(_policy_effective_path "$1") || return 1
+    _policy_print_recipients "$_cps_policy"
+}
+
+# Map a policy mutation target to the exact directory that owns .recipients.
+# Existing entries select their containing directory; otherwise TARGET denotes
+# a prefix. `.` always means the root store policy.
+_policy_scope_dir() {
+    _psd_target=${1:-.}
+    _psd_create=${2:-0}
+    _psd_root=$(_root) || return 1
+    _psd_force_prefix=0
+    _psd_force_entry=0
+
+    case $_psd_target in
+        *::*) _error 'aliased store policies are read-only; select that store directly to modify it'; return 1 ;;
+        .) printf '%s\n' "$_psd_root"; return 0 ;;
+        */) _psd_force_prefix=1; _psd_target=${_psd_target%/} ;;
+        *.age) _psd_force_entry=1 ;;
+    esac
+
+    _psd_name=$(_normalize_name "$_psd_target") || return 1
+    _psd_secret=$(_secret_path "$_psd_name") || return 1
+    _check_path_components "$_psd_root" "$_psd_name" || return 1
+    _psd_dir=$_psd_root/$_psd_name
+
+    _psd_has_secret=0
+    _psd_has_dir=0
+    if [ -e "$_psd_secret" ] || [ -L "$_psd_secret" ]; then
+        _validate_secret_file "$_psd_secret" || return 1
+        _psd_has_secret=1
+    fi
+    if [ -e "$_psd_dir" ] || [ -L "$_psd_dir" ]; then
+        [ -d "$_psd_dir" ] && [ ! -L "$_psd_dir" ] || {
+            _error "policy scope [$_psd_dir] is not a regular directory"
+            return 1
+        }
+        _psd_has_dir=1
+    fi
+
+    if [ "$_psd_force_entry" = 1 ]; then
+        [ "$_psd_has_secret" = 1 ] || { _error "secret [$_psd_name] does not exist"; return 1; }
+        dirname -- "$_psd_secret"
+        return
+    fi
+
+    if [ "$_psd_force_prefix" = 1 ]; then
+        if [ "$_psd_has_dir" = 0 ]; then
+            [ "$_psd_create" = 1 ] || { _error "policy scope [$_psd_name/] does not exist"; return 1; }
+            mkdir -p -- "$_psd_dir" || { _error "cannot create policy scope [$_psd_dir]"; return 1; }
+        fi
+        printf '%s\n' "$_psd_dir"
+        return
+    fi
+
+    if [ "$_psd_has_secret" = 1 ] && [ "$_psd_has_dir" = 1 ]; then
+        _error "ambiguous policy target [$_psd_target]: both entry and prefix exist; use [$_psd_name.age] for the entry or [$_psd_name/] for the prefix"
+        return 1
+    fi
+    if [ "$_psd_has_secret" = 1 ]; then
+        dirname -- "$_psd_secret"
+        return
+    fi
+    if [ "$_psd_has_dir" = 0 ]; then
+        [ "$_psd_create" = 1 ] || { _error "policy scope [$_psd_target] does not exist"; return 1; }
+        mkdir -p -- "$_psd_dir" || { _error "cannot create policy scope [$_psd_dir]"; return 1; }
+    fi
+    printf '%s\n' "$_psd_dir"
+}
+
+_resolve_recipient_arg() {
+    [ "$#" -eq 1 ] || return 1
+    _rra_value=$1
+    if [ "$_rra_value" = self ]; then
+        _rra_value=$("$(_sec)" recipient) || {
+            _error 'cannot resolve self recipient'
+            return 1
+        }
+    fi
+    [ -n "$_rra_value" ] || { _error 'recipient is empty'; return 1; }
+    _rra_lines=$(printf '%s\n' "$_rra_value" | awk 'END { print NR }') || return 1
+    [ "$_rra_lines" -eq 1 ] || { _error 'recipient must be a single line'; return 1; }
+    printf '%s\n' "$_rra_value"
+}
+
+_validate_recipient_arg() (
+    _vra_value=$1
+    _vra_tmp=$(_runtime_tmp) || { _error 'cannot create temporary recipient file'; exit 1; }
+    trap 'rm -f -- "$_vra_tmp"' 0 HUP INT TERM
+    printf '%s\n' "$_vra_value" >"$_vra_tmp" || exit 1
+    if ! _validate_policy "$_vra_tmp" >/dev/null 2>&1; then
+        _error "invalid recipient [$_vra_value]"
+        exit 1
+    fi
+)
+
+_policy_replace_file() {
+    _prf_tmp=$1 _prf_policy=$2
+    if [ -e "$_prf_policy" ]; then
+        chmod --reference="$_prf_policy" "$_prf_tmp" 2>/dev/null || {
+            _prf_mode=$(stat -c '%a' -- "$_prf_policy" 2>/dev/null) || return 1
+            chmod "$_prf_mode" "$_prf_tmp" || return 1
+        }
+    else
+        chmod 600 "$_prf_tmp" 2>/dev/null || :
+    fi
+    mv -f -- "$_prf_tmp" "$_prf_policy"
+}
+
+_cmd_policy_edit() (
+    [ "$#" -le 1 ] || { _error 'usage: sec store policy edit [entry|prefix|.]'; exit 1; }
+    _require_store || exit 1
+    _cpe_scope=$(_policy_scope_dir "${1:-.}" 1) || exit 1
+    _cpe_policy=$_cpe_scope/.recipients
+    [ ! -L "$_cpe_policy" ] || { _error "refusing symlink recipient policy [$_cpe_policy]"; exit 1; }
+    if [ -e "$_cpe_policy" ]; then
+        [ -f "$_cpe_policy" ] && [ -r "$_cpe_policy" ] || {
+            _error "recipient policy [$_cpe_policy] is not readable"; exit 1;
+        }
+    fi
+
+    _cpe_tmp=$(_same_dir_tmp "$_cpe_policy") || { _error 'cannot create temporary policy file'; exit 1; }
+    trap 'rm -f -- "$_cpe_tmp"' 0 HUP INT TERM
+    if [ -f "$_cpe_policy" ]; then
+        cat -- "$_cpe_policy" >"$_cpe_tmp" || exit 1
+        _cpe_before=$(cksum <"$_cpe_policy") || exit 1
+    else
+        : >"$_cpe_tmp" || exit 1
+        _cpe_before=missing
+    fi
+    chmod 600 "$_cpe_tmp" 2>/dev/null || :
+
+    _cpe_editor=$(_editor) || exit 1
+    "$_cpe_editor" "$_cpe_tmp"
+    _cpe_rc=$?
+    [ "$_cpe_rc" -eq 0 ] || { _error "editor exited with status $_cpe_rc"; exit "$_cpe_rc"; }
+    [ -f "$_cpe_tmp" ] && [ ! -L "$_cpe_tmp" ] || { _error 'edited recipient policy disappeared'; exit 1; }
+
+    if [ "$_cpe_before" = missing ] && [ ! -s "$_cpe_tmp" ]; then
+        _info "no policy created at [$_cpe_policy]"
+        exit 0
+    fi
+    _cpe_after=$(cksum <"$_cpe_tmp") || exit 1
+    if [ "$_cpe_before" = "$_cpe_after" ]; then
+        _info "policy [$_cpe_policy] unchanged"
+        exit 0
+    fi
+    _validate_policy "$_cpe_tmp" >/dev/null 2>&1 || {
+        _error 'edited recipient policy is invalid; original policy was not changed'
+        exit 1
+    }
+    _policy_replace_file "$_cpe_tmp" "$_cpe_policy" || {
+        _error "cannot replace recipient policy [$_cpe_policy]"; exit 1;
+    }
+    _cpe_tmp=
+    _info "policy [$_cpe_policy] updated"
+)
+
+_ensure_file_newline() {
+    _efn_file=$1
+    [ -s "$_efn_file" ] || return 0
+    _efn_last=$(tail -c 1 -- "$_efn_file" | od -An -tuC | tr -d '[:space:]') || return 1
+    [ "$_efn_last" = 10 ] || printf '\n' >>"$_efn_file"
+}
+
+_cmd_policy_add() (
+    [ "$#" -eq 2 ] || { _error 'usage: sec store policy add <entry|prefix|.> <recipient|self>'; exit 1; }
+    _require_store || exit 1
+    _cpa_recipient=$(_resolve_recipient_arg "$2") || exit 1
+    _validate_recipient_arg "$_cpa_recipient" || exit 1
+    _cpa_scope=$(_policy_scope_dir "$1" 1) || exit 1
+    _cpa_policy=$_cpa_scope/.recipients
+    [ ! -L "$_cpa_policy" ] || { _error "refusing symlink recipient policy [$_cpa_policy]"; exit 1; }
+
+    if [ -e "$_cpa_policy" ]; then
+        _validate_policy "$_cpa_policy" >/dev/null 2>&1 || {
+            _error "recipient policy [$_cpa_policy] is invalid; edit it before adding recipients"; exit 1;
+        }
+        if grep -Fqx -- "$_cpa_recipient" "$_cpa_policy"; then
+            _info 'recipient already present'
+            exit 0
+        fi
+    fi
+
+    _cpa_tmp=$(_same_dir_tmp "$_cpa_policy") || { _error 'cannot create temporary policy file'; exit 1; }
+    trap 'rm -f -- "$_cpa_tmp"' 0 HUP INT TERM
+    if [ -f "$_cpa_policy" ]; then cat -- "$_cpa_policy" >"$_cpa_tmp" || exit 1; else : >"$_cpa_tmp" || exit 1; fi
+    _ensure_file_newline "$_cpa_tmp" || exit 1
+    printf '%s\n' "$_cpa_recipient" >>"$_cpa_tmp" || exit 1
+    _validate_policy "$_cpa_tmp" >/dev/null 2>&1 || { _error 'resulting recipient policy is invalid'; exit 1; }
+    _policy_replace_file "$_cpa_tmp" "$_cpa_policy" || exit 1
+    _cpa_tmp=
+    _info "recipient added to [$_cpa_policy]"
+)
+
+_cmd_policy_rm() (
+    [ "$#" -eq 2 ] || { _error 'usage: sec store policy rm <entry|prefix|.> <recipient|self>'; exit 1; }
+    _require_store || exit 1
+    _cpr_scope=$(_policy_scope_dir "$1" 0) || exit 1
+    _cpr_policy=$_cpr_scope/.recipients
+    [ ! -L "$_cpr_policy" ] || { _error "refusing symlink recipient policy [$_cpr_policy]"; exit 1; }
+    [ -f "$_cpr_policy" ] && [ -r "$_cpr_policy" ] || {
+        _error "no recipient policy at exact scope [${1}]"; exit 1;
+    }
+    _validate_policy "$_cpr_policy" >/dev/null 2>&1 || {
+        _error "recipient policy [$_cpr_policy] is invalid; edit it before removing recipients"; exit 1;
+    }
+    _cpr_recipient=$(_resolve_recipient_arg "$2") || exit 1
+    grep -Fqx -- "$_cpr_recipient" "$_cpr_policy" || {
+        _error 'recipient is not present in exact policy scope'; exit 1;
+    }
+
+    _cpr_tmp=$(_same_dir_tmp "$_cpr_policy") || { _error 'cannot create temporary policy file'; exit 1; }
+    trap 'rm -f -- "$_cpr_tmp"' 0 HUP INT TERM
+    : >"$_cpr_tmp" || exit 1
+    while IFS= read -r _cpr_line || [ -n "$_cpr_line" ]; do
+        [ "$_cpr_line" = "$_cpr_recipient" ] && continue
+        printf '%s\n' "$_cpr_line" >>"$_cpr_tmp" || exit 1
+    done <"$_cpr_policy"
+
+    if ! awk 'NF && $0 !~ /^[[:space:]]*#/ { found=1 } END { exit found ? 0 : 1 }' "$_cpr_tmp"; then
+        _error 'refusing to remove the last recipient from a policy; edit/delete the policy explicitly if you intend to change inheritance'
+        exit 1
+    fi
+    _validate_policy "$_cpr_tmp" >/dev/null 2>&1 || { _error 'resulting recipient policy is invalid'; exit 1; }
+    _policy_replace_file "$_cpr_tmp" "$_cpr_policy" || exit 1
+    _cpr_tmp=
+    _info "recipient removed from [$_cpr_policy]"
+)
+
+_cmd_policy_delete() (
+    [ "$#" -eq 1 ] || { _error 'usage: sec store policy delete <entry|prefix|.>'; exit 1; }
+    _require_store || exit 1
+    _cpd_scope=$(_policy_scope_dir "$1" 0) || exit 1
+    _cpd_policy=$_cpd_scope/.recipients
+    [ ! -L "$_cpd_policy" ] || { _error "refusing symlink recipient policy [$_cpd_policy]"; exit 1; }
+    [ -f "$_cpd_policy" ] || {
+        _error "no recipient policy at exact scope [$1]"
+        exit 1
+    }
+    rm -- "$_cpd_policy" || {
+        _error "cannot delete recipient policy [$_cpd_policy]"
+        exit 1
+    }
+    _info "policy [$_cpd_policy] deleted; inherited policy is now effective"
+)
+
+_cmd_policy() {
+    [ "$#" -gt 0 ] || {
+        _error 'usage: sec store policy <entry|.>|show <entry|.>|path <entry|.>|edit [scope]|add <scope> <recipient>|rm <scope> <recipient>|delete <scope>'
+        return 1
+    }
+    case $1 in
+        show) shift; _cmd_policy_show "$@" ;;
+        path) shift; _cmd_policy_path "$@" ;;
+        edit) shift; _cmd_policy_edit "$@" ;;
+        add)  shift; _cmd_policy_add "$@" ;;
+        rm)   shift; _cmd_policy_rm "$@" ;;
+        delete|del|d) shift; _cmd_policy_delete "$@" ;;
+        *)    _cmd_policy_path "$@" ;;
+    esac
 }
 
 _rekey_file() (
