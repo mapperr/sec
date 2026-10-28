@@ -15,8 +15,8 @@ usage:
     sec-store-remote-git fetch|update|check git+ssh://URL|git+https://URL[#COMMIT] DESTINATION
 
 commands:
-    fetch     fetch a Git-backed sec container into an empty destination
-    update    fetch a fresh Git-backed sec container snapshot
+    fetch     fetch a Git-backed sec store into an empty destination
+    update    fetch a fresh Git-backed sec store snapshot
     check     validate a cached Git store against its source
 EOF
 }
@@ -55,7 +55,7 @@ _check() {
     _parse_source "$1" || return 1
     _dst=$2
     [ -d "$_dst" ] && [ ! -L "$_dst" ] &&
-    [ -d "$_dst/store" ] && [ ! -L "$_dst/store" ] &&
+    [ -d "$_dst/secrets" ] && [ ! -L "$_dst/secrets" ] &&
     [ -d "$_dst/.sec-remote-git" ] && [ ! -L "$_dst/.sec-remote-git" ] || {
         _error "invalid cached Git store [$_dst]"; return 1;
     }
@@ -108,8 +108,8 @@ _fetch() {
         }
     git -C "$_dst/.sec-remote-git" archive --format=tar "$_selected" |
         tar -xf - -C "$_dst" || { _error 'cannot extract store content'; return 1; }
-    [ -d "$_dst/store" ] && [ ! -L "$_dst/store" ] || {
-        _error 'remote repository does not contain a regular store/ directory'; return 1;
+    [ -d "$_dst/secrets" ] && [ ! -L "$_dst/secrets" ] || {
+        _error 'remote repository does not contain a regular secrets/ directory'; return 1;
     }
     [ -z "$(find "$_dst" -type l -print -quit)" ] || {
         _error 'remote repository contains symlinks'; return 1;

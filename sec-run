@@ -22,7 +22,7 @@ usage:
     sec-run manifest|m ls|edit|rm ...
 
 manifest commands (manifest|m):
-    manifest|m ls|l                list named manifests in selected sec/run/
+    manifest|m ls|l                list named manifests in selected store/manifests/
     manifest|m edit|e NAME         edit/create a local named manifest
     manifest|m rm|r NAME [...]     remove local named manifests
 
@@ -60,14 +60,14 @@ A manifest contains one directive per line:
 The aliases -e, -v and -f are accepted for env/var/file. Blank lines and #
 comments are ignored. A val VALUE may contain spaces and additional '='
 characters; it is literal data and is not expanded. Manifest content is data,
-never shell code. A bare NAME resolves in the selected container's run/
-directory (project .sec/run or personal ~/.local/share/sec/run).
-ALIAS::NAME resolves NAME in that aliased container's run/ directory;
+never shell code. A bare NAME resolves in the selected store's manifests/ directory
+(project .sec/manifests or personal ~/.local/share/sec/manifests).
+ALIAS::NAME resolves NAME in that aliased store's manifests/ directory;
 unqualified env/var/file entries inside it inherit ALIAS automatically.
 Already-qualified entries are left unchanged. Explicit manifest paths work
 with any store and do not inherit an alias. Aliased manifests are read-only;
-manifest edit/rm operate on the selected local container. Aliases are declared
-in the selected container's stores file.
+manifest edit/rm operate on the selected local store. Aliases are declared
+in the selected store's stores file.
 
 The .env format is literal, one NAME=VALUE per line; empty lines and lines
 beginning with # are ignored. No quotes, interpolation or shell syntax.
@@ -77,7 +77,7 @@ not the secret contents. These paths remain available only while the command
 is running. The runner returns the command's exit status.
 
 env vars:
-    SEC_STORE_DIR        optional explicit store location (handled by sec-store)
+    SEC_STORE_DIR        optional explicit store root (handled by sec-store)
     SEC_STORE_REQUIRE_PROJECT    if 1, disallow personal-store fallback
     SEC_RUN_SEC          sec executable (default: sec)
     SEC_RUN_TMPDIR       explicit private temporary parent (default: XDG_RUNTIME_DIR)
@@ -267,22 +267,16 @@ _add_file() {
     printf '%s\n%s\n%s\n%s\n' "$_var" "$_entry" "$_af_rel" "${2:-cli}" >>"$_tmp/file-meta" || return 1
 }
 
-# Pin the store once so every entry in this run uses the same store, even if
-# the command was invoked from a nested directory or used a named manifest.
+# Pin the selected store once so every entry and manifest in this run uses the
+# same root, even if the command was invoked from a nested project directory.
 _pin_store() {
-    [ -n "${_store_dir:-}" ] && return 0
-    # Capture the logical container before SEC_STORE_DIR becomes an explicit
-    # physical path. This preserves project stores whose store/ is a symlink,
-    # and also supports named manifests in the personal sec/run directory.
-    _container_root=$("$_sec_bin" store root) || {
-        _error 'cannot resolve sec container'; return 1;
+    [ -n "${_store_root:-}" ] && return 0
+    _store_root=$("$_sec_bin" store dir) || {
+        _error 'cannot resolve sec store'; return 1;
     }
-    _store_dir=$("$_sec_bin" store dir) || {
-        _error 'cannot resolve store directory'; return 1;
-    }
-    SEC_STORE_CONTEXT_ROOT=$_container_root
-    SEC_STORE_DIR=$_store_dir
-    export SEC_STORE_CONTEXT_ROOT SEC_STORE_DIR
+    _secrets_dir=$_store_root/secrets
+    SEC_STORE_DIR=$_store_root
+    export SEC_STORE_DIR
 }
 
 _manifest_path() {
@@ -294,10 +288,10 @@ _manifest_path() {
     _pin_store || return 1
 
     # A versioned project manifest must not depend on developer-local aliases.
-    _mp_project=$("$_sec_bin" store dir --project-sec 2>/dev/null) || _mp_project=
+    _mp_project=$("$_sec_bin" store dir --project 2>/dev/null) || _mp_project=
     [ -z "$_mp_project" ] || { SEC_STORE_PROJECT_ONLY=1; export SEC_STORE_PROJECT_ONLY; }
 
-    _mp_container=$_container_root
+    _mp_store=$_store_root
     _mp_name=$_mp_ref
     case $_mp_ref in
         *::*)
@@ -310,7 +304,7 @@ _manifest_path() {
                     ;;
             esac
             [ -n "$_mp_name" ] || { _error "missing manifest name in [$_mp_ref]"; return 1; }
-            _mp_container=$("$_sec_bin" store root "$_mp_alias") || {
+            _mp_store=$("$_sec_bin" store dir "$_mp_alias") || {
                 _error "cannot resolve manifest store alias [$_mp_alias]"
                 return 1
             }
@@ -323,7 +317,7 @@ _manifest_path() {
 
     _valid_entry "$_mp_name" || { _error "invalid manifest name [$_mp_name]"; return 1; }
     _mp_rest=$_mp_name
-    _mp_cur=$_mp_container/run
+    _mp_cur=$_mp_store/manifests
     [ ! -L "$_mp_cur" ] || { _error "symlinked manifest directory [$_mp_cur]"; return 1; }
     while :; do
         case $_mp_rest in
@@ -388,7 +382,7 @@ _load_manifest() {
     case $_lm_ref in
         /*|./*|../*) ;;
         *)
-            if "$_sec_bin" store dir --project-sec >/dev/null 2>&1; then
+            if "$_sec_bin" store dir --project >/dev/null 2>&1; then
                 SEC_STORE_PROJECT_ONLY=1
                 export SEC_STORE_PROJECT_ONLY
             fi
@@ -451,7 +445,7 @@ _manifest_editor() {
 
 _manifest_run_dir() {
     _pin_store || return 1
-    _mr_dir=$_container_root/run
+    _mr_dir=$_store_root/manifests
     [ ! -L "$_mr_dir" ] || { _error "symlinked manifest directory [$_mr_dir]"; return 1; }
     if [ -e "$_mr_dir" ] && [ ! -d "$_mr_dir" ]; then
         _error "manifest path [$_mr_dir] is not a directory"
@@ -553,8 +547,8 @@ usage:
 `m` is a short alias for `manifest`.
 
 commands:
-    ls|l            list named manifests in the selected sec/run/ directory
-    edit|e NAME     edit or create local NAME; creates run/ and parent dirs as needed
+    ls|l            list named manifests in the selected store/manifests/ directory
+    edit|e NAME     edit or create local NAME; creates manifests/ and parent dirs as needed
     rm|r NAME ...   remove local named manifests
 
 Aliased manifests (ALIAS::NAME) are loaded with -m/--manifest and are read-only.
@@ -746,8 +740,8 @@ _inspect_env_key() {
 
 _inspect() {
 	printf 'Context:\n'
-	printf '  container: %s\n' "$_container_root"
-	printf '  store:     %s\n' "$_store_dir"
+	printf '  store:   %s\n' "$_store_root"
+	printf '  secrets: %s\n' "$_secrets_dir"
 
 	if [ -s "$_tmp/manifests-used" ]; then
 		printf '\nManifests:\n'

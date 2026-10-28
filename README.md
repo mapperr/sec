@@ -87,7 +87,7 @@ Aliases include `sec git l`, `a`, `r`, `t`, `u`, and `f`; see `sec git --help` f
 
 ## Encrypted store: sec-store
 
-`sec-store` keeps each secret as an encrypted `.age` entry, suitable for personal use or a Git-backed team store:
+`sec-store` keeps each secret as an encrypted `.age` entry. It can be used as a personal store, a project store committed with the application, or a shared store referenced from other stores.
 
 ```sh
 sec store init
@@ -95,293 +95,562 @@ printf '%s\n' 'example-password' | sec store put personal/example
 sec store get personal/example
 sec store edit personal/example
 sec store ls
-sec store y                              # sync the selected sec data with Git
+sec store search github
 ```
 
-### One format for personal, project and remote stores
+### Store model
 
-Every **sec container** has the same structure: a required `store/` directory with encrypted `.age` entries and `.recipients` policies, an optional plain-text `stores` file declaring other stores, and an optional `run/` directory with manifests.
+A **store** is one directory with this canonical layout:
 
 ```text
-# Personal container (breaking change)
-~/.local/share/sec/
-├── store/
+store-root/
+├── secrets/                 # required
 │   ├── .recipients
 │   └── accounts/github.age
-├── stores
-└── run/default
+├── manifests/               # optional, used by sec-run
+│   └── dev
+└── stores                   # optional references to other stores
+```
 
-# Project container
+The same format is used everywhere:
+
+```text
+# Personal store
+~/.local/share/sec/
+├── secrets/
+├── manifests/
+└── stores
+
+# Project store
 myproject/.sec/
-├── store/
-│   ├── .recipients
-│   └── dev/app.env.age
-├── stores
-└── run/dev
+├── secrets/
+├── manifests/
+└── stores
 
 # Root of a shared Git repository
 shared-secrets/
-├── store/
-│   ├── .recipients
-│   └── databases/test.env.age
-├── stores                  # optional
-└── run/                    # optional
+├── secrets/
+├── manifests/
+└── stores
 ```
 
-There is **no automatic migration** from the old personal layout, where entries lived directly in `~/.local/share/sec/`. Move the existing encrypted entries, their directory structure, and their `.recipients` files into `~/.local/share/sec/store/` before using the new version. They do not need to be decrypted or re-encrypted. Leave any `stores` file and `run/` directory at the container level; inspect the existing directory before moving files to avoid overwriting anything. No legacy layout fallback is provided.
-
-`sec-store` selects the default store in this order:
-
-1. `SEC_STORE_DIR`, if set (points to the **store/** directory, not its container).
-2. The nearest `.sec/store`, searching upward from the current directory.
-3. `${XDG_DATA_HOME:-$HOME/.local/share}/sec/store` (personal).
-
-The discovery is read-only. Existing symlinks to `.sec`, `.sec/store`, or the personal store directory are followed; broken links fail instead of triggering another fallback. Individual secrets and `.recipients` files inside `store/` may **not** be symlinks. `SEC_STORE_REQUIRE_PROJECT=1` prevents the implicit personal fallback; an explicit `SEC_STORE_DIR` still takes precedence. For the new layout, point an explicit `SEC_STORE_DIR` at a path ending in `/store` to give it an associated container for `stores` and `run/`.
+`SEC_STORE_DIR` always points to the **store root**, never to `secrets/`:
 
 ```sh
-cd /path/to/myproject
-sec store init --project             # creates .sec/store here
-sec store dir                        # path to the selected store/
-sec store root                       # path to its enclosing .sec/
-sec store dir --source               # project / explicit / personal
-sec store put dev/database.env < ./database.env
-
-# From anywhere beneath the project, the same store is discovered:
-cd src/api
-sec store ls
-sec store get dev/database.env
-
-# Outside any project:
-sec store init                       # initializes the personal .../sec/store/
-sec store root                       # ~/.local/share/sec
+SEC_STORE_DIR="$HOME/src/secrets" sec store ls
 ```
 
-`.recipients` applies to its directory and descendants; the closest policy wins. Without a policy, the core's self-recipient fallback applies. **Commit an explicit `.sec/store/.recipients` for team stores** so each developer encrypts for the intended recipients rather than just themselves. Never commit plaintext secrets or private identities.
+The default store selection order is:
 
-`sec store get` emits plaintext to stdout. `sec store git ...` / `sec store g ...` runs Git from the resolved physical store directory; if `store/` is symlinked outside the project checkout, Git operates in that destination repository. `sec store dir --project-sec` remains available for finding the associated project `.sec` directory.
+1. `SEC_STORE_DIR`, if set.
+2. The nearest `.sec/`, searching upward from the current directory.
+3. `${XDG_DATA_HOME:-$HOME/.local/share}/sec`.
 
-### Git sync: `y`
+`SEC_STORE_REQUIRE_PROJECT=1` disables the personal fallback. `sec store dir` prints the selected store root:
 
-`sec store y [message ...]` synchronizes the selected sec data with Git using the same convenient workflow as `tsk y` and `trk y`:
+```sh
+sec store dir
+sec store dir --source            # explicit / project / personal
+sec store dir --project           # current project's selected .sec store
+sec store dir shared              # resolve an aliased store
+```
+
+A store root may itself be a symlink, for example:
+
+```text
+project/.sec -> /home/me/shared/project-store
+```
+
+`secrets/` itself is not a symlink boundary: it must be a real directory inside the store, and managed secret/policy paths may not contain symlinks.
+
+Initialize stores with:
+
+```sh
+sec store init                    # selected/personal store
+sec store init --project          # creates .sec/secrets in current directory
+```
+
+### Breaking change from the previous 0.9 layout
+
+There is no legacy-layout fallback. Existing stores must be renamed:
+
+```text
+old                         new
+
+store/                  ->  secrets/
+run/                    ->  manifests/
+stores                   ->  stores
+```
+
+For example:
+
+```sh
+cd ~/.local/share/sec
+mv store secrets
+mv run manifests                 # if present
+```
+
+and for a project:
+
+```sh
+cd myproject/.sec
+mv store secrets
+mv run manifests                 # if present
+```
+
+Remote Git stores need the same rename at repository root.
+
+`SEC_STORE_DIR` also changed meaning:
+
+```sh
+# old
+SEC_STORE_DIR=/path/to/sec/store
+
+# new
+SEC_STORE_DIR=/path/to/sec
+```
+
+The old `sec store root` command is removed because `sec store dir` now returns the store root directly. `sec store dir --project-sec` is replaced by `sec store dir --project`.
+
+If you previously symlinked only the old `store/` directory, prefer symlinking the entire store root in the new model.
+
+### Secret entries
+
+Secret names are relative to `secrets/` and are stored as `<name>.age`:
+
+```sh
+sec store put dev/database.env < ./database.env
+sec store get dev/database.env
+sec store edit dev/database.env
+
+sec store ls
+sec store ls dev
+sec store search 'token$'
+sec store search database dev
+
+sec store rm dev/database.env
+```
+
+`search|s` filters the logical entry list with `grep`:
+
+```sh
+sec store s '^dev/'
+sec store search 'token$' shared::
+```
+
+Plaintext secret contents are never written inside `secrets/` during normal store operations.
+
+### Recipient policies
+
+A `.recipients` file contains one age or SSH recipient per non-empty line. Blank lines and `#` comments are ignored:
+
+```text
+# Development team
+age1...
+ssh-ed25519 AAAA... alice@example
+```
+
+A policy applies to its directory and descendants. The **nearest `.recipients` wins**; parent and child policies are not merged. If no policy exists, `sec` falls back to its self recipient.
+
+For a team store, commit an explicit root policy:
+
+```text
+.sec/secrets/.recipients
+```
+
+Inspect effective policies:
+
+```sh
+sec store policy dev/database.env
+sec store policy path dev/database.env
+sec store policy show dev/database.env
+
+sec store policy path .
+sec store policy show .
+```
+
+Manage exact policy scopes:
+
+```sh
+sec store policy edit
+sec store policy edit dev
+
+sec store policy add . self
+sec store policy add dev 'age1...'
+sec store policy rm dev 'age1...'
+
+sec store policy delete dev
+sec store policy del dev
+sec store policy d dev
+```
+
+`.` means the root policy under `secrets/`. The special recipient `self` is resolved immediately through `sec recipient`; the literal word `self` is never written to `.recipients`.
+
+`policy rm` removes one recipient and refuses to leave an empty policy. `policy delete` removes the exact `.recipients` file and therefore restores inheritance from the nearest parent policy (or self fallback at root).
+
+For mutation targets, an existing entry selects the policy of its containing directory. Use a trailing `/` to force a prefix or `.age` to force an entry when a name is ambiguous:
+
+```sh
+sec store policy add dev/ self
+sec store policy add dev.age self
+```
+
+### Store references: `stores`
+
+A store may reference other local or remote stores through its plain-text `stores` file:
+
+```text
+# alias   source
+personal file:///home/mapperr/src/git.sr.ht/~mapperr/secrets
+shared   git+ssh://git@example.org/company/shared-secrets.git
+infra    git+https://git.example.org/company/infra-secrets.git
+```
+
+The source always names a complete store root.
+
+Manage the file with:
+
+```sh
+sec store stores ls
+sec store stores edit
+sec store stores path
+```
+
+Project aliases override personal aliases of the same name. `SEC_STORE_PROJECT_ONLY=1` disables personal alias fallback.
+
+Use aliases with read-only operations:
+
+```sh
+sec store get shared::databases/test.env
+sec store ls shared::
+sec store search database shared::
+sec store policy show shared::databases/test.env
+sec store dir shared
+```
+
+Aliased stores are intentionally read-only through `alias::entry`. To modify one, select that store directly with `SEC_STORE_DIR` or work inside its checkout.
+
+#### Local stores: `file://`
+
+A local reference is resolved directly, without a backend or cache:
+
+```text
+local file:///home/me/secrets
+```
+
+The target must have the canonical layout and a real `secrets/` directory.
+
+#### Git-backed remote stores
+
+`git+ssh://` and `git+https://` are implemented by the separate `sec-store-remote-git` backend.
+
+The first access fetches a missing store into a private ciphertext cache:
+
+```text
+${XDG_CACHE_HOME:-$HOME/.cache}/sec/stores/
+```
+
+Subsequent reads reuse the cached snapshot. Stores are **not automatically updated** on every use:
+
+```sh
+sec store update shared
+sec store update --all
+```
+
+`update --all` skips `file://` aliases.
+
+For reproducible use, a full Git commit can be pinned:
+
+```text
+shared git+ssh://git@example.org/company/shared-secrets.git#0123456789abcdef0123456789abcdef01234567
+```
+
+Only full 40- or 64-hex commit IDs are accepted. A pinned store remains on that revision until the `stores` declaration itself changes.
+
+`SEC_STORE_OFFLINE=1` prevents fetching an unavailable/outdated remote revision. `SEC_STORE_CACHE_DIR` overrides the cache root.
+
+Remote repositories are fetched without a normal working-tree checkout, so clean/smudge filters are not executed. Symlinks and submodules in remote stores are rejected.
+
+Future transports can be added as separate backends (for example HTTP or SFTP) without changing `sec-run`.
+
+### Git commands and sync
+
+Run Git directly from the selected store root:
+
+```sh
+sec store git status
+sec store g log --oneline
+```
+
+`sec store y [message ...]` provides a small add/commit/pull/push workflow:
 
 ```sh
 sec store y
 sec store y 'rotate development credentials'
 ```
 
-The command stages the sec sync scope, creates a commit when there are changes, runs `git pull --rebase`, and then pushes. The default commit message is `sync`; any remaining arguments are joined and used as the commit message. If the current branch has no upstream, `y` prefers `origin`, otherwise it uses the only configured remote when that choice is unambiguous, and performs the initial `git push -u <remote> HEAD`.
+It stages only the selected store. If `.sec/` lives inside a larger application repository, unrelated files outside `.sec/` are not staged; the command refuses to start when outside changes would make `git pull --rebase` unsafe.
 
-The sync target follows the **resolved physical store**, which matters when symlinks are used:
+The default commit message is `sync`. If the current branch has no upstream, `y` prefers `origin`, otherwise the only unambiguous configured remote, and performs the initial `git push -u`.
 
-- If `store/` and its sec container belong to the same Git repository, the whole sec container is synchronized so that `store/`, `stores`, and `run/` are kept together.
-- If `store/` is a symlink into a separately versioned secrets repository, `y` synchronizes that physical repository instead of the logical container containing the symlink.
-- If the physical path is a canonical remote-style container whose `store/` directory lives beside `stores` and `run/`, the whole physical container is synchronized.
-
-A sec container may live inside a larger application repository. In that case `y` stages and commits only the sec sync scope; it never stages unrelated application files. Before starting the sync it also refuses to proceed when the surrounding repository has changes outside that scope, because `git pull --rebase` would not be safe or predictable:
-
-```text
-sec-store: error: Git repository has changes outside the sec sync scope; commit or stash them before sync
-```
-
-`y` is intended for a writable Git-backed personal or project store. Aliased remote stores fetched through `sec-store-remote-git` remain read-only snapshots; update those with `sec store update <alias>` instead.
-
-### Shared stores via aliases and Git remotes
-
-Add a public, declarative `stores` file to either the project container (`.sec/stores`) or the personal one (`~/.local/share/sec/stores`):
-
-```text
-# alias   remote source
-shared git+ssh://git@example.org/company/shared-secrets.git
-infra  git+https://git.example.org/company/infra-secrets.git
-```
-
-Edit it with your usual editor or retrieve its path:
+### Validation and rekeying
 
 ```sh
-sec store stores edit
-sec store stores path
-sec store sources                    # show effective aliases and sources
+sec store check
+sec store rekey
+sec store rekey dev
 ```
 
-Both Git protocols use the separate `sec-store-remote-git` companion. A remote repository has exactly the same container layout as above, with `store/` at its root and optional `stores` and `run/`. Neither remote manifests nor transitive aliases are imported automatically by the first version. The personal `stores` file can supply interactive aliases not present in a project; a **named project manifest** intentionally uses project aliases only, so it cannot depend on one developer's private configuration. A project alias with the same name overrides the personal alias.
+`check` validates managed secret paths, age ciphertexts and recipient policies. Set `SEC_STORE_CHECK_DECRYPT=1` to additionally attempt decryption with the current identities.
 
-```sh
-sec store get dev/app.env             # current project or personal store
-sec store get shared::databases/test.env
-sec store ls shared::                 # list entries with qualified names
-sec store ls shared::databases
-sec store policy shared::databases/test.env
-```
-
-The first access to an absent remote store automatically clones it into a private ciphertext cache under `${XDG_CACHE_HOME:-$HOME/.cache}/sec/stores/`. Subsequent reads reuse the cached snapshot without network access. **Nothing is automatically pulled on subsequent runs.** To update explicitly:
-
-```sh
-sec store update shared
-sec store update --all               # all aliases declared in this container
-SEC_STORE_OFFLINE=1 sec store get shared::databases/test.env
-```
-
-Remote entries are **read-only when accessed via an alias**: `put`, `edit`, `rm` and `rekey` act only on your selected local store. To change a shared secret, change it in the shared repository's own checkout and commit/push it there; then run `sec store update shared` in dependent projects. Updating publishes a new local snapshot without modifying an existing snapshot, so running commands can keep using the snapshot they already resolved. Older cached snapshots are retained; cache pruning is not yet provided.
-
-For reproducible builds, optionally pin a full Git commit (40 or 64 hexadecimal characters):
-
-```text
-shared git+ssh://git@example.org/company/shared-secrets.git#0123456789abcdef0123456789abcdef01234567
-```
-
-A pinned alias keeps referring to that commit even after `update`; changing the pin requires updating the container's `stores` file. HTTPS authentication and SSH access use your normal Git configuration. Do not put credentials in remote URLs; `sec-store` does not grant access to secrets merely by downloading ciphertext. The reader still needs an age identity authorized by the remote store's `.recipients` policy. Remove access by rotating **underlying credentials**, not just by removing a recipient from the current Git version: older Git history and cached snapshots may remain decryptable.
-
-A `stores` file is data, **not shell code**. Only `git+ssh://` and `git+https://` sources are supported initially; HTTP and SFTP backends can be added later. Remote repositories are downloaded without a working-tree checkout (and extracted from Git objects), so their clean/smudge filters are not executed. Repository symlinks and submodules are rejected by this backend. As with any repository, only use remotes you trust to supply the desired ciphertext and manifest data. `SEC_STORE_CACHE_DIR` overrides the cache location; `SEC_STORE_OFFLINE=1` prevents an initial fetch or explicit update if the source is not available at the requested cached revision.
+`rekey` decrypts and re-encrypts matching entries through a FIFO, without writing plaintext regular files.
 
 ## Developer workflows: sec-run
 
-`sec-run` launches an arbitrary command with secret environment variables and/or temporary files obtained from **sec-store**. It uses the same automatic store discovery and also accepts `alias::entry` references for shared stores. Running it from a project subdirectory requires no local store-path setup. No plaintext needs to be checked into your project, and the calling shell's environment is left unchanged.
+`sec-run` launches one command with environment variables and/or temporary files obtained from `sec-store`.
+
+It uses the same store discovery, so from inside a project this usually requires no store-path configuration:
 
 ```sh
 sec run \
     -e dev/app.env \
-    -e shared/monitoring.env \
-    -f dev/client.crt:TLS_CERT \
-    -f dev/client.key:TLS_KEY \
-    -f dev/credentials.json \
-    -- ./myapp --port 8080
+    -v API_TOKEN:dev/api-token \
+    --val ENVIRONMENT=development \
+    -f dev/client.key:SSH_KEY \
+    -- ./myapp
 ```
 
-In this example, `sec-run` loads both environment entries, decrypts the certificate, key, and JSON file into a private temporary directory, and starts `./myapp`. The child receives `TLS_CERT`, `TLS_KEY`, and `CREDENTIALS_JSON`, each holding an **absolute temporary file path**, not the file contents. `SEC_RUN_DIR` points to the directory containing the materialized files.
-
-### Project manifests: `-m` / `--manifest`
-
-For projects that need several environment files and certificates, keep **references**, not secret values, in `.sec/run/` beside the project store. A named manifest resolves in the **selected container's `run/`** (`.sec/run/` for a project or `~/.local/share/sec/run/` outside projects). The selection is stable even if the project's `.sec` or `store/` is symlinked elsewhere. A project manifest only uses the project `stores` declarations, never accidental personal alias fallbacks.
+The four injection types are deliberately small and distinct:
 
 ```text
-myproject/
-├── .sec/
-│   ├── store/
-│   │   ├── .recipients
-│   │   └── dev/
-│   │       ├── app.env.age
-│   │       ├── client.crt.age
-│   │       └── client.key.age
-│   ├── stores
-│   └── run/
-│       └── dev
-├── justfile
-└── src/
+env ENTRY                import literal NAME=VALUE lines from a secret
+var NAME:ENTRY           set NAME to the exact contents of one secret
+val NAME=VALUE           set a literal non-secret value
+file ENTRY[:NAME]        materialize a secret file and export its path
 ```
 
-Example `.sec/run/dev` (one directive and one entry per line, blank lines and `#` comments allowed):
+`var` preserves the secret contents exactly, including trailing newlines. Unix environment variables cannot contain NUL bytes, so NUL is rejected. Inspect mode warns about a trailing LF or CRLF without altering the value.
 
-```text
-# Project development environment
-env dev/app.env
-file dev/client.crt:TLS_CERT
-file dev/client.key:TLS_KEY
+`val` is literal data: it splits on the first `=` and performs no interpolation, shell quoting, variable expansion or command substitution.
 
-# Shared store declared in .sec/stores
-env shared::databases/test.env
-file shared::certificates/company-ca.pem:TLS_CA
-```
+### Environment entries: `env`
 
-From **any directory inside the project**:
-
-```sh
-sec run -m dev                         # inspect without showing secret values
-sec run -m dev -- ./myapp              # run with variables and temporary files
-sec run -m dev --print                 # print sensitive values: do not log
-sec run -m dev -e shared/extra.env -- ./myapp
-```
-
-A bare manifest name such as `dev` resolves to the current container's `run/dev`; `sec-run` does not independently search for manifests in parent directories. Explicit manifest paths (`./config/run`, `../config/run`, `/absolute/run`) work with any store. You can repeat `-m` and mix manifests with `-e`/`-f` options; they are processed in command-line order. Manifests contain only literal `env ENTRY` and `file ENTRY[:ENV_VAR]` directives (the aliases `-e ENTRY` and `-f ENTRY[:ENV_VAR]` also work). No `source`, `eval`, interpolation, shell quoting, or inline comments are executed. Entries in a manifest are whitespace-free; use direct CLI flags for names containing spaces.
-
-For a team repository, commit `.sec/run/`, `.sec/stores`, and the **ciphertext** under `.sec/store/`. After an ordinary `git clone`, a developer with Git and age access can run `sec run -m dev -- ./myapp`: missing shared repositories are fetched automatically once. If the project store is missing, a named manifest fails instead of silently borrowing an unrelated personal manifest; use `SEC_STORE_REQUIRE_PROJECT=1` to prohibit personal fallback for ordinary commands too.
-
-### Environment entries: `-e`
-
-An environment entry is a secret in the store containing literal `NAME=VALUE` lines:
+An `env` entry contains literal `NAME=VALUE` lines:
 
 ```dotenv
-# dev/app.env (contents before encryption)
 DATABASE_HOST=localhost
 DATABASE_PASSWORD=example value with spaces
 API_TOKEN=example-token
 ```
 
+Use it with:
+
 ```sh
 sec run -e dev/app.env -- ./myapp
 ```
 
-Repeat `-e` to combine multiple entries; when the same variable appears in more than one, **the last definition wins**. The parser treats values literally: it does not `source` the entry, execute command substitutions, expand variables, or interpret shell quoting. Blank lines and lines beginning with `#` are ignored. Environment values must be single-line and cannot contain NUL bytes.
+Blank lines and lines beginning with `#` are ignored. Multiple `-e` entries are processed in order; for variables defined by more than one `env`, the last assignment wins.
 
-### Temporary files: `-f`
+### Scalar secret values: `var`
 
-Each `-f` takes a store entry with an optional environment variable name:
-
-```text
--f ENTRY
--f ENTRY:ENV_VAR
-```
-
-If the variable is omitted, it is derived from the entry's basename: `dev/credentials.json` becomes `CREDENTIALS_JSON`, and `shared::certificates/ca.pem` becomes `CA_PEM`. Paths within the temporary directory preserve the entry's relative structure; files from aliased stores are namespaced under the alias (for example `shared/certificates/ca.pem`). Duplicate destinations or variables are errors.
+Use a whole secret as one environment variable:
 
 ```sh
 sec run \
-    -f prod/frontend/credentials.json:FRONTEND_CREDENTIALS \
-    -f prod/backend/credentials.json:BACKEND_CREDENTIALS \
-    -- ./myapp
+    -v DNSIMPLE_TOKEN:personal::dnsimple.com/terraform-token \
+    -- terraform plan
 ```
 
-Duplicate file destinations, duplicate `-f` environment variable names, and collisions between `-e` variables and file-path variables are **errors**, detected before the command starts. `:` is reserved as the separator for an explicit variable name in `-f` arguments.
+The stored bytes are preserved except that NUL is rejected by the environment model.
 
-### Inspect before running
+### Literal values: `val`
 
-Omit the command to see what would be injected **without displaying secret values**:
+Non-secret configuration can live directly in the invocation or manifest:
 
 ```sh
-sec run -e dev/app.env -f dev/client.key:TLS_KEY
+sec run \
+    --val DNSIMPLE_EMAIL=me@example.org \
+    --val DNSIMPLE_ACCOUNT_ID=12345 \
+    -- ./client
 ```
 
-Use `--print` to print the resolved environment, **including sensitive values**:
+This avoids creating a separate `.env`/`.envrc` for small, static, non-sensitive values.
+
+### Temporary files: `file`
 
 ```sh
-sec run --print -e dev/app.env -f dev/client.key:TLS_KEY
+sec run \
+    -f infra/ssh/deploy.key:SSH_KEY \
+    -- sh -c 'exec ssh -i "$SSH_KEY" -o IdentitiesOnly=yes user@server'
 ```
 
-In this mode, file paths are **placeholders**, not reusable files; no application is started. Do not use `--print` in routine CI logs or paste its output into tickets or chat.
+If the variable is omitted, it is derived from the entry basename. For example:
 
-Use `--env-only` to emit only resolved `NAME=VALUE` assignments (no `-f` allowed):
+```text
+dev/credentials.json -> CREDENTIALS_JSON
+```
+
+Files are materialized under a private runtime workspace with mode `0600`; `SEC_RUN_DIR` points to their private parent.
+
+### Manifests
+
+Named manifests live under the selected store's `manifests/` directory:
+
+```text
+myproject/.sec/
+├── secrets/
+│   └── dev/
+│       ├── app.env.age
+│       ├── api-token.age
+│       └── client.key.age
+├── manifests/
+│   └── dev
+└── stores
+```
+
+Manage local manifests with:
 
 ```sh
-sec run --env-only -e dev/app.env -e shared/monitoring.env
+sec run manifest ls
+sec run manifest edit dev
+sec run manifest rm dev
+
+# short namespace
+sec run m l
+sec run m e dev
+sec run m r dev
 ```
 
-This output is sensitive, too. It is data for programs that accept env-file syntax, **not a script to evaluate with `eval` or `source`**. `--print` and `--env-only` cannot be combined with `-- command`.
+`manifest edit` creates `manifests/` and any required parent directories automatically.
 
-### Lifetime, cleanup, and security
+Example manifest:
 
-`sec-run` prepares **all** required secrets before launching the command; an invalid entry, failed decryption, or variable collision prevents launch. It supervises the child and returns its exit status. Temporary files have mode `0600` under a private `0700` workspace and are removed when the supervised command terminates.
+```text
+# Secret env file
+env dev/app.env
 
-The workspace's parent defaults to `$XDG_RUNTIME_DIR`. There is **no automatic `/tmp` fallback**: set `SEC_RUN_TMPDIR` if needed, to an existing, private directory owned by your user. Prefer a private tmpfs where available. Do not assume files remain available after the supervised command exits; subprocesses that outlive it may lose access. As with any environment injection, child processes can inherit secret variables, so scope `sec run` around the smallest practical command.
+# One secret -> one environment variable
+var API_TOKEN:dev/api-token
 
-`sec-run` relies on `sec store dir` and `sec store root` for store selection; `SEC_STORE_DIR` is optional, and `SEC_STORE_REQUIRE_PROJECT=1` prevents unintended personal fallback. Runner-specific settings remain `SEC_RUN_SEC`, `SEC_RUN_TMPDIR`, and `SEC_RUN_DEBUG`, all with the `SEC_RUN_` prefix.
+# Non-secret static configuration
+val ENVIRONMENT=development
 
-### Make, Just, and direnv
-
-A Make target can give one command exactly the secrets it needs:
-
-```makefile
-.PHONY: run
-run:
-	@sec run -e dev/app.env -f dev/client.key:TLS_KEY -- ./myapp
+# Secret temporary file
+file dev/client.key:SSH_KEY
 ```
 
-Or put the same workflow in a `justfile`:
+The aliases `-e`, `-v` and `-f` are also accepted as manifest directives. Manifest content is data, never shell code.
 
-```just
-run:
-    @sec run -e dev/app.env -f dev/client.key:TLS_KEY -- ./myapp
+Run it with:
+
+```sh
+sec run -m dev -- ./myapp
 ```
 
-With a project-local `.sec/store`, **direnv is optional**: `sec-store` and `sec-run` discover it from any project subdirectory. A `justfile` can use a versioned manifest without repeating secret arguments:
+A bare manifest name resolves under the selected store:
+
+```text
+<store>/manifests/dev
+```
+
+A manifest can also come from an aliased store:
+
+```sh
+sec run -m shared::terraform -- terraform plan
+```
+
+which resolves:
+
+```text
+shared-store/manifests/terraform
+```
+
+Inside an aliased manifest, unqualified `env`, `var` and `file` entries automatically inherit the manifest's alias. For example:
+
+```text
+# shared/manifests/terraform
+var API_TOKEN:api/token
+file credentials.json:CREDENTIALS
+```
+
+loaded as:
+
+```sh
+sec run -m shared::terraform -- ...
+```
+
+is equivalent to references to `shared::api/token` and `shared::credentials.json`. Already-qualified references are left unchanged. `val` needs no store context.
+
+Explicit manifest paths (`./path`, `../path`, `/absolute/path`) are also accepted and do not inherit an alias.
+
+Aliased manifests are read-only through `sec-run`; `manifest edit/rm` operate only on the selected local store.
+
+Manifests are intentionally atomic: they do not include/chaining other manifests. Compose multiple manifests explicitly at the call site:
+
+```sh
+sec run -m shared::dnsimple -m dev -- terraform plan
+```
+
+This keeps dependencies visible and troubleshooting straightforward.
+
+### Inspect and troubleshooting
+
+Omit the command to inspect what will be injected without revealing secret values:
+
+```sh
+sec run -m dev
+```
+
+Example:
+
+```text
+Context:
+  store:   /home/me/project/.sec
+  secrets: /home/me/project/.sec/secrets
+
+Manifests:
+  dev -> /home/me/project/.sec/manifests/dev
+
+Environment:
+  API_TOKEN=<secret>  var:dev/api-token  <- manifest dev:3
+  REGION=<literal>  val  <- manifest dev:4
+
+Files:
+  SSH_KEY=<file>  file:dev/client.key -> <SEC_RUN_DIR>/dev/client.key  <- manifest dev:5
+
+Runtime:
+  SEC_RUN_DIR=<temporary directory>
+```
+
+For `var`, inspect mode appends `[trailing LF]` or `[trailing CRLF]` when appropriate. This is diagnostic only; the stored value is not trimmed.
+
+For variables loaded from multiple `env` entries, inspect output shows the final source and how many earlier assignments were overridden.
+
+`--print` displays resolved values and is sensitive:
+
+```sh
+sec run -m dev --print
+```
+
+`--env-only` emits only resolved `NAME=VALUE` assignments and does not allow `file` entries:
+
+```sh
+sec run --env-only -e dev/app.env -v TOKEN:dev/token
+```
+
+These outputs are data, not shell scripts; do not `eval` or `source` them.
+
+### Lifetime and cleanup
+
+`sec-run` resolves and validates all requested inputs before starting the command. Invalid entries, failed decryption and variable/file collisions prevent launch.
+
+Temporary files live under a private `0700` workspace beneath `$XDG_RUNTIME_DIR` by default and are removed when the supervised command exits. There is no automatic `/tmp` fallback; set `SEC_RUN_TMPDIR` to another private directory when needed.
+
+The child receives `SEC_RUN_DIR` and any requested variables. Scope `sec run` around the smallest practical command because subprocesses inherit environment variables, and processes that outlive the supervised command may lose access to temporary files.
+
+### Make, Just and direnv
+
+A `justfile` can keep the project invocation short:
 
 ```just
 run:
@@ -391,7 +660,14 @@ inspect:
     @sec run -m dev
 ```
 
-If you use direnv, you can keep `.envrc` free of secrets and use it for unrelated project settings. Prefer injecting secret values through `sec-run` at command launch rather than loading them automatically into your interactive shell when entering a directory.
+or compose reusable external manifests explicitly:
+
+```just
+plan:
+    @sec run -m shared::dnsimple -m terraform-dev -- terraform plan
+```
+
+With a project `.sec/`, `direnv` is not required for store discovery. If you use it, keep secret values out of `.envrc`; prefer injecting them only when the target command starts.
 
 ## References
 
