@@ -74,7 +74,8 @@ beginning with # are ignored. No quotes, interpolation or shell syntax.
 A file entry's relative path is preserved under SEC_RUN_DIR (mode 0700).
 A materialized file has mode 0600. SEC_RUN_DIR contains temporary paths,
 not the secret contents. These paths remain available only while the command
-is running. The runner returns the command's exit status.
+is running. The command inherits the caller's stdin/stdout/stderr; pipes and
+interactive stdin therefore work normally. The runner returns the command's exit status.
 
 env vars:
     SEC_STORE_DIR        optional explicit store root (handled by sec-store)
@@ -808,15 +809,20 @@ _print_resolved() (
 )
 
 _run_command() {
+	# POSIX shells may attach /dev/null to an asynchronous command's stdin.
+	# Save the caller's stdin on fd 9 before backgrounding the supervised child,
+	# then restore it immediately before exec.
+	exec 9<&0 || { _error 'cannot preserve command stdin'; return 1; }
 	(
 		# Resolve cleanup utility before imported PATH can change it.
 		_run_rm=$(command -v rm) || exit 1
 		_apply_env || exit 1
 		# A decrypted environment source is needed only while preparing the child.
 		"$_run_rm" -rf -- "$_tmp/envs" "$_tmp/values" "$_tmp/literals" || exit 1
-		exec "$@"
+		exec "$@" <&9 9<&-
 	) &
 	_child=$!
+	exec 9<&-
 	wait "$_child"
 	_rc=$?
 	_child=
