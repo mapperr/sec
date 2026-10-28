@@ -17,6 +17,7 @@ usage:
 keys:
     Ctrl-i   copy first decrypted line to clipboard
     Ctrl-u   copy entry name to clipboard
+    Ctrl-b   copy entry path to clipboard
     Ctrl-y   copy full decrypted entry to clipboard
     Ctrl-o   generate and copy TOTP to clipboard (requires sec-store-otp)
     Ctrl-v   view full decrypted entry
@@ -136,7 +137,7 @@ _copy_name() {
 _copy_path() {
 	name=$1
 	printf '%s' "$name" | _clip || return 1
-	_info "entry name copied: [$name]"
+	_info "entry path copied: [$name]"
 }
 
 _copy_first_line() (
@@ -425,7 +426,7 @@ _run_fzf() (
 
 main() {
 	case ${1:-} in
-		--list|--copy-first|--copy-name|--copy-full|--otp|--view|--preview|--policy|--edit|--rekey|--remove|--new)
+		--list|--copy-first|--copy-name|--copy-path|--copy-full|--otp|--view|--preview|--policy|--edit|--rekey|--remove|--new)
 			cmd=$1
 			shift
 			_internal "$cmd" "$@"
