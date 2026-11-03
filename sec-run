@@ -1,7 +1,7 @@
 #!/bin/sh
 # Run a command with secrets from sec-store. POSIX sh; no eval/source of secrets.
 
-VERSION=0.10.0
+VERSION=0.9.0
 
 umask 077
 set -f
@@ -30,11 +30,12 @@ options:
     -e, --env ENTRY              load literal NAME=VALUE lines from an entry (repeatable)
     -v, --var ENV_VAR=ENTRY     export ENV_VAR with the literal contents of one entry
                                 (repeatable)
-    --set ENV_VAR=VALUE         export a literal non-secret value (repeatable)
+    -s, --set ENV_VAR=VALUE     export a literal non-secret value (repeatable)
     -f, --file [ENV_VAR=]ENTRY materialize an entry and export its file path
                                 (repeatable; default ENV_VAR from basename)
-    -m, --manifest REF          load env/set/var/file entries from a declarative manifest
-                                REF is NAME, ALIAS::NAME, or an explicit PATH
+    -m, --manifest REF          require a manifest (NAME, ALIAS::NAME, or PATH)
+    -M, --optional-manifest REF   load REF if present; missing file is OK, other
+                                 errors (invalid syntax, inaccessible store, etc.) fail
     --print                     display resolved variables, including secret values;
                                 file paths are placeholders, not usable runtime paths
     --env-only                  output resolved NAME=VALUE lines (no -f allowed)
@@ -42,7 +43,7 @@ options:
     -h, --help                  show help
 
 No command: inspect the injection without printing secret values. Inspect output
-shows the selected store, loaded manifests, source entries and directive origin.
+shows the selected store, loaded/skipped manifests, source entries and directive origin.
 For var entries it also warns about a trailing LF or CRLF without modifying the
 secret value. Use -- to separate runner options from the command. --print and --env-only
 cannot be combined with a command. -e entries are merged in order (last wins).
@@ -65,6 +66,11 @@ never shell code. A bare NAME resolves in the selected store's manifests/ direct
 (project .sec/manifests or personal ~/.local/share/sec/manifests).
 ALIAS::NAME resolves NAME in that aliased store's manifests/ directory;
 unqualified env/var/file entries inside it inherit ALIAS automatically.
+The built-in personal alias accesses the personal XDG store explicitly, even
+from a project (for example -M personal::maven). Absent optional manifests
+are skipped silently during execution, but shown in inspect output. Other
+errors remain fatal. An entirely absent optional manifest leaves the caller's
+existing environment untouched.
 Already-qualified entries are left unchanged. Explicit manifest paths work
 with any store and do not inherit an alias. Aliased manifests are read-only;
 manifest edit/rm operate on the selected local store. Aliases are declared
@@ -143,7 +149,7 @@ _require_runtime() {
 	: >"$_tmp/file-specs" && : >"$_tmp/file-vars" &&
 	: >"$_tmp/file-paths" && : >"$_tmp/file-meta" &&
 	: >"$_tmp/env-keys" && : >"$_tmp/env-files" &&
-	: >"$_tmp/manifests-used"
+	: >"$_tmp/manifests-used" && : >"$_tmp/manifests-skipped"
 }
 
 _valid_var() {
@@ -355,8 +361,23 @@ _manifest_ref_arg() {
     esac
 }
 
+# Return success only when a manifest or one of its parent directories
+# genuinely does not exist. Never silently skip an unreadable path, symlink,
+# or an existing non-directory parent.
+_optional_manifest_absent() {
+    _oma_path=$1
+    while [ ! -e "$_oma_path" ] && [ ! -L "$_oma_path" ]; do
+        case $_oma_path in
+            */*) _oma_path=${_oma_path%/*}; [ -n "$_oma_path" ] || _oma_path=/ ;;
+            *) return 1 ;;
+        esac
+    done
+    [ -d "$_oma_path" ] && [ -r "$_oma_path" ] && [ -x "$_oma_path" ] && [ ! -L "$_oma_path" ]
+}
+
 _load_manifest() {
     _lm_ref=$1
+    _lm_optional=${2:-0}
     _lm_default_alias=
     case $_lm_ref in
         /*|./*|../*) ;;
@@ -372,6 +393,13 @@ _load_manifest() {
             fi
             ;;
     esac
+    if [ "$_lm_optional" = 1 ] && [ ! -e "$_lm_path" ] && [ ! -L "$_lm_path" ]; then
+        if _optional_manifest_absent "$_lm_path"; then
+            printf '%s\n%s\n' "$_lm_ref" "$_lm_path" >>"$_tmp/manifests-skipped" || return 1
+            _debug "skipped absent optional manifest [$_lm_ref]"
+            return 0
+        fi
+    fi
     [ -f "$_lm_path" ] && [ -r "$_lm_path" ] && [ ! -L "$_lm_path" ] || {
         _error "manifest [$_lm_path] is not a readable regular file"
         return 1
@@ -735,6 +763,13 @@ _inspect() {
 		done <"$_tmp/manifests-used"
 	fi
 
+	if [ -s "$_tmp/manifests-skipped" ]; then
+        printf '\nSkipped optional manifests (not found):\n'
+        while IFS= read -r _im_ref && IFS= read -r _im_path; do
+            printf '  %s -> %s\n' "$_im_ref" "$_im_path"
+        done <"$_tmp/manifests-skipped"
+    fi
+
 	printf '\nEnvironment:\n'
 	while IFS= read -r _pr_key || [ -n "$_pr_key" ]; do
 		_inspect_env_key "$_pr_key" || return 1
@@ -843,9 +878,9 @@ main() {
 				_seen=1
 				shift 2
 				;;
-			--set)
-				[ "$#" -ge 2 ] || { _error "missing ENV_VAR=VALUE after [$1]"; return 2; }
-				_add_literal "$2" "cli --set" || return 2
+            -s|--set)
+                [ "$#" -ge 2 ] || { _error "missing ENV_VAR=VALUE after [$1]"; return 2; }
+                _add_literal "$2" "cli $1" || return 2
 				_seen=1
 				shift 2
 				;;
@@ -855,12 +890,19 @@ main() {
 				_seen=1
 				shift 2
 				;;
-			-m|--manifest)
-				[ "$#" -ge 2 ] || { _error "missing NAME|ALIAS::NAME|PATH after [$1]"; return 2; }
-				_load_manifest "$2" || return 2
-				shift 2
-				;;
-			--print)
+            -m|--manifest)
+                [ "$#" -ge 2 ] || { _error "missing NAME|ALIAS::NAME|PATH after [$1]"; return 2; }
+                _load_manifest "$2" || return 2
+                _seen=1
+                shift 2
+                ;;
+            -M|--optional-manifest)
+                [ "$#" -ge 2 ] || { _error "missing NAME|ALIAS::NAME|PATH after [$1]"; return 2; }
+                _load_manifest "$2" 1 || return 2
+                _seen=1
+                shift 2
+                ;;
+            --print)
 				[ "$_mode_set" -eq 0 ] || { _error 'only one output mode can be selected'; return 2; }
 				_mode=print; _mode_set=1; shift
 				;;
@@ -880,7 +922,7 @@ main() {
 			*) _error "unknown option [$1]; use -- before the command"; return 2 ;;
 		esac
 	done
-	[ "$_seen" -eq 1 ] || { usage >&2; _error 'specify at least one -e, -v, --set or -f entry'; return 2; }
+    [ "$_seen" -eq 1 ] || { usage >&2; _error 'specify at least one -e, -v, -s, -f, -m or -M entry'; return 2; }
 	if [ "$_mode" = env-only ] && [ -s "$_tmp/file-specs" ]; then
 		_error '--env-only does not accept -f file entries'
 		return 2

@@ -301,7 +301,7 @@ A store may reference other local or remote stores through its plain-text `store
 
 ```text
 # alias   source
-personal file:///home/mapperr/src/git.sr.ht/~mapperr/secrets
+office   file://~/src/company/secrets
 shared   git+ssh://git@example.org/company/shared-secrets.git
 infra    git+https://git.example.org/company/infra-secrets.git
 ```
@@ -316,7 +316,9 @@ sec store stores edit
 sec store stores path
 ```
 
-Project aliases override personal aliases of the same name. `SEC_STORE_PROJECT_ONLY=1` disables personal alias fallback.
+Project aliases take precedence over personal aliases. `SEC_STORE_PROJECT_ONLY=1` disables fallback to declarations in the personal `stores` file, but does not block an explicitly qualified `personal::...` reference. If no applicable declaration exists, the conventional alias **`personal`** points to `${XDG_DATA_HOME:-$HOME/.local/share}/sec`, including when working inside a project. A declaration named `personal` takes precedence over that convention; avoid overriding it in a shared project unless you intend that behavior.
+
+`local` has **no implicit meaning**: inside a project, the selected `.sec/` store is local too. You can use `local` freely as a name for a configured alias.
 
 Use aliases with read-only operations:
 
@@ -335,10 +337,10 @@ Aliased stores are intentionally read-only through `alias::entry`. To modify one
 A local reference is resolved directly, without a backend or cache:
 
 ```text
-local file:///home/me/secrets
+local file://~/secrets
 ```
 
-The target must have the canonical layout and a real `secrets/` directory.
+`file://~/...` and `file://~` expand **only the current user's `$HOME`**, not `~otheruser`, and do not expand environment variables or URI percent escapes. `file:///absolute/path` is also supported. The target must have the canonical layout and a real `secrets/` directory. `personal::...` is available without configuring a `local` alias when the personal XDG store is what you need.
 
 #### Git-backed remote stores
 
@@ -414,9 +416,9 @@ It uses the same store discovery, so from inside a project this usually requires
 ```sh
 sec run \
     -e dev/app.env \
-    -v API_TOKEN:dev/api-token \
-    --val ENVIRONMENT=development \
-    -f dev/client.key:SSH_KEY \
+    -v API_TOKEN=dev/api-token \
+    -s ENVIRONMENT=development \
+    -f SSH_KEY=dev/client.key \
     -- ./myapp
 ```
 
@@ -424,14 +426,15 @@ The four injection types are deliberately small and distinct:
 
 ```text
 env ENTRY                import literal NAME=VALUE lines from a secret
-var NAME:ENTRY           set NAME to the exact contents of one secret
-val NAME=VALUE           set a literal non-secret value
-file ENTRY[:NAME]        materialize a secret file and export its path
+set NAME=VALUE          set a literal non-secret value
+var NAME=ENTRY           set NAME to the exact contents of one secret
+file ENTRY               materialize a secret file (variable derived from basename)
+file NAME=ENTRY          materialize a secret file and export its path
 ```
 
 `var` preserves the secret contents exactly, including trailing newlines. Unix environment variables cannot contain NUL bytes, so NUL is rejected. Inspect mode warns about a trailing LF or CRLF without altering the value.
 
-`val` is literal data: it splits on the first `=` and performs no interpolation, shell quoting, variable expansion or command substitution.
+`set` is literal data: it splits on the first `=` and performs no interpolation, shell quoting, variable expansion or command substitution. Use `-s NAME=VALUE` (or `--set NAME=VALUE`) on the CLI.
 
 ### Environment entries: `env`
 
@@ -457,20 +460,20 @@ Use a whole secret as one environment variable:
 
 ```sh
 sec run \
-    -v DNSIMPLE_TOKEN:personal::dnsimple.com/terraform-token \
+    -v DNSIMPLE_TOKEN=personal::dnsimple.com/terraform-token \
     -- terraform plan
 ```
 
 The stored bytes are preserved except that NUL is rejected by the environment model.
 
-### Literal values: `val`
+### Literal values: `set`
 
 Non-secret configuration can live directly in the invocation or manifest:
 
 ```sh
 sec run \
-    --val DNSIMPLE_EMAIL=me@example.org \
-    --val DNSIMPLE_ACCOUNT_ID=12345 \
+    -s DNSIMPLE_EMAIL=me@example.org \
+    -s DNSIMPLE_ACCOUNT_ID=12345 \
     -- ./client
 ```
 
@@ -480,7 +483,7 @@ This avoids creating a separate `.env`/`.envrc` for small, static, non-sensitive
 
 ```sh
 sec run \
-    -f infra/ssh/deploy.key:SSH_KEY \
+    -f SSH_KEY=infra/ssh/deploy.key \
     -- sh -c 'exec ssh -i "$SSH_KEY" -o IdentitiesOnly=yes user@server'
 ```
 
@@ -530,13 +533,13 @@ Example manifest:
 env dev/app.env
 
 # One secret -> one environment variable
-var API_TOKEN:dev/api-token
+var API_TOKEN=dev/api-token
 
 # Non-secret static configuration
-val ENVIRONMENT=development
+set ENVIRONMENT=development
 
 # Secret temporary file
-file dev/client.key:SSH_KEY
+file SSH_KEY=dev/client.key
 ```
 
 The aliases `-e`, `-v` and `-f` are also accepted as manifest directives. Manifest content is data, never shell code.
@@ -569,8 +572,8 @@ Inside an aliased manifest, unqualified `env`, `var` and `file` entries automati
 
 ```text
 # shared/manifests/terraform
-var API_TOKEN:api/token
-file credentials.json:CREDENTIALS
+var API_TOKEN=api/token
+file CREDENTIALS=credentials.json
 ```
 
 loaded as:
@@ -579,7 +582,7 @@ loaded as:
 sec run -m shared::terraform -- ...
 ```
 
-is equivalent to references to `shared::api/token` and `shared::credentials.json`. Already-qualified references are left unchanged. `val` needs no store context.
+is equivalent to references to `shared::api/token` and `shared::credentials.json`. Already-qualified references are left unchanged. `set` needs no store context.
 
 Explicit manifest paths (`./path`, `../path`, `/absolute/path`) are also accepted and do not inherit an alias.
 
@@ -592,6 +595,27 @@ sec run -m shared::dnsimple -m dev -- terraform plan
 ```
 
 This keeps dependencies visible and troubleshooting straightforward.
+
+### Optional manifests
+
+Use **`-M` / `--optional-manifest`** to request a manifest that may legitimately be absent. Unlike `-m`, which always requires the manifest, `-M` skips only a missing file (or missing `manifests/` directory):
+
+```sh
+sec run -M personal::maven -m buildsecrets -- mvn install
+```
+
+This is useful in a shared `justfile`: one developer may have a personal Maven manifest and another may have Maven credentials already exported in their shell. The conventional `personal::` alias works without a `stores` declaration when the personal XDG store has not been initialized; the missing optional manifest is skipped. The application's inherited environment is not cleared.
+
+An **unresolved alias, unavailable Git remote, malformed manifest, inaccessible file, or symlinked manifest is still an error**. Optionality applies to *absence*, not to failures. The `-M` option may be repeated, mixed with `-m`, and used alone with a command (an absent optional manifest performs no injection).
+
+In no-command inspect mode, skipped optional manifests appear explicitly:
+
+```text
+Skipped optional manifests (not found):
+  personal::maven -> /home/user/.local/share/sec/manifests/maven
+```
+
+No warning is printed during normal execution for an expected missing optional manifest.
 
 ### Inspect and troubleshooting
 
@@ -613,7 +637,7 @@ Manifests:
 
 Environment:
   API_TOKEN=<secret>  var:dev/api-token  <- manifest dev:3
-  REGION=<literal>  val  <- manifest dev:4
+  REGION=<literal>  set  <- manifest dev:4
 
 Files:
   SSH_KEY=<file>  file:dev/client.key -> <SEC_RUN_DIR>/dev/client.key  <- manifest dev:5
@@ -635,10 +659,15 @@ sec run -m dev --print
 `--env-only` emits only resolved `NAME=VALUE` assignments and does not allow `file` entries:
 
 ```sh
-sec run --env-only -e dev/app.env -v TOKEN:dev/token
+sec run --env-only -e dev/app.env -v TOKEN=dev/token
 ```
 
 These outputs are data, not shell scripts; do not `eval` or `source` them.
+
+**Breaking change (0.9.0 grammar):** replace `val NAME=VALUE` with `set NAME=VALUE`,
+`var NAME:ENTRY` with `var NAME=ENTRY`, and `file ENTRY:NAME` with
+`file NAME=ENTRY`. In the CLI use `-s`/`--set` instead of `--val` and the same
+`NAME=ENTRY` form with `-v` and `-f`. Old spellings are intentionally rejected.
 
 ### Lifetime and cleanup
 
@@ -665,6 +694,9 @@ or compose reusable external manifests explicitly:
 ```just
 plan:
     @sec run -m shared::dnsimple -m terraform-dev -- terraform plan
+
+build:
+    @sec run -M personal::maven -m buildsecrets -- mvn install
 ```
 
 With a project `.sec/`, `direnv` is not required for store discovery. If you use it, keep secret values out of `.envrc`; prefer injecting them only when the target command starts.

@@ -87,10 +87,14 @@ store references:
     are allowed. Supported sources:
 
         file:///absolute/store/root
+        file://~/path/from/home
         git+ssh://...
         git+https://...
 
-    stores ls prints effective aliases (project entries override personal ones).
+    file://~/... expands only the current user's $HOME (not ~other users).
+    The conventional alias "personal" resolves to the personal XDG store if
+    not explicitly declared. "local" has no special meaning: it can name any
+    configured store. stores ls also shows the implicit personal alias.
     Aliased stores are read-only; Git stores are fetched on first use.
 
 notes:
@@ -509,7 +513,7 @@ _read_alias() {
         /^[[:space:]]*(#|$)/ { next }
         {
             if (NF != 2 || $1 !~ /^[a-z][a-z0-9_-]*$/ ||
-                $2 !~ /^(file:\/\/\/[^[:space:]]+|git\+(ssh|https):\/\/)/ || seen[$1]++) {
+                $2 !~ /^(file:\/\/(\/[^[:space:]]+|~(\/[^[:space:]]*)?)$|git\+(ssh|https):\/\/)/ || seen[$1]++) {
                 printf "sec-store: error: invalid/duplicate store declaration at %s:%d\n", FILENAME, FNR > "/dev/stderr"
                 bad=1; next
             }
@@ -543,12 +547,17 @@ _alias_source() {
             [ "$_as_rc" -eq 3 ] || return 1
         fi
     fi
+    # Explicitly requested personal:: is a well-known alias; declarations in
+    # the selected store (and optionally the personal stores file) win first.
+    # This explicit alias remains available even with PROJECT_ONLY=1.
+    [ "$_as_alias" != personal ] || { printf 'builtin-personal\n'; return 0; }
     _error "unknown store alias [$_as_alias]"
     return 1
 }
 
 _stores_list() {
     [ "$#" -eq 0 ] || { _error 'usage: sec store stores ls'; return 1; }
+    _so_other=
     _so_file=$(_sources_file) || return 1
     _so_primary=$(_read_alias "$_so_file" '')
     _so_rc=$?
@@ -568,6 +577,10 @@ _stores_list() {
                 done
             fi
         fi
+    fi
+    # Show the convention next to declared aliases without duplicate output.
+    if ! printf '%s\n%s\n' "$_so_primary" "$_so_other" | grep -Eq '^personal '; then
+        printf 'personal file://%s\n' "$(_personal_store)"
     fi
 }
 
@@ -622,8 +635,14 @@ _remote_backend() {
 _local_source_resolve() (
     _lsr_source=$1
     case $_lsr_source in
-        file:///*) _lsr_store=${_lsr_source#file://} ;;
+        file:///*|file://~|file://~/*) _lsr_store=${_lsr_source#file://} ;;
         *) _error "unsupported local source [$_lsr_source]"; exit 1 ;;
+    esac
+    case $_lsr_store in
+        '~'|'~/'*)
+            case ${HOME:-} in /*) ;; *) _error 'HOME must be an absolute path for file://~'; exit 1 ;; esac
+            _lsr_store=$HOME${_lsr_store#\~}
+            ;;
     esac
 
     [ -d "$_lsr_store" ] && [ -r "$_lsr_store" ] && [ -x "$_lsr_store" ] || {
@@ -650,7 +669,12 @@ _local_source_resolve() (
 _source_resolve() {
     _sr_source=$1 _sr_update=${2:-0}
     case $_sr_source in
-        file:///*)
+        builtin-personal)
+            # Like `sec store dir` for a not-yet-initialized store, return the
+            # expected personal path. A read will still validate secrets/.
+            ( SEC_STORE_DIR=$(_personal_store); _store )
+            ;;
+        file:///*|file://~|file://~/*)
             _local_source_resolve "$_sr_source"
             ;;
         git+ssh://*|git+https://*)
@@ -763,7 +787,7 @@ _cmd_update() {
         [ -n "$_cu_lines" ] || return 0
         printf '%s\n' "$_cu_lines" | while IFS=' ' read -r _cu_alias _cu_source; do
             case $_cu_source in
-                file:///*) continue ;;
+                file:///*|file://~|file://~/*|builtin-personal) continue ;;
             esac
             _source_resolve "$_cu_source" 1 >/dev/null || exit 1
             _info "updated remote store [$_cu_alias]"
@@ -772,7 +796,7 @@ _cmd_update() {
     fi
     _cu_source=$(_alias_source "$1") || return 1
     case $_cu_source in
-        file:///*)
+        file:///*|file://~|file://~/*|builtin-personal)
             _source_resolve "$_cu_source" 0 >/dev/null || return 1
             _info "local store [$1] does not require update"
             return 0
