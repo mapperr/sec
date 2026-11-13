@@ -1,0 +1,155 @@
+#!/bin/sh
+
+VERSION=0.9.0
+
+umask 077
+set -f
+
+usage() {
+    printf 'sec-store-type %s\n' "$VERSION"
+    cat <<'USAGE'
+    type an entry's basename, Tab, and first decrypted line into the focused window
+
+usage:
+    sec-store-type ENTRY
+    sec store type ENTRY
+
+    ENTRY accepts the same name as `sec store get`, including alias::entry.
+    The typed name is the entry basename without a trailing .age suffix.
+    The first decrypted line is typed without its line terminator; no Enter
+    is sent. Trailing spaces in the first line are preserved.
+
+options:
+    -h, --help          show this help
+    -V, --version       show version
+
+env vars:
+    SEC_STORE_TYPING_TOOL  wtype or xdotool (default: auto-detect session)
+    SEC_STORE_TYPE_SEC     sec executable (default: sec)
+    SEC_STORE_TYPE_WAIT    optional delay in seconds before typing (default: 0)
+
+notes:
+    Wayland (WAYLAND_DISPLAY set) selects wtype; otherwise X11 (DISPLAY set)
+    selects xdotool. wtype requires compositor virtual-keyboard support.
+    The secret is never passed to a typing program as a command-line argument,
+    written to a regular plaintext file, or printed to stdout.
+    Only text secrets are supported; NUL bytes are not representable by the
+    POSIX shell string used to hold the first line.
+    The keystrokes go to whichever window is focused when typing begins.
+USAGE
+}
+
+_error() { printf 'sec-store-type: error: %s\n' "$1" >&2; return 1; }
+
+_choose_tool() {
+    if [ -n "${SEC_STORE_TYPING_TOOL:-}" ]; then
+        tool=$SEC_STORE_TYPING_TOOL
+    elif [ -n "${WAYLAND_DISPLAY:-}" ]; then
+        tool=wtype
+    elif [ -n "${DISPLAY:-}" ]; then
+        tool=xdotool
+    else
+        _error 'neither WAYLAND_DISPLAY nor DISPLAY is set; choose SEC_STORE_TYPING_TOOL'
+        return 1
+    fi
+
+    case $tool in
+        wtype|xdotool) ;;
+        *) _error 'SEC_STORE_TYPING_TOOL must be wtype or xdotool'; return 1 ;;
+    esac
+    command -v "$tool" >/dev/null 2>&1 || {
+        _error "typing tool [$tool] not found in PATH"
+        return 1
+    }
+}
+
+_type_text() {
+    case $tool in
+        wtype) wtype - ;;
+        xdotool) xdotool type --clearmodifiers --file - ;;
+    esac
+}
+
+_type_tab() {
+    case $tool in
+        wtype) wtype -k Tab ;;
+        xdotool) xdotool key --clearmodifiers Tab ;;
+    esac
+}
+
+main() (
+    case ${1:-} in
+        -h|--help|help) [ "$#" -eq 1 ] || { _error 'usage: sec-store-type ENTRY'; exit 2; }; usage; exit 0 ;;
+        -V|--version|version) [ "$#" -eq 1 ] || { _error 'usage: sec-store-type ENTRY'; exit 2; }; printf 'sec-store-type %s\n' "$VERSION"; exit 0 ;;
+    esac
+
+    [ "$#" -eq 1 ] && [ -n "$1" ] || {
+        _error 'usage: sec-store-type ENTRY'
+        exit 2
+    }
+    entry=$1
+    case $entry in
+        *::*) entry_name=${entry#*::} ;;
+        *) entry_name=$entry ;;
+    esac
+    case $entry_name in
+        ''|*/|'/'|.|..) _error "invalid entry [$entry]"; exit 2 ;;
+    esac
+    base=${entry_name##*/}
+    base=${base%.age}
+    [ -n "$base" ] || { _error "invalid entry [$entry]"; exit 2; }
+
+    _choose_tool || exit 1
+    sec_cmd=${SEC_STORE_TYPE_SEC:-sec}
+    command -v "$sec_cmd" >/dev/null 2>&1 || {
+        _error "sec executable [$sec_cmd] not found"
+        exit 1
+    }
+
+    # Use a private FIFO so the decryptor's exit status can be checked before
+    # typing anything. Decrypted bytes are never stored in a regular file.
+    # Keep the FIFO open and drain the entry to avoid SIGPIPE in the decryptor.
+    runtime_dir=${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}
+    [ -d "$runtime_dir" ] && [ -w "$runtime_dir" ] || {
+        _error "runtime directory [$runtime_dir] is unavailable"
+        exit 1
+    }
+    tmpdir=$(mktemp -d "$runtime_dir/sec-store-type.XXXXXXXX") || {
+        _error 'cannot create private runtime directory'
+        exit 1
+    }
+    fifo=$tmpdir/entry
+    trap 'rm -rf -- "$tmpdir"' 0
+    trap 'exit 1' 1 2 3 15
+    mkfifo "$fifo" || { _error 'cannot create FIFO'; exit 1; }
+
+    "$sec_cmd" store get "$entry" >"$fifo" &
+    decrypt_pid=$!
+
+    exec 3<"$fifo"
+    first=
+    IFS= read -r first <&3 || :
+    cat <&3 >/dev/null || { _error 'cannot read entry'; exit 1; }
+    exec 3<&-
+    wait "$decrypt_pid" || {
+        _error "cannot decrypt entry [$entry]"
+        exit 1
+    }
+
+    # Strip CR only when it is the CRLF line terminator; the LF was removed
+    # by read. Embedded and trailing spaces are intentionally left untouched.
+    cr=$(printf '\r')
+    case $first in
+        *"$cr") first=${first%"$cr"} ;;
+    esac
+
+    if [ -n "${SEC_STORE_TYPE_WAIT:-}" ]; then
+        sleep "$SEC_STORE_TYPE_WAIT" || exit 1
+    fi
+
+    printf '%s' "$base" | _type_text || { _error 'cannot type entry basename'; exit 1; }
+    _type_tab || { _error 'cannot type Tab'; exit 1; }
+    printf '%s' "$first" | _type_text || { _error 'cannot type entry first line'; exit 1; }
+)
+
+main "$@"

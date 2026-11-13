@@ -18,6 +18,7 @@ keys:
     Ctrl-i   copy first decrypted line to clipboard
     Ctrl-u   copy entry name to clipboard
     Ctrl-b   copy entry path to clipboard
+    Ctrl-t   type entry name, Tab, and first secret line into focused window
     Ctrl-y   copy full decrypted entry to clipboard
     Ctrl-o   generate and copy TOTP to clipboard (requires sec-store-otp)
     Ctrl-v   view full decrypted entry
@@ -36,8 +37,13 @@ env vars:
     SEC_STORE_FZF_PAGER        custom pager command for Ctrl-v (default: less -R)
     SEC_STORE_FZF_PASTE_ONCE   if 1 and wl-copy is used, use --paste-once
     SEC_STORE_FZF_DEBUG        enable debug messages
+    SEC_STORE_TYPE_WAIT        delay before typing (default: 2 seconds via Ctrl-t)
 
 sec-store configuration continues to use SEC_STORE_* variables.
+
+Ctrl-t needs sec-store-type and wtype (Wayland) or xdotool (X11). After
+pressing Ctrl-t, focus the target window before the typing delay expires.
+No Enter is sent.
 EOF
 }
 
@@ -139,6 +145,15 @@ _copy_path() {
 	printf '%s' "$name" | _clip || return 1
 	_info "entry path copied: [$name]"
 }
+
+# fzf has keyboard focus when this action starts. Leave time to focus the
+# target window before sec-store-type sends keystrokes. Honor explicit values
+# of SEC_STORE_TYPE_WAIT, including 0; only default to 2 seconds from fzf.
+_type_entry() (
+	SEC_STORE_TYPE_WAIT=${SEC_STORE_TYPE_WAIT:-2}
+	export SEC_STORE_TYPE_WAIT
+	_store type "$1"
+)
 
 _copy_first_line() (
 	name=$1
@@ -369,6 +384,7 @@ _internal() {
 		--copy-first) [ "$#" -eq 1 ] && _copy_first_line "$1" ;;
 		--copy-name)  [ "$#" -eq 1 ] && _copy_name "$1" ;;
 		--copy-path)  [ "$#" -eq 1 ] && _copy_path "$1" ;;
+		--type)       [ "$#" -eq 1 ] && _type_entry "$1" ;;
 		--copy-full)  [ "$#" -eq 1 ] && _copy_full "$1" ;;
 		--otp)        [ "$#" -eq 1 ] && _copy_otp "$1" ;;
 		--view)       [ "$#" -eq 1 ] && _view_entry "$1" ;;
@@ -405,7 +421,7 @@ _run_fzf() (
 		--cycle \
 		--no-multi \
 		--prompt='sec> ' \
-		--header='Ctrl-i:1stline Ctrl-u:name Ctrl-o:TOTP Ctrl-y:full Ctrl-v:view Ctrl-e:edit Ctrl-a:new Ctrl-h:policy Ctrl-r:rekey Ctrl-d:rm Ctrl-b:path' \
+		--header='Ctrl-i:1stline Ctrl-u:name Ctrl-o:TOTP Ctrl-y:full Ctrl-v:view Ctrl-e:edit Ctrl-a:new Ctrl-h:policy Ctrl-r:rekey Ctrl-d:rm Ctrl-b:path Ctrl-t:type' \
         --preview '"$SEC_STORE_FZF_SELF" --preview {1}' \
         --preview-window 'right:60%:wrap:hidden' \
         --bind='ctrl-/:toggle-preview' \
@@ -413,6 +429,7 @@ _run_fzf() (
 		--bind='ctrl-u:execute("$SEC_STORE_FZF_SELF" --copy-name {})' \
 		--bind='ctrl-y:execute("$SEC_STORE_FZF_SELF" --copy-full {})' \
 		--bind='ctrl-b:execute("$SEC_STORE_FZF_SELF" --copy-path {})' \
+		--bind='ctrl-t:execute("$SEC_STORE_FZF_SELF" --type {})' \
 		--bind='ctrl-o:execute("$SEC_STORE_FZF_SELF" --otp {})' \
 		--bind='ctrl-v:execute("$SEC_STORE_FZF_SELF" --view {})' \
 		--bind='ctrl-h:execute("$SEC_STORE_FZF_SELF" --policy {})' \
@@ -426,7 +443,7 @@ _run_fzf() (
 
 main() {
 	case ${1:-} in
-		--list|--copy-first|--copy-name|--copy-path|--copy-full|--otp|--view|--preview|--policy|--edit|--rekey|--remove|--new)
+		--list|--copy-first|--copy-name|--copy-path|--type|--copy-full|--otp|--view|--preview|--policy|--edit|--rekey|--remove|--new)
 			cmd=$1
 			shift
 			_internal "$cmd" "$@"

@@ -12,7 +12,7 @@ Install `age` (or `rage`), then put the executable scripts you want in your `PAT
 
 ```sh
 # For example, if ~/.local/bin is already in PATH:
-install -m 755 sec sec-git sec-store sec-store-remote-git sec-run ~/.local/bin/
+install -m 755 sec sec-git sec-store sec-store-remote-git sec-run sec-store-type ~/.local/bin/
 ```
 
 The resulting commands are `sec e`, `sec d`, `sec git`, `sec store`, and `sec run`. Install only the companions you need. `sec-run` requires `sec-store`; remote Git stores additionally require `sec-store-remote-git`, Git, tar, `flock`, and a working Git SSH/HTTPS authentication setup.
@@ -239,6 +239,21 @@ sec store search 'token$' shared::
 ```
 
 Plaintext secret contents are never written inside `secrets/` during normal store operations.
+
+### Type an entry into the focused window: `sec-store-type`
+
+The optional `sec-store-type` extension types the entry's **basename** (without `.age`), presses **Tab**, and types the **first decrypted line** as text. It does **not** press Enter:
+
+```sh
+sec store type accounts/example.age
+sec store type personal::accounts/example
+```
+
+If the entry is `accounts/example.age` and its first decrypted line is `my-password`, the focused application receives `example`, Tab, `my-password`.
+
+It uses `wtype` under Wayland and `xdotool` under Xorg/X11, or explicitly selects one with `SEC_STORE_TYPING_TOOL=wtype|xdotool` (choose one). `SEC_STORE_TYPE_WAIT=1` optionally delays the keystrokes by one second, useful when switching focus from a terminal or launcher. The secret travels on the typing tool's **stdin** rather than its command line and is never written to a regular plaintext file. The first line must be text (NUL bytes are unsupported); its line terminator is not typed, but trailing spaces are preserved.
+
+**Be careful which window has focus:** simulated typing sends the secret to the active window, potentially exposing it in a terminal, chat or browser address bar. `wtype` also requires virtual-keyboard support from the Wayland compositor.
 
 ### Recipient policies
 
