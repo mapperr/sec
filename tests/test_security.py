@@ -348,6 +348,25 @@ class SecTests(unittest.TestCase):
         self.assertEqual((self.repo / "secret").read_bytes(), b"fixture")
         self.assertEqual((self.repo / "secret").stat().st_mode & 0o777, 0o600)
 
+    def test_store_edit_uses_editor_and_falls_back_to_vi(self):
+        self.project_store()
+        helpers = self.root / "editors"
+        helpers.mkdir()
+        for name in ("editor-fixture", "vi", "store-editor-fixture"):
+            path = helpers / name
+            path.write_text('#!/bin/sh\nset -eu\nprintf "%s\\n" "${0##*/}" > "$1"\n')
+            path.chmod(0o700)
+
+        settings = {"PATH": f"{helpers}:{self.env['PATH']}", "VISUAL": "unused-visual-editor"}
+        for editor, overrides in (
+            ("editor-fixture", {"EDITOR": "editor-fixture"}),
+            ("vi", {"EDITOR": ""}),
+            ("store-editor-fixture", {"EDITOR": "editor-fixture", "SEC_STORE_EDITOR": "store-editor-fixture"}),
+        ):
+            with self.subTest(editor=editor):
+                self.command("sec", "store", "edit", "token", env={**settings, **overrides})
+                self.assertEqual(self.command("sec", "store", "get", "token"), f"{editor}\n".encode())
+
     def test_otp_extracts_one_seed_from_a_multiline_entry(self):
         self.project_store()
         seed = base64.b32encode(b"test seed!")

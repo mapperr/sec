@@ -275,7 +275,7 @@ Example
         "edit",
         "ENTRY",
         "Edit a local entry and encrypt the result.",
-        "Set SEC_STORE_EDITOR to choose the editor.",
+        "Uses EDITOR when set, or vi by default. Set SEC_STORE_EDITOR to override\nEDITOR for the store. Choose a trusted executable for editing secrets.",
     ),
     command(
         "ls",

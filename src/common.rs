@@ -235,27 +235,62 @@ pub fn workspace(configured: Option<OsString>) -> Result<tempfile::TempDir> {
 
 pub fn edit(_path: &Path, input: &[u8], editor_setting: &str, secret: bool) -> Result<Vec<u8>> {
     let temp = workspace(var("XDG_RUNTIME_DIR"))?;
-    let file = temp.path().join("entry");
+    let directory = std::path::absolute(temp.path())?;
+    let file = directory.join("entry");
     write_new(&file, input)?;
-    let preferred = var(editor_setting);
+    let preferred = var(editor_setting).or_else(|| {
+        if secret {
+            var("EDITOR")
+        } else {
+            var("VISUAL").or_else(|| var("EDITOR"))
+        }
+    });
     let mut command = if let Some(executable) = preferred {
         Command::new(executable)
     } else if secret {
-        let mut vim = Command::new(
-            which::which("vim").context("install Vim or specify a trusted no-backup editor")?,
+        let mut vi = Command::new(which::which("vi").context("vi is unavailable. Set EDITOR")?);
+        // Keep default vi configuration and recovery files inside the private workspace.
+        let recovery_dir = path_string(&directory)?;
+        ensure!(
+            !recovery_dir
+                .chars()
+                .any(|ch| ch == '|' || (ch.is_control() && ch != '\t')),
+            "this temporary directory path cannot be passed to vi. Set EDITOR"
         );
-        vim.args(["-Nu", "NONE", "-i", "NONE", "-n", "--"]);
-        vim
+        let recovery_dir = recovery_dir
+            .replace('\\', "\\\\")
+            .replace(' ', "\\ ")
+            .replace('\t', "\\\t");
+        vi.current_dir(&directory)
+            .envs(
+                [
+                    "HOME",
+                    "TMPDIR",
+                    "XDG_CONFIG_HOME",
+                    "XDG_DATA_HOME",
+                    "XDG_CACHE_HOME",
+                    "XDG_STATE_HOME",
+                ]
+                .map(|name| (name, &directory)),
+            )
+            .env_remove("EXINIT")
+            .env("NEXINIT", format!("set recdir={recovery_dir}"))
+            .env("VIMINIT", "set noswapfile nobackup nowritebackup");
+        vi
+    } else if cfg!(windows) {
+        Command::new("notepad.exe")
     } else {
-        Command::new(var("VISUAL").or_else(|| var("EDITOR")).unwrap_or_else(|| {
-            if cfg!(windows) {
-                "notepad.exe".into()
-            } else {
-                "vi".into()
-            }
-        }))
+        Command::new("vi")
     };
-    ensure!(command.arg(&file).status()?.success(), "editor failed");
+    let status = command
+        .arg(&file)
+        .status()
+        .with_context(|| format!("start editor {:?}", command.get_program()))?;
+    ensure!(
+        status.success(),
+        "editor {:?} exited with {status}",
+        command.get_program()
+    );
     bounded(
         platform::open_identity(&file)?,
         if secret { SECRET } else { CONFIG },
