@@ -1,0 +1,6 @@
+[build]
+# Keep proc macros and build scripts on the host's normal linker settings.
+target = "host-tuple"
+
+[target.'cfg(any(target_os = "linux", all(target_os = "windows", target_env = "msvc")))']
+rustflags = ["-C", "target-feature=+crt-static"]

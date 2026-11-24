@@ -1,21 +1,47 @@
 # sec
 
-`sec` is a small wrapper around the already easy-to-use [age](https://github.com/FiloSottile/age).
+`sec` manages age-encrypted secrets with a single Rust executable for Linux, macOS and Windows. It provides automatic identity discovery, private in-place file operations, Git filters, personal and shared stores, and temporary secret injection into commands.
 
-Why wrap something simple? For a few extra ergonomics, automatic identity discovery, safer in-place operations, and tiny, composable Unix workflows. The core stays focused on encryption and decryption; companion scripts provide a Git filter, an encrypted personal/team store, and temporary secret injection into arbitrary commands.
-
-The tools are POSIX `sh` scripts: easy to read, easy to hack on, and no daemon or database required.
+Standard age encryption, ASCII armor and TOTP are built in. The executable starts without a Python or shell runtime. The age format is shared with [age](https://github.com/FiloSottile/age).
 
 ## Install
 
-Install `age` (or `rage`), then put the executable scripts you want in your `PATH`. `sec` discovers companions by their executable names:
+From the repository root, with Rust 1.91 or newer, install `sec` into Cargo's bin directory or build the executable to copy to a trusted directory on `PATH`.
 
 ```sh
-# For example, if ~/.local/bin is already in PATH:
-install -m 755 sec sec-git sec-store sec-store-remote-git sec-run sec-store-type ~/.local/bin/
+cargo install --path . --locked
+cargo build --locked --release
 ```
 
-The resulting commands are `sec e`, `sec d`, `sec git`, `sec store`, and `sec run`. Install only the companions you need. `sec-run` requires `sec-store`; remote Git stores additionally require `sec-store-remote-git`, Git, tar, `flock`, and a working Git SSH/HTTPS authentication setup.
+Cargo builds for the host target by default. Find the target triple with `rustc --print host-tuple`. Release builds produce `target/<target-triple>/release/sec` or `target/<target-triple>/release/sec.exe` on Windows.
+
+- Linux builds statically link the C runtime selected by the target (glibc or musl). Install the libc and compiler runtime static archives for your toolchain if your distribution packages them separately.
+- Windows MSVC builds statically link the C runtime and use the platform's system DLLs.
+- macOS builds use the system libraries and frameworks through dynamic linking.
+
+Run `sec` to see the available commands. For detailed help, use `sec store --help` or `sec help run manifest grant`.
+
+On Unix, run `just build` followed by `just link` to create `$HOME/bin/sec` as a symlink to the release build.
+
+### Optional integrations
+
+- SSH recipients and passphrase-encrypted identities use Go `age` 1.2.1 or newer. Deriving an SSH recipient from a private key uses `ssh-keygen`. Install any hardware plugins you need and list their names in `SEC_AGE_PLUGINS`.
+- Git filters and Git-backed stores use Git. SSH transport and signature operations use OpenSSH.
+- `sec store fzf` uses `fzf` and the available clipboard and desktop integrations. Explicit shell callbacks such as `SEC_STORE_FZF_CLIP_CMD` and `SEC_STORE_OTP_CMD` use the system shell.
+
+On Wayland, `sec store fzf` marks copies as sensitive when `wl-copy` supports `--sensitive`. With `timeout` available, this offer lasts up to 30 seconds so a clipboard watcher or an XWayland app can make multiple requests. `SEC_STORE_FZF_PASTE_ONCE=1` limits the offer to one request. `SEC_STORE_FZF_PASTE_ONCE=0` keeps the offer until replaced. Clipboard history depends on how the manager handles the sensitivity hint.
+
+### Upgrade from earlier installations
+
+Use `sec git`, `sec run`, `sec store` and `sec security` in existing commands and hooks. Update calls to `sec-store-*` to use `sec store` and the corresponding subcommand. Unix users can also point symlinks with the previous tool names at the same `sec` executable. `sec security` keeps the `stage-store` and `pre-receive` commands. Use `sec git on` from each checkout that uses the Git filters to update its local filter commands. Include `--textconv` if you enabled plaintext diffs there.
+
+Existing ciphertext, stores, approvals and attestations use the same formats. The location of those files matters to path-bound approvals and attestations. If you previously installed the scripts, remove the retired copies or replace their links in the directories you used, and check that `sec` resolves to the installed binary.
+
+### Configuration and state
+
+Keep the approval registry and signing policy outside project checkouts. The default registry is `${XDG_CONFIG_HOME:-$HOME/.config}/sec/approvals`. Local provenance records live in `${XDG_STATE_HOME:-$HOME/.local/state}/sec/attestations`. These private directories are owned by the current user. A CI runner can provision a private, read-only registry through `SEC_APPROVAL_DIR`. The controls rely on a trusted account, installed tools and executable. The launched application can read the secrets it receives.
+
+On Windows, configuration and the personal store default to `%APPDATA%/sec`. Cache, attestations and runtime files default to `%LOCALAPPDATA%/sec`. Windows checks ownership and access control lists on private identities and destinations. In-place operations require a trusted private parent directory.
 
 ## Basic usage
 
@@ -40,9 +66,9 @@ sec d ./secret.txt
 `sec` discovers decryption identities in this order:
 
 1. `SEC_IDENTITY`
-2. `${SEC_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/sec}/identity`
-3. `~/.ssh/id_ed25519`
-4. `~/.ssh/id_rsa`
+2. `identity` in `SEC_CONFIG_DIR` or the platform's default `sec` configuration directory
+3. `~/.ssh/id_ed25519`, with `SEC_ALLOW_SSH_IDENTITIES=1`
+4. `~/.ssh/id_rsa`, with the same opt-in
 5. Additional identity **paths** listed in the config file `identities`, one per line (including explicitly configured plugin identities)
 
 ```sh
@@ -51,7 +77,7 @@ sec identity --all       # all discovered identities
 sec recipient            # your public self-recipient, if derivable
 ```
 
-Without explicit recipients, encryption falls back to your own recipient. To encrypt for other people or machines, use `SEC_RECIPIENTS` or `SEC_RECIPIENTS_FILE`:
+Identity files must be private, user-owned regular files. Configure `SEC_AGE_PLUGINS` with the names of trusted age plugins needed for your identities or recipients. Without explicit recipients, encryption falls back to your own recipient. To encrypt for other people or machines, use `SEC_RECIPIENTS` or `SEC_RECIPIENTS_FILE`:
 
 ```sh
 SEC_RECIPIENTS_FILE=./team.recipients sec e < secret.txt > secret.age
@@ -59,35 +85,36 @@ SEC_RECIPIENTS_FILE=./team.recipients sec e < secret.txt > secret.age
 
 An explicit recipient list is authoritative: **your own recipient is not added automatically**. Keep private identities out of the repository; public recipient files may be committed. `SEC_ARMOR=1` requests ASCII-armored output; the default is binary.
 
-## Git integration: sec-git
+## Git integration
 
-`sec-git` uses Git clean/smudge filters and `.gitattributes` to keep *plaintext in the working tree* and *age ciphertext in Git's index and repository*. This is a different workflow from `sec-store`, which keeps ciphertext in its store even locally.
+`sec git` uses Git clean/smudge filters and `.gitattributes` to keep age ciphertext in Git. Checkout keeps ciphertext by default. Use `sec git refresh` to materialize private plaintext files for editing.
 
 ```sh
 cd /path/to/git/repo
 sec git on
 sec git recipient add 'ssh-ed25519 AAAA... alice@laptop'
+sec git recipient approve
 sec git track '.env' 'secrets/*.json'
 git add .gitattributes .sec-recipients .env secrets/
 git commit -m 'Add encrypted project secrets'
 ```
 
-The generated `.gitattributes` entries use `filter=sec diff=sec -text`, so the binary ciphertext is not subject to text normalization. A subsequent `git add` of unchanged plaintext reuses the indexed ciphertext, avoiding noisy changes caused by age's randomized encryption.
+The generated `.gitattributes` entries use `filter=sec diff=sec -text`, so the binary ciphertext is not subject to text normalization. A subsequent `git add` of unchanged plaintext can reuse the indexed ciphertext under an unchanged approved policy, avoiding noisy changes caused by age's randomized encryption.
 
 ```sh
 sec git status           # state, recipients and tracked paths
 sec git recipient list
 sec git recipient rm 'ssh-ed25519 AAAA... alice@laptop'
 sec git rekey            # re-encrypt filtered tracked files and stage new blobs
-sec git refresh          # restore a plaintext working tree after enabling filters
+sec git refresh          # materialize plaintext with mode 0600
 sec git off
 ```
 
-Aliases include `sec git l`, `a`, `r`, `t`, `u`, and `f`; see `sec git --help` for the full interface. Git's filter configuration is local to each checkout, so run `sec git on` after cloning. **Commit `.sec-recipients` in plaintext**: its recipient entries are public, and encrypting the policy complicates bootstrap and recovery. Removing a recipient and re-encrypting does not revoke access to older Git history or credentials they already knew; rotate underlying credentials when revoking access.
+Aliases include `sec git l`, `a`, `r`, `t`, `u`, and `f`; see `sec git --help` for the full interface. Git's filter configuration is local to each checkout. Approve the recipient policy before enabling filters in an existing checkout. `SEC_GIT_SMUDGE_PLAINTEXT=1` enables plaintext on checkout for a trusted private working tree with Git running under `umask 077`. `sec git on --textconv` enables plaintext diffs. `off` and `untrack` refuse to leave protected plaintext behind. **Commit `.sec-recipients` in plaintext**: its recipient entries are public, and encrypting the policy complicates bootstrap and recovery. Removing a recipient and re-encrypting does not revoke access to older Git history or credentials they already knew; rotate underlying credentials when revoking access.
 
-## Encrypted store: sec-store
+## Encrypted store
 
-`sec-store` keeps each secret as an encrypted `.age` entry. It can be used as a personal store, a project store committed with the application, or a shared store referenced from other stores.
+`sec store` keeps each secret as an encrypted `.age` entry. It can be used as a personal store, a project store committed with the application, or a shared store referenced from other stores.
 
 ```sh
 sec store init
@@ -107,7 +134,7 @@ store-root/
 ├── secrets/                 # required
 │   ├── .recipients
 │   └── accounts/github.age
-├── manifests/               # optional, used by sec-run
+├── manifests/               # optional, used by sec run
 │   └── dev
 └── stores                   # optional references to other stores
 ```
@@ -144,7 +171,7 @@ The default store selection order is:
 
 1. `SEC_STORE_DIR`, if set.
 2. The nearest `.sec/`, searching upward from the current directory.
-3. `${XDG_DATA_HOME:-$HOME/.local/share}/sec`.
+3. `${XDG_DATA_HOME:-$HOME/.local/share}/sec` on Unix or `%APPDATA%/sec` on Windows.
 
 `SEC_STORE_REQUIRE_PROJECT=1` disables the personal fallback. `sec store dir` prints the selected store root:
 
@@ -155,13 +182,13 @@ sec store dir --project           # current project's selected .sec store
 sec store dir shared              # resolve an aliased store
 ```
 
-A store root may itself be a symlink, for example:
+A store root can be a symlink when selected explicitly with `SEC_STORE_DIR`, for example:
 
 ```text
 project/.sec -> /home/me/shared/project-store
 ```
 
-`secrets/` itself is not a symlink boundary: it must be a real directory inside the store, and managed secret/policy paths may not contain symlinks.
+`secrets/` must be a real directory inside the store. Automatic project discovery and managed secret and policy paths refuse symlinks.
 
 Initialize stores with:
 
@@ -231,7 +258,7 @@ sec store search database dev
 sec store rm dev/database.env
 ```
 
-`search|s` filters the logical entry list with `grep`:
+`search|s` filters the logical entry list with a regular expression:
 
 ```sh
 sec store s '^dev/'
@@ -240,9 +267,9 @@ sec store search 'token$' shared::
 
 Plaintext secret contents are never written inside `secrets/` during normal store operations.
 
-### Type an entry into the focused window: `sec-store-type`
+### Type an entry into the focused window
 
-The optional `sec-store-type` extension types the entry's **basename** (without `.age`), presses **Tab**, and types the **first decrypted line** as text. It does **not** press Enter:
+`sec store type` types the entry's **basename** (without `.age`), presses **Tab**, and types the **first decrypted line** as text. It leaves the form ready for you to submit:
 
 ```sh
 sec store type accounts/example.age
@@ -251,7 +278,7 @@ sec store type personal::accounts/example
 
 If the entry is `accounts/example.age` and its first decrypted line is `my-password`, the focused application receives `example`, Tab, `my-password`.
 
-It uses `wtype` under Wayland and `xdotool` under Xorg/X11, or explicitly selects one with `SEC_STORE_TYPING_TOOL=wtype|xdotool` (choose one). `SEC_STORE_TYPE_WAIT=1` optionally delays the keystrokes by one second, useful when switching focus from a terminal or launcher. The secret travels on the typing tool's **stdin** rather than its command line and is never written to a regular plaintext file. The first line must be text (NUL bytes are unsupported); its line terminator is not typed, but trailing spaces are preserved.
+On X11, `xdotool` verifies and addresses the active window. On macOS, Accessibility permission allows `sec` to send events to a verified foreground process. Wayland with `wtype` and Windows require `SEC_STORE_TYPE_ALLOW_UNVERIFIED=1`. `SEC_STORE_TYPE_WAIT=1` allows one second to switch focus from a terminal or launcher. External typing helpers receive the secret over standard input. The first line must be UTF-8 text without control characters. Typing preserves trailing spaces and omits the line terminator.
 
 **Be careful which window has focus:** simulated typing sends the secret to the active window, potentially exposing it in a terminal, chat or browser address bar. `wtype` also requires virtual-keyboard support from the Wayland compositor.
 
@@ -265,7 +292,7 @@ age1...
 ssh-ed25519 AAAA... alice@example
 ```
 
-A policy applies to its directory and descendants. The **nearest `.recipients` wins**; parent and child policies are not merged. If no policy exists, `sec` falls back to its self recipient.
+A policy applies to its directory and descendants. The **nearest `.recipients` wins**; parent and child policies are not merged. If no policy exists, a private personal store uses its self recipient. Run `sec store policy add . self` and `sec store policy approve .` before the first write to a new project store. Project and team stores require an approved effective policy. `SEC_STORE_ALLOW_SELF=1` explicitly permits self fallback for a private, locally managed store directory.
 
 For a team store, commit an explicit root policy:
 
@@ -291,6 +318,7 @@ sec store policy edit
 sec store policy edit dev
 
 sec store policy add . self
+sec store policy approve .
 sec store policy add dev 'age1...'
 sec store policy rm dev 'age1...'
 
@@ -301,7 +329,7 @@ sec store policy d dev
 
 `.` means the root policy under `secrets/`. The special recipient `self` is resolved immediately through `sec recipient`; the literal word `self` is never written to `.recipients`.
 
-`policy rm` removes one recipient and refuses to leave an empty policy. `policy delete` removes the exact `.recipients` file and therefore restores inheritance from the nearest parent policy (or self fallback at root).
+`policy rm` removes one recipient and refuses to leave an empty policy. `policy delete` removes the exact `.recipients` file and therefore restores inheritance from the nearest parent policy (or the configured fallback for a private personal store at root).
 
 For mutation targets, an existing entry selects the policy of its containing directory. Use a trailing `/` to force a prefix or `.age` to force an entry when a name is ambiguous:
 
@@ -331,7 +359,7 @@ sec store stores edit
 sec store stores path
 ```
 
-Project aliases take precedence over personal aliases. `SEC_STORE_PROJECT_ONLY=1` disables fallback to declarations in the personal `stores` file, but does not block an explicitly qualified `personal::...` reference. If no applicable declaration exists, the conventional alias **`personal`** points to `${XDG_DATA_HOME:-$HOME/.local/share}/sec`, including when working inside a project. A declaration named `personal` takes precedence over that convention; avoid overriding it in a shared project unless you intend that behavior.
+Project aliases take precedence over personal aliases. `SEC_STORE_PROJECT_ONLY=1` disables fallback to declarations in the personal `stores` file. The reserved `personal` alias always resolves to the platform's default personal store. Remove existing `personal` declarations before upgrading.
 
 `local` has **no implicit meaning**: inside a project, the selected `.sec/` store is local too. You can use `local` freely as a name for a configured alias.
 
@@ -359,13 +387,16 @@ local file://~/secrets
 
 #### Git-backed remote stores
 
-`git+ssh://` and `git+https://` are implemented by the separate `sec-store-remote-git` backend.
+`sec store remote-git` handles `git+ssh://` and `git+https://` stores.
 
-The first access fetches a missing store into a private ciphertext cache:
+Authorize each remote before the first fetch. A pinned origin requires approval of the full commit ID. For a moving branch, supply an absolute `SEC_GIT_ALLOWED_SIGNERS` file from outside the checkout and use `--signed`.
 
-```text
-${XDG_CACHE_HOME:-$HOME/.cache}/sec/stores/
+```sh
+sec store remote-git trust 'git+https://git.example.org/team/secrets.git#0123456789abcdef0123456789abcdef01234567'
+sec store remote-git trust 'git+ssh://git@git.example.org/team/secrets.git' --signed
 ```
+
+Authorized snapshots live under `${XDG_CACHE_HOME:-$HOME/.cache}/sec/stores/`. SSH uses strict known-host verification and can use an SSH agent. For HTTPS, a trusted `SEC_STORE_GIT_ASKPASS` can supply credentials, and `SEC_STORE_GIT_CAINFO` can supply a trusted CA bundle. The backend disables inherited Git URL rewrites, hooks and HTTP redirects.
 
 Subsequent reads reuse the cached snapshot. Stores are **not automatically updated** on every use:
 
@@ -386,9 +417,7 @@ Only full 40- or 64-hex commit IDs are accepted. A pinned store remains on that 
 
 `SEC_STORE_OFFLINE=1` prevents fetching an unavailable/outdated remote revision. `SEC_STORE_CACHE_DIR` overrides the cache root.
 
-Remote repositories are fetched without a normal working-tree checkout, so clean/smudge filters are not executed. Symlinks and submodules in remote stores are rejected.
-
-Future transports can be added as separate backends (for example HTTP or SFTP) without changing `sec-run`.
+Remote snapshots are built from exact Git blobs. The backend rejects symlinks, submodules and unmanaged paths, and checks snapshot files against the tree before use. Signed updates must advance the last accepted revision within the bounded fetch history. Run `sec store cache prune` to remove obsolete snapshots. It preserves current snapshots and active managed readers. Paths obtained from `sec store dir ALIAS` can become stale after an update and prune.
 
 ### Git commands and sync
 
@@ -406,7 +435,7 @@ sec store y
 sec store y 'rotate development credentials'
 ```
 
-It stages only the selected store. If `.sec/` lives inside a larger application repository, unrelated files outside `.sec/` are not staged; the command refuses to start when outside changes would make `git pull --rebase` unsafe.
+The command validates the selected files before staging and verifies outgoing commits before pushing the selected branch. For team stores, configure Git SSH signing and set `SEC_GIT_ALLOWED_SIGNERS` to a trusted absolute path. In an application repository, `y` refuses to publish unrelated history in the same push.
 
 The default commit message is `sync`. If the current branch has no upstream, `y` prefers `origin`, otherwise the only unambiguous configured remote, and performs the initial `git push -u`.
 
@@ -414,17 +443,20 @@ The default commit message is `sync`. If the current branch has no upstream, `y`
 
 ```sh
 sec store check
+sec store check --strict --decrypt
 sec store rekey
 sec store rekey dev
 ```
 
-`check` validates managed secret paths, age ciphertexts and recipient policies. Set `SEC_STORE_CHECK_DECRYPT=1` to additionally attempt decryption with the current identities.
+`check` validates managed secret paths, age structure and recipient syntax. `--decrypt` (or `SEC_STORE_CHECK_DECRYPT=1`) tests the configured identities. `--strict` makes a requested decryption failure fatal. Team reads require provenance from a trusted Git commit, an authorized remote snapshot or local encryption. Use `sec store check --attest` to adopt existing ciphertexts **after verifying their provenance**. Decryption alone does not identify the sender.
 
-`rekey` decrypts and re-encrypts matching entries through a FIFO, without writing plaintext regular files.
+`rekey` decrypts and re-encrypts matching entries through a FIFO and reports per-entry failures. Rotate the underlying credentials when revoking a recipient who could already decrypt them.
 
-## Developer workflows: sec-run
+On a Git receiver, install a pre-receive hook outside the checked-out tree. For a dedicated store, invoke `sec security pre-receive "$PWD" --store`. For an application store, supply `.sec` after `--store`. For repositories using Git filters, invoke `sec security pre-receive "$PWD" --filters /trusted/protected-paths` with shell-style path patterns, one per line. These hooks require trusted SSH signers and validate protected blob structure on incoming commits.
 
-`sec-run` launches one command with environment variables and/or temporary files obtained from `sec-store`.
+## Developer workflows
+
+`sec run` launches one command with environment variables and temporary files obtained from `sec store`.
 
 It uses the same store discovery, so from inside a project this usually requires no store-path configuration:
 
@@ -447,7 +479,7 @@ file ENTRY               materialize a secret file (variable derived from basena
 file NAME=ENTRY          materialize a secret file and export its path
 ```
 
-`var` preserves the secret contents exactly, including trailing newlines. Unix environment variables cannot contain NUL bytes, so NUL is rejected. Inspect mode warns about a trailing LF or CRLF without altering the value.
+`var` preserves the secret contents exactly, including trailing newlines. Unix environment variables cannot contain NUL bytes, so NUL is rejected.
 
 `set` is literal data: it splits on the first `=` and performs no interpolation, shell quoting, variable expansion or command substitution. Use `-s NAME=VALUE` (or `--set NAME=VALUE`) on the CLI.
 
@@ -508,7 +540,7 @@ If the variable is omitted, it is derived from the entry basename. For example:
 dev/credentials.json -> CREDENTIALS_JSON
 ```
 
-Files are materialized under a private runtime workspace with mode `0600`; `SEC_RUN_DIR` points to their private parent.
+Files are materialized under a private runtime workspace with mode `0600` on Unix. `SEC_RUN_DIR` points to their private parent.
 
 ### Manifests
 
@@ -601,7 +633,7 @@ is equivalent to references to `shared::api/token` and `shared::credentials.json
 
 Explicit manifest paths (`./path`, `../path`, `/absolute/path`) are also accepted and do not inherit an alias.
 
-Aliased manifests are read-only through `sec-run`; `manifest edit/rm` operate only on the selected local store.
+Aliased manifests are read-only through `sec run`. `manifest edit` and `manifest rm` operate on the selected local store.
 
 Manifests are intentionally atomic: they do not include/chaining other manifests. Compose multiple manifests explicitly at the call site:
 
@@ -610,6 +642,30 @@ sec run -m shared::dnsimple -m dev -- terraform plan
 ```
 
 This keeps dependencies visible and troubleshooting straightforward.
+
+### Approving manifests
+
+Inspect the resolved injection plan before approving it. The plan lists entry origins and destinations without opening secret values.
+
+```sh
+sec run -m dev
+sec run manifest approve dev --env-name DATABASE_HOST --env-name API_TOKEN -- ./myapp
+sec run -m dev -- ./myapp
+sec run manifest approvals dev -- ./myapp
+sec run manifest revoke dev -- ./myapp
+```
+
+A collective approval covers the manifest's plan and selected command with its arguments. Comments, equivalent directive order and value rotation preserve approval. Changes to entries, origins, destinations or literals require a fresh approval. For `env` directives, specify allowed variable names with repeated `--env-name`. The runner validates the names after decryption. `SEC_RUN_EXEC_SHA256` can require a verified executable digest.
+
+Entries from other stores are included in the review. Authorize a specific new scalar or file entry with `manifest grant REF --entry ALIAS::ENTRY --as NAME --mode var|file -- COMMAND`. For a team store, `manifest grant REF --prefix ALIAS::PREFIX/ -- COMMAND` explicitly pre-approves future scalar and file additions under that prefix. Revoke a grant with the same selector on `manifest revoke`.
+
+A remote manifest resolves its unqualified entries in the same verified snapshot. Compose a separately approved personal manifest at the call site when a command also needs personal credentials.
+
+```sh
+sec run -m shared::terraform -m personal::dnsimple -- terraform plan
+```
+
+On CI, provision reviewed approvals before running the job. Use consistent absolute checkout and executable paths, which are part of the approval scope. The launcher does not create approvals or accept confirmations from stdin.
 
 ### Optional manifests
 
@@ -640,38 +696,16 @@ Omit the command to inspect what will be injected without revealing secret value
 sec run -m dev
 ```
 
-Example:
-
-```text
-Context:
-  store:   /home/me/project/.sec
-  secrets: /home/me/project/.sec/secrets
-
-Manifests:
-  dev -> /home/me/project/.sec/manifests/dev
-
-Environment:
-  API_TOKEN=<secret>  var:dev/api-token  <- manifest dev:3
-  REGION=<literal>  set  <- manifest dev:4
-
-Files:
-  SSH_KEY=<file>  file:dev/client.key -> <SEC_RUN_DIR>/dev/client.key  <- manifest dev:5
-
-Runtime:
-  SEC_RUN_DIR=<temporary directory>
-```
-
-For `var`, inspect mode appends `[trailing LF]` or `[trailing CRLF]` when appropriate. This is diagnostic only; the stored value is not trimmed.
-
-For variables loaded from multiple `env` entries, inspect output shows the final source and how many earlier assignments were overridden.
+Inspection shows entry origins, destinations and the presence of optional manifests. It does not decrypt data or validate the current plaintext contents.
 
 `--print` displays resolved values and is sensitive:
 
 ```sh
+sec run manifest approve dev --print --env-name API_TOKEN
 sec run -m dev --print
 ```
 
-`--env-only` emits only resolved `NAME=VALUE` assignments and does not allow `file` entries:
+Each output mode is a separate manifest approval target. `--env-only` emits only resolved `NAME=VALUE` assignments and does not allow `file` entries:
 
 ```sh
 sec run --env-only -e dev/app.env -v TOKEN=dev/token
@@ -686,9 +720,9 @@ These outputs are data, not shell scripts; do not `eval` or `source` them.
 
 ### Lifetime and cleanup
 
-`sec-run` resolves and validates all requested inputs before starting the command. Invalid entries, failed decryption and variable/file collisions prevent launch.
+`sec run` resolves and validates all requested inputs before starting the command. Invalid entries, failed decryption and variable/file collisions prevent launch.
 
-Temporary files live under a private `0700` workspace beneath `$XDG_RUNTIME_DIR` by default and are removed when the supervised command exits. There is no automatic `/tmp` fallback; set `SEC_RUN_TMPDIR` to another private directory when needed.
+Temporary files live under a private workspace and are removed when the supervised command exits. The base directory comes from `SEC_RUN_TMPDIR` or `XDG_RUNTIME_DIR`. On Linux, one of these must specify a private directory. On macOS, the fallback is the user's private system temporary directory. On Windows, the fallback is `%LOCALAPPDATA%/sec/runtime`.
 
 The child receives `SEC_RUN_DIR` and any requested variables. Scope `sec run` around the smallest practical command because subprocesses inherit environment variables, and processes that outlive the supervised command may lose access to temporary files.
 
@@ -725,4 +759,19 @@ With a project `.sec/`, `direnv` is not required for store discovery. If you use
 
 ## Development
 
-Source: <https://git.sr.ht/~mapperr/sec>
+Run the Rust tests with `cargo test --locked`. The GitHub workflow tests and builds on Linux, macOS on Intel and Apple Silicon, and Windows x64.
+
+On Linux, the integration tests exercise the compiled binary with synthetic fixtures and a local HTTPS server. They need Python 3, Go `age` 1.2.1 or newer, `age-keygen`, Git with `git http-backend`, OpenSSH and OpenSSL.
+
+```sh
+cargo build --locked
+python3 -B -m unittest discover -s tests -v
+```
+
+Set `SEC_TEST_BINARY` to test a different build, such as `target/$(rustc --print host-tuple)/release/sec`.
+
+Sign the executable for each release target with a dedicated OpenSSH release key and the `sec-release` namespace. On Linux or macOS, run `ssh-keygen -Y sign -f RELEASE_SIGNING_KEY -n sec-release "target/$(rustc --print host-tuple)/release/sec"`. Distribute the executable and its detached `.sig` together. Users verify the signature against a release signer obtained independently.
+
+[Source repository on SourceHut](https://git.sr.ht/~mapperr/sec)
+
+The default SourceHut build runs `just test test-integration`. Submit `.build-mirror.yml` manually through builds.sr.ht after provisioning the GitHub SSH deploy key and verified host key. The mirror job tests its `master` checkout, checks the current SourceHut `master` tip and pushes that exact revision to GitHub with a fast-forward push. If SourceHut `master` has advanced by the time the check runs, submit a new mirror job.

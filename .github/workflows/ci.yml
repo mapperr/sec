@@ -1,0 +1,35 @@
+name: sec CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-15, macos-15-intel, windows-2025]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install stable --profile minimal
+      - run: cargo +stable test --locked
+      - run: cargo +stable build --locked --release
+      - name: Check static linking on Linux
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          binary="target/$(rustc +stable --print host-tuple)/release/sec"
+          headers=$(readelf --program-headers --dynamic "$binary")
+          if grep -Eq '[[:space:]]INTERP[[:space:]]|\(NEEDED\)' <<< "$headers"; then
+            printf '%s\n' 'sec has a dynamic interpreter or shared library dependencies' >&2
+            exit 1
+          fi

@@ -1,17 +1,15 @@
-image: alpine/edge
-secrets:
-  - b566bd73-a773-48ca-be59-7b88577d83eb
+image: alpine/3.24
+packages:
+  - age
+  - cargo
+  - git
+  - git-daemon # Provides git http-backend for the HTTPS integration test.
+  - just
+  - openssh-keygen
+  - openssl
+  - python3
 sources:
-  - git@git.sr.ht/~mapperr/sec
-environment:
-  GIT_SSH_COMMAND: ssh -o StrictHostKeyChecking=no
+  - https://git.sr.ht/~mapperr/sec
 tasks:
-  - setup: |
-      # This is for not having to cd into your <repo> for each task
-      echo 'cd sec' >> ~/.buildenv
-  - check: |
-      if [ "$(git rev-parse origin/master)" != "$(git rev-parse HEAD)" ]; then \
-        complete-build; \
-      fi
-  - mirror: |
-      git push --force --mirror git@github.com:mapperr/sec.git
+  - test: |
+      cd sec && just test test-integration
