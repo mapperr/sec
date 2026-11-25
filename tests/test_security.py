@@ -114,7 +114,7 @@ class SecTests(unittest.TestCase):
         self.approve("sec", "store", "policy", "approve")
         return self.repo / ".sec"
 
-    def test_existing_policy_manifest_and_attestation_formats(self):
+    def test_existing_policy_and_attestation_formats(self):
         def encode(value):
             return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()
 
@@ -143,17 +143,6 @@ class SecTests(unittest.TestCase):
             encode({"digest": digest((store / "secrets/token.age").read_bytes()),
                     "policy": policy_digest}) + b"\n",
         )
-
-        manifest = store / "manifests/dev"
-        manifest.parent.mkdir()
-        manifest.write_text("var COMPAT_TOKEN=token\n")
-        target = ["printenv", "COMPAT_TOKEN"]
-        executable = Path(shutil.which(target[0], path=self.env["PATH"])).resolve()
-        manifest_key = [str(store), str(store), "manifests/dev", digest(encode([str(executable), *target]))]
-        record_path(registry, "manifest", manifest_key).write_bytes(
-            encode({"env_names": {}, "plan": [["var", "COMPAT_TOKEN", str(store), "token"]], "prefixes": []}) + b"\n"
-        )
-        self.assertEqual(self.command("sec", "run", "-m", "dev", "--", *target), b"compatibility fixture\n\n")
 
     def test_ssh_age_compatibility(self):
         key = self.root / "ssh"
@@ -214,53 +203,41 @@ class SecTests(unittest.TestCase):
         self.command("sec", "store", "put", "value", data=b"new", ok=False)
         self.assertEqual(self.command("sec", "store", "get", "value"), b"separate age file")
 
-    def test_group_approval_and_semantic_changes(self):
+    def test_manifest_runs_without_approval_and_previews_only_metadata(self):
         store = self.project_store()
-        self.command("sec", "store", "put", "token", data=b"example\n\n")
+        self.command("sec", "store", "put", "token", data=b"example-secret\r\n")
         self.command("sec", "store", "put", "settings", data=b"EXAMPLE_ONE=fixture\n")
         (store / "manifests").mkdir()
         manifest = store / "manifests/dev"
-        manifest.write_text("var EXAMPLE_TOKEN=token\nenv settings\nset EXAMPLE_LABEL=test\n")
+        manifest.write_text("var EXAMPLE_TOKEN=token\nenv settings\nset EXAMPLE_LABEL=literal-value\n")
         launch = ("sec", "run", "-m", "dev", "--", "printenv", "EXAMPLE_TOKEN", "EXAMPLE_ONE")
-        self.command(*launch, ok=False)
-        preview = self.command("sec", "run", "-m", "dev")
-        self.assertIn(b"EXAMPLE_TOKEN", preview)
-        self.assertNotIn(b"fixture", preview)
-        self.approve("sec", "run", "manifest", "approve", "dev", "--env-name", "EXAMPLE_ONE",
-                     "--", "printenv", "EXAMPLE_TOKEN", "EXAMPLE_ONE")
-        self.assertEqual(self.command(*launch), b"example\n\n\nfixture\n")
-        manifest.write_text("# comment\nset EXAMPLE_LABEL=test\nenv settings\nvar EXAMPLE_TOKEN=token\n")
-        self.assertEqual(self.command(*launch), b"example\n\n\nfixture\n")
+        preview = self.command("sec", "run", "-m", "dev", "-M", "personal::missing")
+        for item in (b"EXAMPLE_TOKEN", b"EXAMPLE_ONE", b"CRLF", b"absent, optional"):
+            self.assertIn(item, preview)
+        for value in (b"example-secret", b"fixture", b"literal-value"):
+            self.assertNotIn(value, preview)
+        self.assertEqual(self.command(*launch), b"example-secret\r\n\nfixture\n")
+        denied_pin = {"SEC_RUN_EXEC_SHA256": "0" * 64}
+        self.assertEqual(self.command(*launch, env=denied_pin, ok=False), b"")
+        executable = Path(shutil.which("printenv", path=self.env["PATH"])).resolve()
+        pin = {"SEC_RUN_EXEC_SHA256": hashlib.sha256(executable.read_bytes()).hexdigest()}
+        self.assertEqual(self.command(*launch, env=pin), b"example-secret\r\n\nfixture\n")
+        self.assertIn(b"EXAMPLE_ONE=fixture\n", self.command("sec", "run", "-m", "dev", "--env-only"))
+        self.assertIn(b"SEC_RUN_DIR=<temporary directory>", self.command("sec", "run", "-m", "dev", "--print"))
+
         self.command("sec", "store", "put", "settings", data=b"EXAMPLE_ONE=fixture\nEXTRA=value\n")
-        self.assertEqual(self.command(*launch, ok=False), b"")
-        manifest.write_text("var EXAMPLE_TOKEN=token\nset EXAMPLE_LABEL=changed\n")
-        self.command(*launch, ok=False)
+        manifest.write_text("env settings\nset EXAMPLE_LABEL=changed\n")
+        self.assertEqual(
+            self.command("sec", "run", "-m", "dev", "--", "printenv", "EXAMPLE_LABEL", "EXTRA"),
+            b"changed\nvalue\n",
+        )
+        self.command("sec", "run", "manifest", "approve", "dev", ok=False)
         self.command("sec", "run", "-s", "PATH=/usr/bin", "--", "printenv", "PATH", ok=False)
         self.command("sec", "run", "manifest", "rm", str(manifest), ok=False)
         self.assertTrue(manifest.exists())
-
-    def test_prefix_grant_and_revoke(self):
-        store = self.project_store()
-        team = self.root / "team"
-        self.command("sec", "store", "init", env={"SEC_STORE_DIR": str(team)})
-        team_env = {"SEC_STORE_DIR": str(team), "SEC_STORE_ALLOW_SELF": "1"}
-        self.command("sec", "store", "put", "scope/one", data=b"first", env=team_env)
-        self.command("sec", "store", "put", "scope/two", data=b"second", env=team_env)
-        self.command("sec", "store", "put", "elsewhere/three", data=b"third", env=team_env)
-        (store / "stores").write_text(f"team file://{team}\n")
-        (store / "manifests").mkdir()
-        manifest = store / "manifests/dev"
-        manifest.write_text("var ONE=team::scope/one\n")
-        target = ("--", "sh", "-c", 'printf "%s/%s" "$ONE" "${TWO:-none}"')
-        self.approve("sec", "run", "manifest", "approve", "dev", *target)
-        self.approve("sec", "run", "manifest", "grant", "dev", "--prefix", "team::scope/", *target)
-        manifest.write_text("var ONE=team::scope/one\nvar TWO=team::scope/two\n")
-        self.assertEqual(self.command("sec", "run", "-m", "dev", *target), b"first/second")
-        manifest.write_text("var ONE=team::scope/one\nvar TWO=team::elsewhere/three\n")
-        self.command("sec", "run", "-m", "dev", *target, ok=False)
-        self.command("sec", "run", "manifest", "revoke", "dev", "--prefix", "team::scope/", *target)
-        manifest.write_text("var ONE=team::scope/one\nvar TWO=team::scope/two\n")
-        self.command("sec", "run", "-m", "dev", *target, ok=False)
+        self.command("sec", "store", "put", "settings", data=b"LD_PRELOAD=blocked\n")
+        self.assertEqual(self.command("sec", "run", "-m", "dev", ok=False), b"")
+        self.assertEqual(self.command("sec", "run", "-m", "dev", "--", "true", ok=False), b"")
 
     def test_file_injection_preserves_stdin(self):
         self.project_store()
@@ -409,6 +386,29 @@ class SecTests(unittest.TestCase):
         self.command("sec", "store", "put", "token", data=b"bad\0text\n")
         self.assertEqual(self.command("sec", "store", "type", "token", env=settings, ok=False), b"")
 
+    def test_fzf_inherits_user_configuration_and_search_matches_legacy_patterns(self):
+        self.project_store()
+        name = "folder/Token (work)"
+        self.command("sec", "store", "put", name, data=b"fixture")
+        for pattern in ("Token (work)$", r"Token (\(work\))$"):
+            self.assertEqual(self.command("sec", "store", "search", pattern),
+                             (name + "\n").encode())
+
+        options_file = self.root / "fzf options"
+        options_file.write_text("--layout=reverse\n")
+        program = self.root / "fake fzf"
+        program.write_text(
+            "#!/bin/sh\n"
+            'test "$FZF_DEFAULT_OPTS" = "--height=40%" || exit 2\n'
+            'test "$(cat "$FZF_DEFAULT_OPTS_FILE")" = "--layout=reverse" || exit 3\n'
+            "cat\n"
+        )
+        program.chmod(0o700)
+        settings = {"FZF_DEFAULT_OPTS": "--height=40%", "FZF_DEFAULT_OPTS_FILE": str(options_file),
+                    "SEC_STORE_FZF_FZF": str(program)}
+        self.assertEqual(self.command("sec", "store", "fzf", "folder", env=settings),
+                         (name + "\n").encode())
+
     def test_clipboard_uses_a_timed_sensitive_offer_on_wayland(self):
         self.project_store()
         self.command("sec", "store", "put", "token", data=b"synthetic first line\nsecond line\n")
@@ -484,6 +484,8 @@ class SecTests(unittest.TestCase):
         (origin / "secrets/token.age").write_bytes(self.command("sec", "e", data=b"shared token"))
         manifest = origin / "manifests/dev"
         manifest.write_text("var SHARED_TOKEN=token\n")
+        (origin / "manifests/file").write_text("file SHARED_FILE=token\n")
+        (origin / "manifests/personal").write_text("var PERSONAL_TOKEN=personal::token\n")
         self.command("git", "init", "-q", cwd=origin)
         self.command("git", "-c", "user.name=Sec Test", "-c", "user.email=sec@example.invalid",
                      "add", ".", cwd=origin)
@@ -556,12 +558,23 @@ class SecTests(unittest.TestCase):
         (personal / "manifests").mkdir()
         (personal / "manifests/dev").write_text("var PERSONAL_TOKEN=token\n")
         target = ("--", "printenv", "SHARED_TOKEN", "PERSONAL_TOKEN")
-        self.approve("sec", "run", "manifest", "approve", "shared::dev", *target, env=settings)
-        self.approve("sec", "run", "manifest", "approve", "personal::dev", *target, env=settings)
         self.assertEqual(
             self.command("sec", "run", "-m", "shared::dev", "-m", "personal::dev", *target, env=settings),
             b"shared token\npersonal token\n",
         )
+        self.assertEqual(self.command("sec", "run", "-m", "shared::dev", "--env-only", env=settings),
+                         b"SHARED_TOKEN=shared token\n")
+
+        manifest_file = ("sec", "run", "-m", "shared::file")
+        self.assertIn(b"SHARED_FILE=<SEC_RUN_DIR>/shared/token\n",
+                      self.command(*manifest_file, "--print", env=settings))
+        self.assertEqual(
+            self.command(*manifest_file, "--", "sh", "-c",
+                         'test "$SHARED_FILE" = "$SEC_RUN_DIR/shared/token" && cat "$SHARED_FILE"',
+                         env=settings),
+            b"shared token",
+        )
+        self.command("sec", "run", "-m", "shared::personal", "--env-only", env=settings, ok=False)
 
     def test_remote_requires_authorized_origin_and_validates_the_snapshot(self):
         self.command("git", "init", "-q")

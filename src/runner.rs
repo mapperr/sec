@@ -9,7 +9,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail, ensure};
-use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
 use crate::{
@@ -18,43 +17,15 @@ use crate::{
     supervisor,
 };
 
-type Prefix = (String, String, Option<String>, Option<String>);
-type Row = Vec<String>;
-type EnvNames = BTreeMap<String, Vec<String>>;
-
-#[derive(Default, Deserialize, Serialize)]
-#[serde(default)]
-struct Approval {
-    plan: Vec<Row>,
-    env_names: EnvNames,
-    prefixes: Vec<Prefix>,
-}
-
-#[derive(Clone)]
 struct Injection {
     mode: String,
     name: String,
     value: String,
     store: Option<Store>,
+    alias: Option<String>,
 }
 
 impl Injection {
-    fn record(&self) -> Row {
-        match &self.store {
-            Some(source) => vec![
-                self.mode.clone(),
-                self.name.clone(),
-                source.origin.clone(),
-                self.value.clone(),
-            ],
-            None => vec![
-                self.mode.clone(),
-                self.name.clone(),
-                c::sha(self.value.as_bytes()),
-            ],
-        }
-    }
-
     fn describe(&self) -> String {
         match &self.store {
             Some(source) => format!(
@@ -70,80 +41,6 @@ impl Injection {
             ),
             None => format!("set {}=<literal>", self.name),
         }
-    }
-}
-
-struct Manifest {
-    refname: String,
-    source: Store,
-    path: String,
-    commands: Vec<Injection>,
-}
-
-impl Manifest {
-    fn plan(&self) -> Vec<Row> {
-        let mut env = Vec::new();
-        let mut other = Vec::new();
-        for command in &self.commands {
-            if command.mode == "env" {
-                env.push(command.record());
-            } else {
-                other.push(command.record());
-            }
-        }
-        other.sort();
-        env.extend(other);
-        env
-    }
-
-    fn key(&self, base: &Store, argv: &[String]) -> Result<[String; 4]> {
-        Ok([
-            c::path_string(&base.root)?,
-            self.source.origin.clone(),
-            self.path.clone(),
-            c::sha(c::canonical(&argv)?),
-        ])
-    }
-
-    fn allowed(&self, base: &Store, argv: &[String]) -> Result<EnvNames> {
-        let binding = self.key(base, argv)?;
-        let previous = c::record::<Approval>("manifest", &binding)?.with_context(|| {
-            format!(
-                "manifest {:?} requires approval; use sec run manifest approve",
-                self.refname
-            )
-        })?;
-        let plan = self.plan();
-        if previous.plan != plan {
-            let originals = plan
-                .iter()
-                .filter(|row| previous.plan.contains(row))
-                .cloned()
-                .collect::<Vec<_>>();
-            let mut additions = plan
-                .iter()
-                .filter(|row| !previous.plan.contains(row))
-                .peekable();
-            let covered = additions.peek().is_some()
-                && additions.all(|row| {
-                    matches!(row[0].as_str(), "var" | "file")
-                        && previous
-                            .prefixes
-                            .iter()
-                            .any(|(origin, prefix, mode, name)| {
-                                row[2] == *origin
-                                    && row[3].starts_with(prefix)
-                                    && mode.as_ref().is_none_or(|mode| row[0] == *mode)
-                                    && name.as_ref().is_none_or(|name| row[1] == *name)
-                            })
-                });
-            ensure!(
-                originals == previous.plan && covered,
-                "manifest {:?} requires approval; use sec run manifest approve",
-                self.refname
-            );
-        }
-        Ok(previous.env_names)
     }
 }
 
@@ -185,13 +82,17 @@ impl Runner {
         Ok(source)
     }
 
-    fn path(&mut self, reference: &str, mutable: bool) -> Result<(Store, String, PathBuf)> {
+    fn path<'a>(
+        &mut self,
+        reference: &'a str,
+        mutable: bool,
+    ) -> Result<(Store, Option<&'a str>, PathBuf)> {
         let direct = Path::new(reference);
         if !mutable
             && (direct.is_absolute() || reference.starts_with("./") || reference.starts_with("../"))
         {
             let path = c::absolute_path(direct)?;
-            return Ok((self.base.clone(), c::path_string(&path)?, path));
+            return Ok((self.base.clone(), None, path));
         }
         let (alias, name) = store::reference(reference)?;
         ensure!(
@@ -200,18 +101,15 @@ impl Runner {
         );
         c::managed(name)?;
         let source = self.resolve(alias)?;
-        Ok((
-            source.clone(),
-            format!("manifests/{name}"),
-            source.root.join("manifests").join(name),
-        ))
+        let path = source.root.join("manifests").join(name);
+        Ok((source, alias, path))
     }
 
     fn instruction(
         &mut self,
         mode: &str,
         value: &str,
-        primary: Option<&Store>,
+        primary: Option<(&Store, Option<&str>)>,
     ) -> Result<Injection> {
         if mode == "set" {
             let (name, value) = value.split_once('=').context("set expects NAME=VALUE")?;
@@ -222,6 +120,7 @@ impl Runner {
                 name: name.into(),
                 value: value.into(),
                 store: None,
+                alias: None,
             });
         }
         let (name, value) = if mode == "env" {
@@ -259,15 +158,12 @@ impl Runner {
             variable(&name)?;
             name
         };
-        let source = if alias.is_none()
-            && let Some(primary) = primary
-        {
-            primary.clone()
-        } else {
-            self.resolve(alias)?
+        let (source, alias) = match (alias, primary) {
+            (None, Some((source, alias))) => (source.clone(), alias),
+            (alias, _) => (self.resolve(alias)?, alias),
         };
         ensure!(
-            !primary.is_some_and(|primary| primary.remote) || !store::is_personal(&source),
+            !primary.is_some_and(|(primary, _)| primary.remote) || !store::is_personal(&source),
             "compose a personal manifest explicitly at the call site"
         );
         Ok(Injection {
@@ -275,6 +171,7 @@ impl Runner {
             name,
             value,
             store: Some(source),
+            alias: alias.map(str::to_owned),
         })
     }
 
@@ -282,56 +179,49 @@ impl Runner {
         &mut self,
         reference: &str,
         optional: bool,
-        load: bool,
-    ) -> Result<Option<Manifest>> {
-        let (source, id, path) = self.path(reference, false)?;
-        let mut commands = Vec::new();
-        if load {
-            let Some(data) = c::optional(&path, c::CONFIG)? else {
-                if optional {
-                    return Ok(None);
-                }
-                bail!("manifest {reference:?} does not exist");
-            };
-            for (number, line) in c::utf8(&data)?.lines().enumerate() {
-                let line = line.trim_start();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                let (mode, value) = line.split_once(char::is_whitespace).with_context(|| {
-                    format!("invalid directive at {reference:?}:{}", number + 1)
-                })?;
-                let mode = match mode {
-                    "-e" => "env",
-                    "-v" => "var",
-                    "-f" => "file",
-                    value => value,
-                };
-                ensure!(
-                    matches!(mode, "env" | "var" | "file" | "set"),
-                    "invalid directive at {reference:?}:{}",
-                    number + 1
-                );
-                let value = if mode == "set" {
-                    value.trim_start()
-                } else {
-                    let value = value.trim();
-                    ensure!(
-                        !value.chars().any(char::is_whitespace),
-                        "whitespace in manifest reference"
-                    );
-                    value
-                };
-                commands.push(self.instruction(mode, value, Some(&source))?);
-                ensure!(commands.len() <= 128, "manifest exceeds 128 directives");
+    ) -> Result<(PathBuf, Option<Vec<Injection>>)> {
+        let (source, alias, path) = self.path(reference, false)?;
+        let Some(data) = c::optional(&path, c::CONFIG)? else {
+            ensure!(optional, "manifest {reference:?} does not exist");
+            if c::var("SEC_RUN_DEBUG").is_some() {
+                eprintln!("sec run: skipping absent optional manifest {reference:?}");
             }
+            return Ok((path, None));
+        };
+        let mut commands = Vec::new();
+        for (number, line) in c::utf8(&data)?.lines().enumerate() {
+            let line = line.trim_start();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let (mode, value) = line
+                .split_once(char::is_whitespace)
+                .with_context(|| format!("invalid directive at {reference:?}:{}", number + 1))?;
+            let mode = match mode {
+                "-e" => "env",
+                "-v" => "var",
+                "-f" => "file",
+                value => value,
+            };
+            ensure!(
+                matches!(mode, "env" | "var" | "file" | "set"),
+                "invalid directive at {reference:?}:{}",
+                number + 1
+            );
+            let value = if mode == "set" {
+                value.trim_start()
+            } else {
+                let value = value.trim();
+                ensure!(
+                    !value.chars().any(char::is_whitespace),
+                    "whitespace in manifest reference"
+                );
+                value
+            };
+            commands.push(self.instruction(mode, value, Some((&source, alias)))?);
+            ensure!(commands.len() <= 128, "manifest exceeds 128 directives");
         }
-        Ok(Some(Manifest {
-            refname: reference.into(),
-            source,
-            path: id,
-            commands,
-        }))
+        Ok((path, Some(commands)))
     }
 }
 
@@ -387,29 +277,11 @@ fn variable(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn target(command: &[String], output: Option<&str>) -> Result<Vec<String>> {
-    if let Some(mode) = output {
-        ensure!(
-            command.is_empty(),
-            "output modes cannot be combined with a command"
-        );
-        return Ok(vec!["output".into(), mode.into()]);
-    }
-    let first = command
-        .first()
-        .context("specify a command after -- or an output mode")?;
-    let path = which::which(first)
-        .with_context(|| format!("command {first:?} is unavailable"))?
-        .canonicalize()?;
-    if let Some(digest) = c::var("SEC_RUN_EXEC_SHA256") {
-        pinned(&path, digest.to_str().context("invalid SHA-256 pin")?)?;
-    }
-    let mut binding = vec![c::path_string(&path)?];
-    binding.extend_from_slice(command);
-    Ok(binding)
-}
-
-fn pinned(path: &Path, hash: &str) -> Result<File> {
+fn pinned(path: &Path) -> Result<Option<File>> {
+    let Some(hash) = c::var("SEC_RUN_EXEC_SHA256") else {
+        return Ok(None);
+    };
+    let hash = hash.to_str().context("invalid SHA-256 pin")?;
     ensure!(
         hash.len() == 64
             && hash
@@ -423,52 +295,16 @@ fn pinned(path: &Path, hash: &str) -> Result<File> {
         digest == hash,
         "executable differs from trusted SHA-256 pin"
     );
-    Ok(file)
+    Ok(Some(file))
 }
 
-fn env_key(item: &Injection) -> Result<String> {
-    Ok(c::sha(c::canonical(&item.record())?))
-}
-
-struct Arguments<'a> {
-    flags: BTreeMap<&'a str, Vec<&'a str>>,
-    output: Option<&'a str>,
-}
-impl<'a> Arguments<'a> {
-    fn parse(args: &'a [String]) -> Result<Self> {
-        let mut flags: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
-        let mut output = None;
-        let mut args = args.iter().map(String::as_str);
-        while let Some(flag) = args.next() {
-            match flag {
-                "--print" | "--env-only" => {
-                    ensure!(output.replace(flag).is_none(), "use only one output mode");
-                }
-                "--env-name" | "--entry" | "--prefix" | "--as" | "--mode" => {
-                    flags
-                        .entry(flag)
-                        .or_default()
-                        .push(args.next().context("missing flag argument")?);
-                }
-                _ => bail!("invalid approval argument {flag:?}"),
-            }
-        }
-        Ok(Self { flags, output })
-    }
-    fn one(&self, name: &str) -> Result<Option<&'a str>> {
-        let value = self.flags.get(name).map(Vec::as_slice).unwrap_or_default();
-        ensure!(value.len() <= 1, "{name} may only be specified once");
-        Ok(value.first().copied())
-    }
-}
-
-fn manage(runner: &mut Runner, options: &[String], command: &[String]) -> Result<()> {
+fn manage(runner: &mut Runner, options: &[String]) -> Result<()> {
     let (action, args) = options
         .split_first()
         .context("specify a manifest command")?;
     let action = action.as_str();
     match action {
-        "ls" | "l" if args.is_empty() && command.is_empty() => {
+        "ls" | "l" if args.is_empty() => {
             let folder = runner.base.root.join("manifests");
             match c::lines(&folder) {
                 Ok(files) => {
@@ -483,7 +319,7 @@ fn manage(runner: &mut Runner, options: &[String], command: &[String]) -> Result
                 Err(error) => return Err(error),
             }
         }
-        "edit" | "e" | "rm" | "r" if !args.is_empty() && command.is_empty() => {
+        "edit" | "e" | "rm" | "r" if !args.is_empty() => {
             let editing = matches!(action, "edit" | "e");
             ensure!(
                 !editing || args.len() == 1,
@@ -504,180 +340,6 @@ fn manage(runner: &mut Runner, options: &[String], command: &[String]) -> Result
                 } else {
                     platform::remove_file(&path)?;
                 }
-            }
-        }
-        "approve" | "revoke" | "grant" | "approvals" => {
-            let (reference, args) = args.split_first().context("specify a manifest reference")?;
-            let flags = Arguments::parse(args)?;
-            let target = target(command, flags.output)?;
-            let manifest = runner
-                .manifest(reference, false, matches!(action, "approve" | "grant"))?
-                .unwrap();
-            let binding = manifest.key(&runner.base, &target)?;
-            let previous = c::record::<Approval>("manifest", &binding)?;
-            match action {
-                "approvals" => {
-                    ensure!(flags.flags.is_empty(), "unexpected approval arguments");
-                    if let Some(record) = previous {
-                        for row in record.plan {
-                            println!("{:?}", if row[0] == "set" { &row[..2] } else { &row });
-                        }
-                        for prefix in record.prefixes {
-                            println!("prefix {prefix:?}");
-                        }
-                    }
-                }
-                "approve" => {
-                    ensure!(
-                        flags.flags.keys().all(|name| *name == "--env-name"),
-                        "unexpected approval arguments"
-                    );
-                    let existing = previous.is_some();
-                    let mut record = previous.unwrap_or_default();
-                    let plan = manifest.plan();
-                    let names = flags
-                        .flags
-                        .get("--env-name")
-                        .into_iter()
-                        .flatten()
-                        .map(|name| {
-                            variable(name)?;
-                            Ok(name.to_string())
-                        })
-                        .collect::<Result<BTreeSet<_>>>()?
-                        .into_iter()
-                        .collect::<Vec<_>>();
-                    let mut envs = BTreeMap::new();
-                    for entry in manifest.commands.iter().filter(|entry| entry.mode == "env") {
-                        let key = env_key(entry)?;
-                        let names = if names.is_empty() {
-                            record
-                                .env_names
-                                .get(&key)
-                                .cloned()
-                                .context("approve env entries with --env-name NAME")?
-                        } else {
-                            names.clone()
-                        };
-                        envs.insert(key, names);
-                    }
-                    if existing && record.plan == plan && record.env_names == envs {
-                        return Ok(());
-                    }
-                    let mut changes = vec![
-                        format!("{:?}/{}", manifest.source.origin, manifest.path),
-                        format!("command: {:?}", &target[1..]),
-                    ];
-                    for entry in &manifest.commands {
-                        if !record.plan.contains(&entry.record()) {
-                            changes.push(format!("+ {}", entry.describe()));
-                        }
-                    }
-                    for row in &record.plan {
-                        if !plan.contains(row) {
-                            changes.push(format!(
-                                "- {:?}",
-                                if row[0] == "set" { &row[..2] } else { row }
-                            ));
-                        }
-                    }
-                    if envs != record.env_names {
-                        let names = envs.values().flatten().cloned().collect::<BTreeSet<_>>();
-                        changes.push(format!("allowed env names: {names:?}"));
-                    }
-                    if changes.len() == 2 && existing && record.plan != plan {
-                        changes.push("environment import order changed".into());
-                    }
-                    c::confirm("Approve manifest injection", changes)?;
-                    record.plan = plan;
-                    record.env_names = envs;
-                    c::write_record("manifest", &binding, &record)?;
-                }
-                "grant" | "revoke" => {
-                    ensure!(
-                        !flags.flags.contains_key("--env-name"),
-                        "unexpected approval arguments"
-                    );
-                    let entry = flags.one("--entry")?;
-                    let prefix = flags.one("--prefix")?;
-                    let mode = flags.one("--mode")?;
-                    let name = flags.one("--as")?;
-                    ensure!(
-                        entry.is_none() || prefix.is_none(),
-                        "choose one of --entry or --prefix"
-                    );
-                    if let Some(mode) = mode {
-                        ensure!(matches!(mode, "var" | "file"), "expected var or file");
-                    }
-                    if let Some(name) = name {
-                        variable(name)?;
-                    }
-                    let Some(mut record) = previous else {
-                        ensure!(action == "revoke", "approve the manifest's plan first");
-                        return Ok(());
-                    };
-                    if let Some(prefix) = prefix {
-                        let (alias, path) = store::reference(prefix.trim_end_matches('/'))?;
-                        ensure!(alias.is_some(), "prefix grant requires ALIAS::PREFIX");
-                        let origin = runner.resolve(alias)?;
-                        ensure!(
-                            !store::is_personal(&origin),
-                            "personal entries require an explicit list"
-                        );
-                        let scope = (
-                            origin.origin,
-                            format!("{}/", c::managed(path)?),
-                            mode.map(str::to_owned),
-                            name.map(str::to_owned),
-                        );
-                        if action == "grant" {
-                            if record.prefixes.contains(&scope) {
-                                return Ok(());
-                            }
-                            c::confirm(
-                                "Allow future entries under this team prefix",
-                                [format!("{scope:?}")],
-                            )?;
-                            record.prefixes.push(scope);
-                        } else {
-                            record.prefixes.retain(|item| item != &scope);
-                        }
-                    } else if let Some(entry) = entry {
-                        let mode = mode.context("an entry grant needs --mode")?;
-                        let name = name.context("an entry grant needs --as")?;
-                        let row = runner
-                            .instruction(mode, &format!("{name}={entry}"), None)?
-                            .record();
-                        if action == "grant" {
-                            let plan = manifest.plan();
-                            ensure!(plan.contains(&row), "grant is absent from the manifest");
-                            let mut updated = record.plan.clone();
-                            if updated.contains(&row) {
-                                return Ok(());
-                            }
-                            updated.push(row.clone());
-                            updated.sort();
-                            let mut observed = plan.clone();
-                            observed.sort();
-                            ensure!(
-                                observed == updated,
-                                "other plan changes require collective approval"
-                            );
-                            c::confirm("Approve additional manifest entry", [format!("{row:?}")])?;
-                            record.plan = plan;
-                        } else {
-                            record.plan.retain(|item| item != &row);
-                        }
-                    } else {
-                        ensure!(
-                            action == "revoke" && flags.flags.is_empty(),
-                            "specify --entry or --prefix"
-                        );
-                        return c::remove_record("manifest", &binding);
-                    }
-                    c::write_record("manifest", &binding, &record)?;
-                }
-                _ => unreachable!(),
             }
         }
         _ => bail!("invalid manifest command or arguments. Run sec run manifest --help"),
@@ -702,7 +364,10 @@ fn dotenv(data: &[u8]) -> Result<Values> {
             .position(|&byte| byte == b'=')
             .context("expected NAME=VALUE")?;
         let name = c::utf8(&line[..equal])?;
-        variable(name)?;
+        ensure!(
+            variable(name).is_ok(),
+            "invalid or reserved variable name in environment entry"
+        );
         values.insert(name.into(), Zeroizing::new(line[equal + 1..].to_vec()));
     }
     Ok(values)
@@ -716,24 +381,17 @@ fn normalized(name: &str) -> String {
     }
 }
 
-fn destination(item: &Injection, base: &Store) -> String {
-    let source = item.store.as_ref().unwrap();
-    if source.root == base.root {
-        item.value.clone()
-    } else {
-        format!("{}/{}", &c::sha(source.origin.as_bytes())[..16], item.value)
+fn destination(item: &Injection) -> String {
+    match &item.alias {
+        Some(alias) => format!("{alias}/{}", item.value),
+        None => item.value.clone(),
     }
 }
 
-fn prepare(
-    plan: &[(Injection, Option<usize>)],
-    approvals: &[EnvNames],
-    base: &Store,
-    runtime: Option<&Path>,
-) -> Result<Values> {
+fn prepare(plan: &[Injection], runtime: Option<&Path>) -> Result<Values> {
     let mut names = BTreeSet::new();
     let mut paths = BTreeSet::new();
-    for (item, _) in plan {
+    for item in plan {
         if item.mode != "env" {
             ensure!(
                 names.insert(normalized(&item.name)),
@@ -742,7 +400,7 @@ fn prepare(
             );
         }
         if item.mode == "file" {
-            let target = normalized(&destination(item, base));
+            let target = normalized(&destination(item));
             ensure!(
                 !paths.iter().any(|old: &String| old == &target
                     || old.starts_with(&(target.clone() + "/"))
@@ -754,7 +412,11 @@ fn prepare(
     }
     let mut values = Values::new();
     let mut total = 0;
-    for (item, manifest) in plan {
+    let debug = c::var("SEC_RUN_DEBUG").is_some();
+    for item in plan {
+        if debug {
+            eprintln!("sec run: {}", item.describe());
+        }
         if item.mode == "set" {
             values.insert(
                 item.name.clone(),
@@ -779,16 +441,6 @@ fn prepare(
         match item.mode.as_str() {
             "env" => {
                 let decoded = dotenv(&data)?;
-                if let Some(manifest) = manifest {
-                    let key = env_key(item)?;
-                    let names = approvals[*manifest]
-                        .get(&key)
-                        .context("environment entry has no approved names")?;
-                    ensure!(
-                        decoded.keys().all(|key| names.contains(key)),
-                        "environment entry contains an unapproved variable"
-                    );
-                }
                 for (name, value) in decoded {
                     ensure!(
                         !names.contains(&normalized(&name)),
@@ -806,7 +458,7 @@ fn prepare(
             }
             "file" => {
                 if let Some(runtime) = runtime {
-                    let file = runtime.join(destination(item, base));
+                    let file = runtime.join(destination(item));
                     platform::create_dirs(file.parent().unwrap())?;
                     c::write_new(&file, &data)?;
                     values.insert(
@@ -904,13 +556,16 @@ pub fn cli(args: &[String]) -> Result<i32> {
         .first()
         .is_some_and(|first| matches!(first.as_str(), "manifest" | "m"))
     {
-        manage(&mut runner, &options[1..], command)?;
+        ensure!(
+            command.is_empty(),
+            "manifest commands take a manifest reference. Omit -- COMMAND"
+        );
+        manage(&mut runner, &options[1..])?;
         return Ok(0);
     }
     let mut output = None;
     let mut plan = Vec::new();
     let mut manifest_refs = Vec::new();
-    let mut manifests = Vec::new();
     let mut options = options.iter().map(String::as_str);
     while let Some(option) = options.next() {
         let mode = match option {
@@ -920,19 +575,10 @@ pub fn cli(args: &[String]) -> Result<i32> {
             }
             "-m" | "--manifest" | "-M" | "--optional-manifest" => {
                 let name = options.next().context("missing manifest reference")?;
-                let found =
-                    runner.manifest(name, matches!(option, "-M" | "--optional-manifest"), true)?;
-                manifest_refs.push((name, found.is_some()));
-                if let Some(found) = found {
-                    plan.extend(
-                        found
-                            .commands
-                            .iter()
-                            .cloned()
-                            .map(|item| (item, Some(manifests.len()))),
-                    );
-                    manifests.push(found);
-                }
+                let (path, found) =
+                    runner.manifest(name, matches!(option, "-M" | "--optional-manifest"))?;
+                manifest_refs.push((name, path, found.is_some()));
+                plan.extend(found.into_iter().flatten());
                 continue;
             }
             "-e" | "--env" => "env",
@@ -942,7 +588,7 @@ pub fn cli(args: &[String]) -> Result<i32> {
             _ => bail!("invalid injection flag {option:?}. Run sec run --help"),
         };
         let value = options.next().context("missing injection argument")?;
-        plan.push((runner.instruction(mode, value, None)?, None));
+        plan.push(runner.instruction(mode, value, None)?);
     }
     ensure!(
         !manifest_refs.is_empty() || !plan.is_empty(),
@@ -950,61 +596,72 @@ pub fn cli(args: &[String]) -> Result<i32> {
     );
     ensure!(plan.len() <= 128, "injection plan exceeds 128 directives");
     if output.is_none() && command.is_empty() {
-        for (name, present) in manifest_refs {
-            println!(
-                "Manifest {name:?} ({})",
-                if present {
-                    "approval checked when launching"
-                } else {
-                    "absent (optional)"
-                }
-            );
+        let values = prepare(&plan, None)?;
+        println!("Store: {:?}", runner.base.root);
+        for (name, path, present) in manifest_refs {
+            let status = if present { "" } else { " (absent, optional)" };
+            println!("Manifest {name:?}: {path:?}{status}");
         }
-        for (item, _) in plan {
+        for item in &plan {
             println!("{}", item.describe());
+            if item.mode == "file" {
+                println!("  {}=<SEC_RUN_DIR>/{}", item.name, destination(item));
+            }
+            if item.mode == "var" {
+                let value = &values[&item.name];
+                if value.ends_with(b"\r\n") {
+                    println!("  {} ends with CRLF", item.name);
+                } else if value.ends_with(b"\n") {
+                    println!("  {} ends with LF", item.name);
+                }
+            }
+        }
+        if !values.is_empty() {
+            println!(
+                "Environment: {}",
+                values.keys().cloned().collect::<Vec<_>>().join(", ")
+            );
         }
         return Ok(0);
     }
-    let target = target(command, output)?;
-    let approvals = manifests
-        .iter()
-        .map(|manifest| manifest.allowed(&runner.base, &target))
-        .collect::<Result<Vec<_>>>()?;
-    if command.is_empty() {
+    ensure!(
+        output.is_none() || command.is_empty(),
+        "output modes cannot be combined with a command"
+    );
+    if let Some(mode) = output {
         ensure!(
-            output != Some("--env-only") || !plan.iter().any(|(item, _)| item.mode == "file"),
+            mode != "--env-only" || !plan.iter().any(|item| item.mode == "file"),
             "--env-only does not accept file entries"
         );
-        let env = prepare(&plan, &approvals, &runner.base, None)?;
+        let env = prepare(&plan, None)?;
         let mut stdout = io::stdout().lock();
         for (name, value) in env {
             write!(stdout, "{name}=")?;
             stdout.write_all(&value)?;
             stdout.write_all(b"\n")?;
         }
-        if output == Some("--print") {
-            for (item, _) in &plan {
+        if mode == "--print" {
+            for item in &plan {
                 if item.mode == "file" {
-                    writeln!(stdout, "{}=<SEC_RUN_DIR>/{}", item.name, item.value)?;
+                    writeln!(stdout, "{}=<SEC_RUN_DIR>/{}", item.name, destination(item))?;
                 }
             }
             writeln!(stdout, "SEC_RUN_DIR=<temporary directory>")?;
         }
         return Ok(0);
     }
+    let first = &command[0];
+    let target = which::which(first)
+        .with_context(|| format!("command {first:?} is unavailable"))?
+        .canonicalize()?;
+    let program = c::path_string(&target)?;
+    pinned(&target)?;
     let (workspace, lease) = workspace()?;
     let runtime = workspace.path().join("files");
     platform::create_dirs(&runtime)?;
-    let env = prepare(&plan, &approvals, &runner.base, Some(&runtime))?;
-    let executable = c::var("SEC_RUN_EXEC_SHA256")
-        .map(|hash| {
-            pinned(
-                Path::new(&target[0]),
-                hash.to_str().context("invalid SHA-256 pin")?,
-            )
-        })
-        .transpose()?;
-    let mut child = Command::new(supervisor::program(&target[0], executable.as_ref()));
+    let env = prepare(&plan, Some(&runtime))?;
+    let executable = pinned(&target)?;
+    let mut child = Command::new(supervisor::program(&program, executable.as_ref()));
     child
         .args(&command[1..])
         .env("SEC_STORE_DIR", &runner.base.root)

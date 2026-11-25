@@ -349,12 +349,18 @@ pub fn get(store: &Store, name: &str, limit: usize) -> Result<Zeroizing<Vec<u8>>
         None
     };
     let path = store.path(name)?;
+    if c::var("SEC_STORE_DEBUG").is_some() {
+        eprintln!("sec store: reading {path:?}");
+    }
     let cipher = c::read(&path, c::CIPHER)?;
     attest(store, &path, &cipher, false)?;
     crypto::decrypt_data(&cipher, limit)
 }
 
 fn encrypt(store: &Store, path: &Path, expected: Option<&[u8]>, data: &[u8]) -> Result<()> {
+    if c::var("SEC_STORE_DEBUG").is_some() {
+        eprintln!("sec store: encrypting {path:?}");
+    }
     let policy = encryption_policy(store, path)?;
     let legacy = if policy.is_empty() {
         config::legacy_self()?
@@ -433,6 +439,42 @@ pub fn list(store: &Store, prefix: &str) -> Result<Vec<String>> {
             })
         })
         .collect())
+}
+
+#[cfg(unix)]
+fn search(pattern: &str, entries: Vec<String>) -> Result<i32> {
+    if entries.is_empty() {
+        return Ok(1);
+    }
+    let mut input = entries.join("\n").into_bytes();
+    input.push(b'\n');
+    let result = c::capture(
+        std::process::Command::new("grep").args(["-e", pattern]),
+        Some(input),
+        c::SECRET,
+        30,
+    )?;
+    match result.status.code() {
+        Some(0) => {
+            io::stdout().write_all(&result.out)?;
+            Ok(0)
+        }
+        Some(1) => Ok(1),
+        _ => bail!("grep exited with {}", result.status),
+    }
+}
+
+#[cfg(windows)]
+fn search(pattern: &str, entries: Vec<String>) -> Result<i32> {
+    let regex = regex::Regex::new(pattern)?;
+    let mut found = false;
+    for entry in entries {
+        if regex.is_match(&entry) {
+            println!("{entry}");
+            found = true;
+        }
+    }
+    Ok(i32::from(!found))
 }
 
 fn scope(store: &Store, target: &str) -> Result<PathBuf> {
@@ -594,7 +636,7 @@ fn rekey(store: &Store, prefix: &str) -> Result<()> {
 fn check(store: &Store, args: &[String]) -> Result<()> {
     let mut strict = false;
     let mut adopt = false;
-    let mut decrypt = c::on("SEC_STORE_CHECK_DECRYPT");
+    let mut decrypt = c::var("SEC_STORE_CHECK_DECRYPT").is_some();
     for flag in args {
         match flag.as_str() {
             "--strict" => strict = true,
@@ -737,15 +779,8 @@ pub fn cli(args: &[String]) -> Result<i32> {
             }
         }
         ("search" | "s", [pattern] | [pattern, _]) => {
-            let regex = regex::Regex::new(pattern)?;
-            let mut any = false;
-            for name in list(&store, args.get(1).map(String::as_str).unwrap_or(""))? {
-                if regex.is_match(&name) {
-                    println!("{name}");
-                    any = true;
-                }
-            }
-            return Ok(i32::from(!any));
+            let entries = list(&store, args.get(1).map(String::as_str).unwrap_or(""))?;
+            return search(pattern, entries);
         }
         ("rm", [_, ..]) => {
             store.check_root()?;

@@ -200,7 +200,7 @@ fn display(data: &[u8]) -> Vec<u8> {
         .into_bytes()
 }
 
-fn type_entry(name: &str) -> Result<()> {
+fn type_entry(name: &str, default_delay: f64) -> Result<()> {
     let (_, name_only) = store::reference(name)?;
     let canonical = store::entry(name_only)?;
     let base = canonical.rsplit('/').next().unwrap_or_default();
@@ -210,9 +210,10 @@ fn type_entry(name: &str) -> Result<()> {
         !first.chars().any(char::is_control) && !base.chars().any(char::is_control),
         "control bytes are not supported in typed text"
     );
-    let delay: f64 = env::var("SEC_STORE_TYPE_WAIT")
-        .unwrap_or_else(|_| "0".into())
-        .parse()?;
+    let delay = match c::var("SEC_STORE_TYPE_WAIT") {
+        Some(value) => value.to_str().context("invalid typing delay")?.parse()?,
+        None => default_delay,
+    };
     ensure!(
         (0.0..=60.0).contains(&delay),
         "typing delay must be between 0 and 60 seconds"
@@ -412,110 +413,212 @@ fn view(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn dispatch(action: &str, name: &str) -> Result<()> {
+fn dispatch(action: &str, name: &str, in_menu: bool) -> Result<()> {
+    let (_, path) = store::reference(name)?;
+    let path = store::entry(path)?;
     match action {
         "--copy-first" => clipboard(first_line(&entry(name, c::SECRET)?)),
         "--copy-full" => clipboard(&entry(name, c::SECRET)?),
         "--otp" => clipboard(first_line(&otp(&entry(name, 65536)?)?)),
-        "--copy-name" => clipboard(name.rsplit('/').next().unwrap_or(name).as_bytes()),
+        "--copy-name" => clipboard(path.rsplit('/').next().unwrap_or(path).as_bytes()),
         "--copy-path" => clipboard(name.as_bytes()),
         "--view" => view(name),
         "--preview" => {
             io::stdout().write_all(&display(&entry(name, c::SECRET)?))?;
             Ok(())
         }
-        "--type" => type_entry(name),
-        "--policy" | "--edit" | "--rekey" | "--remove" => {
-            if action == "--remove" {
+        "--type" => type_entry(name, if in_menu { 2.0 } else { 0.0 }),
+        "--policy" => {
+            store::cli(&["policy".into(), "path".into(), name.into()])?;
+            Ok(())
+        }
+        "--edit" | "--rekey" | "--remove" => {
+            let command = if action == "--remove" {
                 c::confirm("Remove encrypted entry", [format!("{name:?}")])?;
-            }
-            store::cli(&[
-                action.trim_start_matches("--").replace("remove", "rm"),
-                name.into(),
-            ])?;
+                "rm"
+            } else {
+                &action[2..]
+            };
+            store::cli(&[command.into(), name.into()])?;
             Ok(())
         }
         _ => bail!("unknown interactive action"),
     }
 }
 
-fn fzf(args: &[String]) -> Result<()> {
-    const SHORTCUTS: &str = "Ctrl-I/Tab:first  Ctrl-Y:full  Ctrl-O:TOTP  Ctrl-V:view  Ctrl-T:type  Ctrl-E:edit  Ctrl-A:new  Ctrl-D:remove";
+const FZF_ACTIONS: &[(&str, &str)] = &[
+    ("ctrl-i", "--copy-first"),
+    ("ctrl-u", "--copy-name"),
+    ("ctrl-b", "--copy-path"),
+    ("ctrl-y", "--copy-full"),
+    ("ctrl-o", "--otp"),
+    ("ctrl-v", "--view"),
+    ("ctrl-e", "--edit"),
+    ("ctrl-t", "--type"),
+    ("ctrl-h", "--policy"),
+    ("ctrl-r", "--rekey"),
+    ("ctrl-d", "--remove"),
+    ("ctrl-a", "--new"),
+];
 
-    if args.first().is_some_and(|action| action == "--list") {
-        store::cli(
-            &std::iter::once("ls".to_owned())
-                .chain(args[1..].iter().filter(|v| !v.is_empty()).cloned())
-                .collect::<Vec<_>>(),
-        )?;
-        return Ok(());
+fn new_entry() -> Result<()> {
+    use std::io::BufRead;
+    let (mut input, mut output) = c::terminal()?;
+    write!(output, "new entry name: ")?;
+    output.flush()?;
+    let mut name = String::new();
+    input.read_line(&mut name)?;
+    let name = name.trim_end_matches(['\r', '\n']);
+    if !name.is_empty() {
+        dispatch("--edit", name, true)?;
     }
-    if args.len() == 2 && args[0].starts_with("--") {
-        return dispatch(&args[0], &args[1]);
-    }
-    if args == ["--new"] {
-        use std::io::BufRead;
-        let (mut input, mut output) = c::terminal()?;
-        write!(output, "new entry name: ")?;
-        output.flush()?;
-        let mut name = String::new();
-        input.read_line(&mut name)?;
-        if !name.trim().is_empty() {
-            dispatch("--edit", name.trim())?;
+    Ok(())
+}
+
+fn pause() -> Result<()> {
+    use std::io::BufRead;
+    let (mut input, mut output) = c::terminal()?;
+    write!(output, "\nPress Enter to return to fzf... ")?;
+    output.flush()?;
+    input.read_line(&mut String::new())?;
+    Ok(())
+}
+
+fn fzf(args: &[String]) -> Result<()> {
+    match args {
+        [action, ..] if action == "--list" && args.len() <= 2 => {
+            let prefix = args.get(1).map_or("", String::as_str);
+            for name in store::list(&store::selected()?, prefix)? {
+                println!("{name}");
+            }
         }
-        return Ok(());
+        [action] if action == "--new" => new_entry()?,
+        #[cfg(unix)]
+        [flag, action, rest @ ..] if flag == "--menu-action" => {
+            let result = match (action.as_str(), rest) {
+                ("--new", []) => new_entry(),
+                (action, [name]) => dispatch(action, name, true),
+                _ => bail!("invalid fzf action arguments"),
+            };
+            match result {
+                Ok(()) if matches!(action.as_str(), "--view" | "--policy") => pause()?,
+                Ok(()) => {}
+                Err(error) => {
+                    eprintln!("sec store fzf: {error:#}");
+                    pause()?;
+                }
+            }
+        }
+        [action, name] if action.starts_with("--") => dispatch(action, name, false)?,
+        [] => fzf_menu("")?,
+        [prefix] if !prefix.starts_with("--") => fzf_menu(prefix)?,
+        _ => bail!("invalid fzf arguments. Run sec store fzf --help"),
     }
-    ensure!(
-        args.len() <= 1,
-        "invalid fzf arguments. Run sec store fzf --help"
-    );
-    let list = store::list(
-        &store::selected()?,
-        args.first().map(String::as_str).unwrap_or(""),
-    )?;
-    let fzf = c::var("SEC_STORE_FZF_FZF").unwrap_or_else(|| "fzf".into());
-    let shortcuts = [
-        ("ctrl-i", "--copy-first"),
-        ("ctrl-u", "--copy-name"),
-        ("ctrl-b", "--copy-path"),
-        ("ctrl-y", "--copy-full"),
-        ("ctrl-o", "--otp"),
-        ("ctrl-v", "--view"),
-        ("ctrl-/", "--view"),
-        ("ctrl-e", "--edit"),
-        ("ctrl-t", "--type"),
-        ("ctrl-h", "--policy"),
-        ("ctrl-r", "--rekey"),
-        ("ctrl-d", "--remove"),
-        ("ctrl-a", "--new"),
-    ];
+    Ok(())
+}
+
+fn fzf_command(prefix: &str) -> Command {
+    let program = c::var("SEC_STORE_FZF_FZF").unwrap_or_else(|| "fzf".into());
+    if c::var("SEC_STORE_FZF_DEBUG").is_some() {
+        eprintln!("sec store fzf: starting {program:?} for prefix {prefix:?}");
+    }
+    Command::new(program)
+}
+
+const FZF_HEADER: &str = "Ctrl-I:first  Ctrl-U:name  Ctrl-B:path  Ctrl-Y:full  Ctrl-O:TOTP
+Ctrl-V:view  Ctrl-T:type  Ctrl-H:policy  Ctrl-R:rekey  Ctrl-E:edit  Ctrl-A:new  Ctrl-D:remove";
+
+#[cfg(unix)]
+fn fzf_menu(prefix: &str) -> Result<()> {
+    let executable = env::current_exe()?;
+    let subcommand = if executable
+        .file_stem()
+        .is_some_and(|name| name == "sec-store-fzf")
+    {
+        ""
+    } else {
+        " store fzf"
+    };
+    // Keep the shell syntax fixed. fzf quotes the full entry placeholder for this shell.
+    let sec = format!("\"$SEC_STORE_FZF_SELF\"{subcommand}");
+    let reload = format!("+reload({sec} --list \"$SEC_STORE_FZF_PREFIX\")");
+    let mut command = fzf_command(prefix);
+    command
+        .env("SEC_STORE_FZF_SELF", executable)
+        .env("SEC_STORE_FZF_PREFIX", prefix)
+        .args([
+            "--with-shell=/bin/sh -c",
+            "--no-multi",
+            "--cycle",
+            "--prompt",
+            "sec> ",
+            "--header",
+            &format!("{FZF_HEADER}  Ctrl-/:preview"),
+            "--preview",
+            &format!("{sec} --preview {{}}"),
+            "--preview-window",
+            "right:60%:wrap:hidden",
+            "--bind",
+            "ctrl-/:toggle-preview",
+        ]);
+    for &(key, action) in FZF_ACTIONS {
+        let selected = if action == "--new" { "" } else { " {}" };
+        let reload = if matches!(action, "--new" | "--remove") {
+            reload.as_str()
+        } else {
+            ""
+        };
+        command.arg(format!(
+            "--bind={key}:execute({sec} --menu-action {action}{selected}){reload}"
+        ));
+    }
+    let entries = store::list(&store::selected()?, prefix)?;
+    let result = c::capture(&mut command, Some(fzf_input(&entries)), c::CONFIG, 3600)?;
+    if result.status.success() {
+        io::stdout().write_all(&result.out)?;
+    } else if !matches!(result.status.code(), Some(1 | 130)) {
+        bail!("fzf exited with {}", result.status);
+    }
+    Ok(())
+}
+
+fn fzf_input(entries: &[String]) -> Vec<u8> {
+    if entries.is_empty() {
+        Vec::new()
+    } else {
+        (entries.join("\n") + "\n").into_bytes()
+    }
+}
+
+#[cfg(windows)]
+fn fzf_menu(prefix: &str) -> Result<()> {
+    // Dispatch from the selected line directly, without passing it through cmd.exe.
+    let shortcuts = FZF_ACTIONS.iter().copied().chain([("ctrl-/", "--view")]);
     let keys = shortcuts
-        .iter()
-        .map(|(key, _)| *key)
+        .clone()
+        .map(|(key, _)| key)
         .collect::<Vec<_>>()
         .join(",");
     let mut query = String::new();
-    let mut entries = list;
-    let mut header = SHORTCUTS.to_owned();
+    let mut entries = store::list(&store::selected()?, prefix)?;
     loop {
         let result = c::capture(
-            Command::new(&fzf)
-                .env_remove("FZF_DEFAULT_OPTS")
-                .env_remove("FZF_DEFAULT_OPTS_FILE")
-                .args([
-                    "--no-multi",
-                    "--cycle",
-                    "--print-query",
-                    "--query",
-                    &query,
-                    "--expect",
-                    &keys,
-                    "--prompt",
-                    "sec> ",
-                    "--header",
-                    &header,
-                ]),
-            Some((entries.join("\n") + "\n").into_bytes()),
+            fzf_command(prefix).args([
+                "--no-multi",
+                "--no-read0",
+                "--no-print0",
+                "--cycle",
+                "--print-query",
+                "--query",
+                &query,
+                "--expect",
+                &keys,
+                "--prompt",
+                "sec> ",
+                "--header",
+                FZF_HEADER,
+            ]),
+            Some(fzf_input(&entries)),
             c::CONFIG,
             3600,
         )?;
@@ -529,10 +632,19 @@ fn fzf(args: &[String]) -> Result<()> {
         query = lines.next().unwrap_or_default().to_owned();
         let key = lines.next().unwrap_or_default();
         let result = if key == "ctrl-a" {
-            fzf_new()
-        } else if let Some((_, action)) = shortcuts.iter().find(|(name, _)| *name == key) {
-            if let Some(name) = lines.next().filter(|v| !v.is_empty()) {
-                dispatch(action, name)
+            new_entry()
+        } else if let Some((_, action)) = shortcuts.clone().find(|(name, _)| *name == key) {
+            if let Some(name) = lines
+                .next()
+                .filter(|name| entries.iter().any(|entry| entry == name))
+            {
+                dispatch(action, name, true).and_then(|()| {
+                    if matches!(action, "--view" | "--policy") {
+                        pause()
+                    } else {
+                        Ok(())
+                    }
+                })
             } else {
                 Ok(())
             }
@@ -542,29 +654,14 @@ fn fzf(args: &[String]) -> Result<()> {
             }
             return Ok(());
         };
-        header = match result {
-            Ok(()) => SHORTCUTS.to_owned(),
-            Err(error) => {
-                eprintln!("sec store fzf: {error:#}");
-                let message = format!("{error:#}")
-                    .chars()
-                    .map(|ch| if ch.is_control() { ' ' } else { ch })
-                    .take(160)
-                    .collect::<String>();
-                format!("Action failed: {message}\n{SHORTCUTS}")
-            }
-        };
+        if let Err(error) = result {
+            eprintln!("sec store fzf: {error:#}");
+            pause()?;
+        }
         if matches!(key, "ctrl-d" | "ctrl-a") {
-            entries = store::list(
-                &store::selected()?,
-                args.first().map(String::as_str).unwrap_or(""),
-            )?;
+            entries = store::list(&store::selected()?, prefix)?;
         }
     }
-}
-
-fn fzf_new() -> Result<()> {
-    fzf(&["--new".into()])
 }
 
 pub fn cli(component: &str, args: &[String]) -> Result<i32> {
@@ -576,8 +673,13 @@ pub fn cli(component: &str, args: &[String]) -> Result<i32> {
         return Ok(0);
     }
     match (component, args) {
-        ("otp", [name]) => io::stdout().write_all(&otp(&entry(name, 65536)?)?)?,
-        ("type", [name]) => type_entry(name)?,
+        ("otp", [name]) => {
+            if c::var("SEC_STORE_OTP_DEBUG").is_some() {
+                eprintln!("sec store otp: reading {name:?}");
+            }
+            io::stdout().write_all(&otp(&entry(name, 65536)?)?)?;
+        }
+        ("type", [name]) => type_entry(name, 0.0)?,
         ("fzf", args) => fzf(args)?,
         _ => {
             return Err(anyhow!(

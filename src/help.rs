@@ -287,7 +287,8 @@ Example
         "search|s",
         "REGEX [[ALIAS::]PREFIX]",
         "Search entry names with a regular expression.",
-        "Searches names and paths. Returns status 1 when there are no matches.
+        "Searches names and paths. Unix uses grep basic regular expressions. Windows
+uses Rust regular expressions. Returns status 1 when there are no matches.
 
 Example
   sec store search 'token$' team::dev/",
@@ -504,8 +505,8 @@ Actions and shortcuts
   --copy-name   Ctrl-U          Copy the entry basename.
   --copy-path   Ctrl-B          Copy the entry path.
   --otp         Ctrl-O          Copy the current TOTP code.
-  --view        Ctrl-V, Ctrl-/  View the decrypted entry.
-  --preview                     Print the decrypted entry as display text.
+  --view        Ctrl-V          View the decrypted entry.
+  --preview     Ctrl-/ (Unix)   Toggle the preview pane, or print display text directly.
   --type        Ctrl-T          Type into the focused window.
   --policy      Ctrl-H          Show the recipient policy path.
   --edit        Ctrl-E          Edit a local entry.
@@ -513,6 +514,9 @@ Actions and shortcuts
   --remove      Ctrl-D          Remove a local entry after confirmation.
   --new         Ctrl-A          Prompt for an entry name and edit it.
   --list                        List entries without opening fzf.
+
+fzf reads FZF_DEFAULT_OPTS and FZF_DEFAULT_OPTS_FILE. On Unix, sec uses /bin/sh
+for its fzf bindings. Ctrl-/ opens the pager on Windows.
 
 On Wayland, wl-copy with --sensitive support and timeout keeps the offer
 for up to 30 seconds. X11 and older Wayland helpers default to one request.
@@ -532,8 +536,9 @@ Options
 
 Use ALIAS::ENTRY or ALIAS::REF for another store. Options may be repeated
 for multiple inputs. With no command or output flag, sec previews the
-plan without revealing secret values. --print and --env-only reveal
-plaintext and each requires its own approval when a manifest is used.
+plan and validates the inputs without showing their values. --print and
+--env-only reveal plaintext. Load manifests you trust. Set SEC_RUN_DEBUG
+to log resolved inputs with their values redacted.
 
 Examples
   sec run -m dev
@@ -543,13 +548,8 @@ Examples
 const MANIFEST: &[Topic] = &[group(
     "manifest|m",
     "COMMAND [ARGS...]",
-    "Edit manifests and manage their approvals and grants.",
-    "Approvals are bound to the manifest, its resolved plan and the exact
-command and arguments, or to a particular output mode. To inspect a plan
-before approving it, run sec run -m REF.
-
-Example
-  sec run manifest approve dev --env-name API_TOKEN -- ./myapp",
+    "List, edit or remove manifests.",
+    "Inspect a manifest with sec run -m REF. Use sec run -m REF -- COMMAND to run it.",
     &[
         command("ls|l", "", "List manifests in the selected store.", ""),
         command(
@@ -564,41 +564,6 @@ set and file directives. See sec run --help for the corresponding inputs.",
             "REF [REF...]",
             "Remove one or more local manifests.",
             "",
-        ),
-        command(
-            "approve",
-            "REF [--env-name NAME]... -- COMMAND [ARGS...]\nREF [--env-name NAME]... (--print | --env-only)",
-            "Review and approve a manifest's complete injection plan.",
-            "For manifests with env directives, repeat --env-name for each variable
-permitted in those imports. Approval requires interactive confirmation.",
-        ),
-        command(
-            "approvals",
-            "REF -- COMMAND [ARGS...]\nREF (--print | --env-only)",
-            "Show approved injections and prefix grants for the selected target.",
-            "",
-        ),
-        command(
-            "grant",
-            "REF --entry ENTRY --as NAME --mode (var | file) TARGET
-REF --prefix ALIAS::PREFIX/ [--as NAME] [--mode (var | file)] TARGET",
-            "Approve one added entry or explicitly allow future additions under a team prefix.",
-            "TARGET is -- COMMAND [ARGS...], --print, or --env-only. Approve the
-manifest plan first. Prefix grants cover scalar and file injections from
-a team store. Use --as or --mode to narrow a prefix grant.
-
-Example
-  sec run manifest grant dev --prefix team::dev/ --mode var -- ./myapp",
-        ),
-        command(
-            "revoke",
-            "REF TARGET
-REF --entry ENTRY --as NAME --mode (var | file) TARGET
-REF --prefix ALIAS::PREFIX/ [--as NAME] [--mode (var | file)] TARGET",
-            "Remove a manifest approval or revoke a specific grant.",
-            "TARGET is -- COMMAND [ARGS...], --print, or --env-only. Omit the
-selector to remove the entire approval. For a prefix, repeat the same
---as and --mode restrictions used to grant it.",
         ),
     ],
 )];

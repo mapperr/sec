@@ -186,13 +186,6 @@ pub fn write_record(kind: &str, key: &impl Serialize, value: &impl Serialize) ->
     platform::atomic_replace(&path, previous.as_deref(), &bytes)
 }
 
-pub fn remove_record(kind: &str, key: &impl Serialize) -> Result<()> {
-    let path = record_path(kind, key)?;
-    let _parent = platform::private_dir(record_parent(&path))?;
-    platform::remove_file(&path)?;
-    Ok(())
-}
-
 pub fn terminal() -> Result<(BufReader<File>, File)> {
     let path = if cfg!(windows) { "CONIN$" } else { "/dev/tty" };
     let output = if cfg!(windows) { "CONOUT$" } else { "/dev/tty" };

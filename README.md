@@ -19,7 +19,7 @@ Cargo builds for the host target by default. Find the target triple with `rustc 
 - Windows MSVC builds statically link the C runtime and use the platform's system DLLs.
 - macOS builds use the system libraries and frameworks through dynamic linking.
 
-Run `sec` to see the available commands. For detailed help, use `sec store --help` or `sec help run manifest grant`.
+Run `sec` to see the available commands. For detailed help, use `sec store --help` or `sec help run manifest edit`.
 
 On Unix, run `just build` followed by `just link` to create `$HOME/bin/sec` as a symlink to the release build.
 
@@ -27,7 +27,7 @@ On Unix, run `just build` followed by `just link` to create `$HOME/bin/sec` as a
 
 - SSH recipients and passphrase-encrypted identities use Go `age` 1.2.1 or newer. Deriving an SSH recipient from a private key uses `ssh-keygen`. Install any hardware plugins you need and list their names in `SEC_AGE_PLUGINS`.
 - Git filters and Git-backed stores use Git. SSH transport and signature operations use OpenSSH.
-- `sec store fzf` uses `fzf` and the available clipboard and desktop integrations. Explicit shell callbacks such as `SEC_STORE_FZF_CLIP_CMD` and `SEC_STORE_OTP_CMD` use the system shell.
+- `sec store fzf` uses `fzf` and the available clipboard and desktop integrations. It reads `FZF_DEFAULT_OPTS` and `FZF_DEFAULT_OPTS_FILE`. On Unix, Ctrl-/ toggles an in-menu preview, Ctrl-V opens the pager, and the built-in bindings use `/bin/sh`. On Windows, Ctrl-/ and Ctrl-V open the pager. Explicit shell callbacks such as `SEC_STORE_FZF_CLIP_CMD` and `SEC_STORE_OTP_CMD` use the system shell.
 
 On Wayland, `sec store fzf` marks copies as sensitive when `wl-copy` supports `--sensitive`. With `timeout` available, this offer lasts up to 30 seconds so a clipboard watcher or an XWayland app can make multiple requests. `SEC_STORE_FZF_PASTE_ONCE=1` limits the offer to one request. `SEC_STORE_FZF_PASTE_ONCE=0` keeps the offer until replaced. Clipboard history depends on how the manager handles the sensitivity hint.
 
@@ -35,11 +35,11 @@ On Wayland, `sec store fzf` marks copies as sensitive when `wl-copy` supports `-
 
 Use `sec git`, `sec run`, `sec store` and `sec security` in existing commands and hooks. Update calls to `sec-store-*` to use `sec store` and the corresponding subcommand. Unix users can also point symlinks with the previous tool names at the same `sec` executable. `sec security` keeps the `stage-store` and `pre-receive` commands. Use `sec git on` from each checkout that uses the Git filters to update its local filter commands. Include `--textconv` if you enabled plaintext diffs there.
 
-Existing ciphertext, stores, approvals and attestations use the same formats. The location of those files matters to path-bound approvals and attestations. If you previously installed the scripts, remove the retired copies or replace their links in the directories you used, and check that `sec` resolves to the installed binary.
+Existing ciphertext, stores, recipient approvals and attestations use the same formats. The location of the store matters to path-bound recipient approvals and attestations. If you previously installed the scripts, remove the retired copies or replace their links in the directories you used, and check that `sec` resolves to the installed binary.
 
 ### Configuration and state
 
-Keep the approval registry and signing policy outside project checkouts. The default registry is `${XDG_CONFIG_HOME:-$HOME/.config}/sec/approvals`. Local provenance records live in `${XDG_STATE_HOME:-$HOME/.local/state}/sec/attestations`. These private directories are owned by the current user. A CI runner can provision a private, read-only registry through `SEC_APPROVAL_DIR`. The controls rely on a trusted account, installed tools and executable. The launched application can read the secrets it receives.
+Keep the approval registry and signing policy outside project checkouts. The default registry is `${XDG_CONFIG_HOME:-$HOME/.config}/sec/approvals`. Local provenance records live in `${XDG_STATE_HOME:-$HOME/.local/state}/sec/attestations`. These private directories are owned by the current user. A CI runner can provision a private registry through `SEC_APPROVAL_DIR`. The controls rely on a trusted account, installed tools and executable. The launched application can read the secrets it receives.
 
 On Windows, configuration and the personal store default to `%APPDATA%/sec`. Cache, attestations and runtime files default to `%LOCALAPPDATA%/sec`. Windows checks ownership and access control lists on private identities and destinations. In-place operations require a trusted private parent directory.
 
@@ -258,7 +258,7 @@ sec store search database dev
 sec store rm dev/database.env
 ```
 
-`search|s` filters the logical entry list with a regular expression:
+`search|s` filters the logical entry list with `grep` basic regular expressions on Unix and Rust regular expressions on Windows:
 
 ```sh
 sec store s '^dev/'
@@ -448,9 +448,9 @@ sec store rekey
 sec store rekey dev
 ```
 
-`check` validates managed secret paths, age structure and recipient syntax. `--decrypt` (or `SEC_STORE_CHECK_DECRYPT=1`) tests the configured identities. `--strict` makes a requested decryption failure fatal. Team reads require provenance from a trusted Git commit, an authorized remote snapshot or local encryption. Use `sec store check --attest` to adopt existing ciphertexts **after verifying their provenance**. Decryption alone does not identify the sender.
+`check` validates managed secret paths, age structure and recipient syntax. `--decrypt` (or a nonempty `SEC_STORE_CHECK_DECRYPT`) tests the configured identities. `--strict` makes a requested decryption failure fatal. Team reads require provenance from a trusted Git commit, an authorized remote snapshot or local encryption. Use `sec store check --attest` to adopt existing ciphertexts **after verifying their provenance**. Decryption alone does not identify the sender.
 
-`rekey` decrypts and re-encrypts matching entries through a FIFO and reports per-entry failures. Rotate the underlying credentials when revoking a recipient who could already decrypt them.
+`rekey` decrypts and re-encrypts matching entries without writing plaintext files and reports per-entry failures. Rotate the underlying credentials when revoking a recipient who could already decrypt them.
 
 On a Git receiver, install a pre-receive hook outside the checked-out tree. For a dedicated store, invoke `sec security pre-receive "$PWD" --store`. For an application store, supply `.sec` after `--store`. For repositories using Git filters, invoke `sec security pre-receive "$PWD" --filters /trusted/protected-paths` with shell-style path patterns, one per line. These hooks require trusted SSH signers and validate protected blob structure on incoming commits.
 
@@ -643,29 +643,15 @@ sec run -m shared::dnsimple -m dev -- terraform plan
 
 This keeps dependencies visible and troubleshooting straightforward.
 
-### Approving manifests
+### Running manifests
 
-Inspect the resolved injection plan before approving it. The plan lists entry origins and destinations without opening secret values.
+Load manifests from sources you trust. `sec run -m REF -- COMMAND` uses the current manifest directly and runs without a prompt, including in CI. Set `SEC_RUN_EXEC_SHA256` to require a specific executable digest for the launched command.
 
-```sh
-sec run -m dev
-sec run manifest approve dev --env-name DATABASE_HOST --env-name API_TOKEN -- ./myapp
-sec run -m dev -- ./myapp
-sec run manifest approvals dev -- ./myapp
-sec run manifest revoke dev -- ./myapp
-```
-
-A collective approval covers the manifest's plan and selected command with its arguments. Comments, equivalent directive order and value rotation preserve approval. Changes to entries, origins, destinations or literals require a fresh approval. For `env` directives, specify allowed variable names with repeated `--env-name`. The runner validates the names after decryption. `SEC_RUN_EXEC_SHA256` can require a verified executable digest.
-
-Entries from other stores are included in the review. Authorize a specific new scalar or file entry with `manifest grant REF --entry ALIAS::ENTRY --as NAME --mode var|file -- COMMAND`. For a team store, `manifest grant REF --prefix ALIAS::PREFIX/ -- COMMAND` explicitly pre-approves future scalar and file additions under that prefix. Revoke a grant with the same selector on `manifest revoke`.
-
-A remote manifest resolves its unqualified entries in the same verified snapshot. Compose a separately approved personal manifest at the call site when a command also needs personal credentials.
+A remote manifest resolves its unqualified entries in the same verified snapshot. Compose a personal manifest at the call site when the command also needs personal credentials.
 
 ```sh
 sec run -m shared::terraform -m personal::dnsimple -- terraform plan
 ```
-
-On CI, provision reviewed approvals before running the job. Use consistent absolute checkout and executable paths, which are part of the approval scope. The launcher does not create approvals or accept confirmations from stdin.
 
 ### Optional manifests
 
@@ -682,8 +668,7 @@ An **unresolved alias, unavailable Git remote, malformed manifest, inaccessible 
 In no-command inspect mode, skipped optional manifests appear explicitly:
 
 ```text
-Skipped optional manifests (not found):
-  personal::maven -> /home/user/.local/share/sec/manifests/maven
+Manifest "personal::maven": "/home/user/.local/share/sec/manifests/maven" (absent, optional)
 ```
 
 No warning is printed during normal execution for an expected missing optional manifest.
@@ -696,16 +681,15 @@ Omit the command to inspect what will be injected without revealing secret value
 sec run -m dev
 ```
 
-Inspection shows entry origins, destinations and the presence of optional manifests. It does not decrypt data or validate the current plaintext contents.
+Inspection validates entries and shows their origins, variable names, file destinations and the status of optional manifests. It also reports LF or CRLF endings for scalar values.
 
 `--print` displays resolved values and is sensitive:
 
 ```sh
-sec run manifest approve dev --print --env-name API_TOKEN
 sec run -m dev --print
 ```
 
-Each output mode is a separate manifest approval target. `--env-only` emits only resolved `NAME=VALUE` assignments and does not allow `file` entries:
+`--env-only` emits resolved `NAME=VALUE` assignments and accepts environment inputs:
 
 ```sh
 sec run --env-only -e dev/app.env -v TOKEN=dev/token

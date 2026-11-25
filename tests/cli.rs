@@ -77,10 +77,10 @@ fn help_covers_the_single_binary_without_accessing_a_store_or_git() {
         );
     }
 
-    let grant = help(&["help", "run", "manifest", "grant"]);
-    assert_eq!(grant, help(&["run", "m", "grant", "-h"]));
-    assert!(grant.contains("--entry ENTRY --as NAME"));
-    assert!(grant.contains("--prefix ALIAS::PREFIX/"));
+    let manifest = help(&["help", "run", "manifest"]);
+    assert_eq!(manifest, help(&["run", "m", "-h"]));
+    assert!(manifest.contains("edit"));
+    assert!(!manifest.contains("approve"));
     assert!(help(&["store", "policy", "approve", "--help"]).contains("interactive confirmation"));
     assert!(help(&["git", "recipient", "--help"]).contains(".sec-recipients"));
     assert!(help(&["security", "pre-receive", "--help"]).contains("--filters ABSOLUTE_PATH"));

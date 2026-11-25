@@ -54,6 +54,9 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<bool> {
                 if !armor && io::stdout().is_terminal() {
                     bail!("redirect encrypted output or set SEC_ARMOR=1");
                 }
+                if common::var("SEC_DEBUG").is_some() {
+                    eprintln!("sec: encrypting input stream");
+                }
                 crypto::encrypt_to(
                     io::stdin().lock(),
                     io::stdout().lock(),
@@ -74,6 +77,9 @@ fn run(mut args: impl Iterator<Item = OsString>) -> Result<bool> {
             if args.is_empty() {
                 if io::stdout().is_terminal() {
                     bail!("redirect decrypted output to a private file or trusted consumer");
+                }
+                if common::var("SEC_DEBUG").is_some() {
+                    eprintln!("sec: decrypting input stream");
                 }
                 crypto::decrypt_from(io::stdin().lock(), io::stdout().lock(), &identities)?;
             } else {

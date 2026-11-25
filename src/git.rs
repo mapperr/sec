@@ -728,6 +728,7 @@ fn filter(mode: &str, root: &Path, recipients: &Path, name: &str, data: &[u8]) -
         }
         return Ok(data.to_vec());
     }
+    let debug = c::var("SEC_GIT_DEBUG").is_some();
     let store = Store::local(root.to_owned())?;
     let policy = store::require_policy(&store, recipients, "git", false)?;
     let plaintext = if encrypted {
@@ -746,9 +747,15 @@ fn filter(mode: &str, root: &Path, recipients: &Path, name: &str, data: &[u8]) -
                 && crypto::decrypt_data(&old, c::SECRET)
                     .is_ok_and(|existing| *existing == *plaintext)
             {
+                if debug {
+                    eprintln!("sec git: reusing indexed ciphertext for {name:?}");
+                }
                 return Ok(old);
             }
         }
+    }
+    if debug {
+        eprintln!("sec git: encrypting {name:?}");
     }
     let keys = store::recipient_lines(&policy)?;
     let result = crypto::encrypt_keys(&plaintext, &keys, None, c::on("SEC_GIT_ARMOR"))?;
